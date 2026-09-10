@@ -15,6 +15,12 @@ use objc2_av_foundation::{
 };
 use objc2_foundation::{NSArray, NSString};
 
+const FRAME_RATE_EPSILON: f64 = 0.01;
+
+pub(super) fn fps_matches_range(requested: f64, min_fps: f64, max_fps: f64) -> bool {
+    requested >= min_fps - FRAME_RATE_EPSILON && requested <= max_fps + FRAME_RATE_EPSILON
+}
+
 /// 权限状态
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AVAuthorizationStatus {
@@ -392,12 +398,11 @@ pub(crate) fn find_best_format(
                 let range = frame_rate_ranges.objectAtIndex_unchecked(j);
                 let min_fps = range.minFrameRate();
                 let max_fps = range.maxFrameRate();
-                if config.frame_rate()?.as_f64() >= min_fps
-                    && config.frame_rate()?.as_f64() <= max_fps
-                {
+                let requested_fps = config.frame_rate()?.as_f64();
+                if fps_matches_range(requested_fps, min_fps, max_fps) {
                     fps_supported = true;
                     // 精确匹配最大帧率得更高分
-                    if config.frame_rate()?.as_f64() == max_fps {
+                    if (requested_fps - max_fps).abs() <= FRAME_RATE_EPSILON {
                         score += 100;
                     } else {
                         score += 50;
@@ -466,9 +471,7 @@ pub(crate) fn find_best_format(
                     let range = frame_rate_ranges.objectAtIndex_unchecked(j);
                     let min_fps = range.minFrameRate();
                     let max_fps = range.maxFrameRate();
-                    if config.frame_rate()?.as_f64() >= min_fps
-                        && config.frame_rate()?.as_f64() <= max_fps
-                    {
+                    if fps_matches_range(config.frame_rate()?.as_f64(), min_fps, max_fps) {
                         fps_supported = true;
                         break;
                     }
@@ -535,9 +538,7 @@ pub(crate) fn find_best_format(
                     let range = frame_rate_ranges.objectAtIndex_unchecked(j);
                     let min_fps = range.minFrameRate();
                     let max_fps = range.maxFrameRate();
-                    if config.frame_rate()?.as_f64() >= min_fps
-                        && config.frame_rate()?.as_f64() <= max_fps
-                    {
+                    if fps_matches_range(config.frame_rate()?.as_f64(), min_fps, max_fps) {
                         fps_supported = true;
                         break;
                     }
@@ -589,8 +590,13 @@ pub(crate) fn find_best_format(
 
         best_match.ok_or_else(|| {
             CameraError::UnsupportedFormat(format!(
-                "No matching format for {:?} {}x{}@{}fps",
-                config.format, config.width, config.height, config.fps
+                "No matching format for {:?} {}x{}@{:.6}fps ({}/{})",
+                config.format,
+                config.width,
+                config.height,
+                config.frame_rate().map_or(0.0, |rate| rate.as_f64()),
+                config.fps,
+                config.fps_denominator
             ))
         })
     }
@@ -631,5 +637,17 @@ mod tests {
             cross_format_fallback_priority(VideoFormat::MJPEG)
                 > cross_format_fallback_priority(VideoFormat::NV12)
         );
+    }
+
+    #[test]
+    fn fixed_fractional_frame_rate_accepts_integer_and_reconstructed_rates() {
+        let reported = 30.000_029_970_029_97;
+        assert!(fps_matches_range(30.0, reported, reported));
+        assert!(fps_matches_range(
+            3_000_003.0 / 100_000.0,
+            reported,
+            reported
+        ));
+        assert!(!fps_matches_range(29.0, reported, reported));
     }
 }

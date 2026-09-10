@@ -24,7 +24,7 @@ use crate::error::CameraError;
 use crate::types::{CameraConfig, CameraResult};
 
 use super::delegate::{CaptureDelegate, FrameBuffer};
-use super::device::{find_best_format, get_device_by_id};
+use super::device::{find_best_format, fps_matches_range, get_device_by_id};
 
 fn cv_pixel_buffer_pixel_format_type_key() -> &'static NSString {
     unsafe { AsRef::<NSString>::as_ref(kCVPixelBufferPixelFormatTypeKey) }
@@ -68,11 +68,6 @@ where
     F: FnOnce() -> CameraResult<T>,
 {
     catch_objc(context, f)?
-}
-
-fn fps_matches_range(requested_fps: u32, min_fps: f64, max_fps: f64) -> bool {
-    let requested_fps = requested_fps as f64;
-    requested_fps + 0.5 >= min_fps && requested_fps - 0.5 <= max_fps
 }
 
 /// Retains the configuration lock through startRunning; macOS otherwise lets
@@ -264,9 +259,7 @@ impl CaptureSession {
                 let min_fps = range.minFrameRate();
                 let max_fps = range.maxFrameRate();
                 log::debug!("Format supports fps range: {:.6}-{:.6}", min_fps, max_fps);
-                if config.frame_rate()?.as_f64() >= min_fps - 0.01
-                    && config.frame_rate()?.as_f64() <= max_fps + 0.01
-                {
+                if fps_matches_range(config.frame_rate()?.as_f64(), min_fps, max_fps) {
                     let requested = config.frame_rate()?.as_f64();
                     let target = requested.clamp(min_fps, max_fps);
                     let distance = (target - requested).abs();
@@ -551,8 +544,8 @@ mod tests {
 
     #[test]
     fn fps_matches_near_integer_avfoundation_ranges() {
-        assert!(fps_matches_range(30, 30.00003, 30.00003));
-        assert!(fps_matches_range(60, 59.94, 60.0));
-        assert!(!fps_matches_range(30, 50.0, 60.0));
+        assert!(fps_matches_range(30.0, 30.00003, 30.00003));
+        assert!(fps_matches_range(60.0, 59.94, 60.0));
+        assert!(!fps_matches_range(30.0, 50.0, 60.0));
     }
 }
