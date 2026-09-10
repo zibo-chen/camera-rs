@@ -1,0 +1,68 @@
+name: Camera
+on: [push, pull_request, workflow_dispatch]
+jobs:
+  native:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - name: Linux native prerequisites
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y cmake nasm
+      - name: macOS native prerequisites
+        if: runner.os == 'macOS'
+        run: brew install nasm
+      - name: Windows native prerequisites
+        if: runner.os == 'Windows'
+        uses: ilammy/setup-nasm@v1
+      - run: cargo fmt --all -- --check
+      - name: Native metadata and lifecycle regressions
+        if: runner.os != 'Windows'
+        run: ./scripts/test-native.sh
+      - run: cargo test --no-default-features
+      - run: cargo test --features ndarray
+      - run: cargo check --all-targets --all-features
+      - run: cargo clippy --all-targets --features ndarray -- -D warnings
+      - name: UVC contracts
+        if: runner.os != 'Windows'
+        run: cargo test --features backend-uvc,ndarray
+      - run: cargo doc --no-deps
+      - run: cargo package --allow-dirty
+  msrv:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.88.0
+      - run: brew install nasm
+      - run: cargo check --lib --features ndarray,backend-uvc
+  android:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android, armv7-linux-androideabi
+      - uses: android-actions/setup-android@v3
+      - run: sdkmanager 'ndk;27.0.12077973' 'platforms;android-34' 'build-tools;34.0.0'
+      - name: Android adapters and example
+        run: |
+          export ANDROID_NDK_HOME="$ANDROID_HOME/ndk/27.0.12077973"
+          ./scripts/build-android-adapter.sh aarch64-linux-android
+          ./scripts/build-android-adapter.sh armv7-linux-androideabi
+          cd android_example
+          ./gradlew assembleDebug assembleDebugAndroidTest
+  ios:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-ios, aarch64-apple-ios-sim
+      - run: cargo check --target aarch64-apple-ios --no-default-features --features backend-avfoundation
+      - run: cargo check --target aarch64-apple-ios-sim --no-default-features --features backend-avfoundation

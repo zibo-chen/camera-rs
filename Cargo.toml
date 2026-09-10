@@ -1,0 +1,147 @@
+[package]
+name = "camera"
+version = "0.2.0"
+edition = "2021"
+description = "Cross-platform camera capture with owned sessions and shared native frames"
+rust-version = "1.88"
+license = "MIT OR Apache-2.0"
+readme = "README.md"
+include = ["/src/**", "/Cargo.toml", "/build.rs", "/README.md", "/BUILD.md", "/docs/ARCHITECTURE.md", "/LICENSE-*", "/THIRD_PARTY.md", "/cpp/**", "/cmake/**", "/examples/**", "/benches/**", "/tests/**", "/scripts/**", "/docs/API.md", "/docs/V4L2.md", "/3rdparty/libuvc/src/**", "/3rdparty/libuvc/include/**", "/3rdparty/libuvc/LICENSE.txt", "/3rdparty/libusb/libusb/**", "/3rdparty/libusb/COPYING", "/3rdparty/libusb/android/**"]
+keywords = ["camera", "uvc", "video", "usb"]
+categories = ["multimedia::video", "hardware-support"]
+
+[dependencies]
+# 核心依赖
+libc = "0.2"
+thiserror = "1.0"
+log = "0.4"
+
+# 高性能锁
+parking_lot = "0.12"
+
+# 异步支持
+tokio = { version = "1.0", features = ["sync", "time", "rt", "macros"] }
+
+# 数据处理
+ndarray = { version = "0.16", optional = true }
+
+# JPEG 解码，用于 UVC/Media Foundation/V4L2 的 MJPEG 路径。
+turbojpeg = { version = "1.3", optional = true }
+
+# Optional GUI example dependencies
+eframe = { version = "0.29", optional = true }
+egui = { version = "0.29", optional = true }
+
+# Windows Media Foundation 支持
+[target.'cfg(target_os = "windows")'.dependencies]
+windows-core = { version = "0.58", optional = true }
+windows = { version = "0.58", optional = true, features = [
+    "implement",
+    "Win32_Foundation",
+    "Win32_System_Com",
+    "Win32_Media_MediaFoundation",
+    "Win32_Media_DirectShow",
+    "Win32_Media_KernelStreaming",
+] }
+once_cell = { version = "1.19", optional = true }
+
+# macOS/iOS AVFoundation 支持
+[target.'cfg(any(target_os = "macos", target_os = "ios"))'.dependencies]
+objc2 = { version = "0.6", optional = true, features = ["exception"] }
+objc2-foundation = { version = "0.3", optional = true, default-features = false, features = [
+    "std",
+    "NSArray",
+    "NSString",
+    "NSObject",
+    "NSError",
+    "NSException",
+    "NSObjCRuntime",
+    "NSDictionary",
+    "NSValue",
+    "NSNotification",
+    "objc2-core-foundation",
+] }
+objc2-av-foundation = { version = "0.3", optional = true, default-features = false, features = [
+    "std",
+    "AVCaptureDevice",
+    "AVCaptureInput",
+    "AVCaptureOutput",
+    "AVCaptureOutputBase",
+    "AVCaptureSession",
+    "AVCaptureSessionPreset",
+    "AVCaptureVideoDataOutput",
+    "AVMediaFormat",
+    "block2",
+    "dispatch2",
+    "objc2-core-media",
+    "objc2-core-video",
+] }
+objc2-core-media = { version = "0.3", optional = true, default-features = false, features = [
+    "std",
+    "CMFormatDescription",
+    "CMSampleBuffer",
+    "CMBlockBuffer",
+    "CMTime",
+    "objc2",
+    "objc2-core-video",
+] }
+objc2-core-video = { version = "0.3", optional = true, default-features = false, features = [
+    "std",
+    "CVBase",
+    "CVBuffer",
+    "CVImageBuffer",
+    "CVPixelBuffer",
+    "CVReturn",
+    "objc2",
+] }
+block2 = { version = "0.6", optional = true }
+dispatch2 = { version = "0.3", optional = true, features = ["std", "block2", "objc2"] }
+
+[build-dependencies]
+cc = "1.0"
+
+[dev-dependencies]
+tokio = { version = "1.0", features = ["full"] }
+
+
+
+# Example-specific configurations
+[[example]]
+name = "egui_viewer"
+required-features = ["viewer"]
+
+[[example]]
+name = "hotplug_monitor"
+
+[[example]]
+name = "probe_formats"
+
+[[example]]
+name = "resilient_camera"
+
+# Benchmark configurations
+[[bench]]
+name = "color_convert"
+harness = false
+
+[lib]
+crate-type = ["lib"]
+
+[features]
+ndarray = ["dep:ndarray"]
+viewer = ["dep:eframe", "dep:egui"]
+# Platform-native capture by default; UVC is opt-in.
+default = ["native"]
+native = ["turbojpeg", "apple", "windows-native"]
+jpeg = ["turbojpeg"]
+
+# 后端选择
+backend-uvc = ["turbojpeg"] # UVC (libuvc) - 跨平台 USB 摄像头
+backend-v4l2 = ["turbojpeg"] # Linux 内核 V4L2 (MMAP，无需 libuvc)
+backend-avfoundation = ["apple"] # AVFoundation - macOS/iOS
+backend-camera2 = []      # Camera2 - Android (NDK, no JNI required)
+native-debug-logs = []    # Verbose libusb diagnostics; keep disabled for capture benchmarks.
+backend-mf = ["turbojpeg", "windows-native"] # Media Foundation - Windows
+
+apple = ["dep:objc2", "dep:objc2-foundation", "dep:objc2-av-foundation", "dep:objc2-core-media", "dep:objc2-core-video", "dep:block2", "dep:dispatch2"]
+windows-native = ["dep:windows", "dep:windows-core", "dep:once_cell"]

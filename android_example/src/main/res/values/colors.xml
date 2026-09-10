@@ -1,0 +1,38 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <color name="primary">#2196F3</color>
+    <color name="primary_dark">#1976D2</color>
+    <color name="accent">#00BCD4</color>
+    
+    <color name="status_streaming">#4CAF50</color>
+    <color name="status_stopped">#9E9E9E</color>
+    <color name="status_connecting">#FFC107</color>
+    <color name="status_reconnecting">#FF9800</color>
+    <color name="status_error">#F44336</color>
+    
+    <!-- 深色主题颜色 -->
+    <color name="background_dark">#121212</color>
+    <color name="toolbar_background">#1E1E1E</color>
+    <color name="panel_background">#1A1A1A</color>
+    <color name="preview_background">#000000</color>
+    <color name="card_background">#252525</color>
+    <color name="card_background_elevated">#2D2D2D</color>
+    
+    <color name="text_primary">#FFFFFF</color>
+    <color name="text_secondary">#B3B3B3</color>
+    <color name="text_hint">#808080</color>
+    
+    <color name="divider">#333333</color>
+    <color name="background_light">#FAFAFA</color>
+    
+    <color name="button_primary">#00BCD4</color>
+    <color name="button_secondary">#424242</color>
+    <color name="button_danger">#F44336</color>
+    
+    <color name="seekbar_background">#404040</color>
+    <color name="spinner_background">#2D2D2D</color>
+    <color name="spinner_stroke">#404040</color>
+    
+    <color name="overlay_background">#CC000000</color>
+    <color name="status_badge_background">#33FFFFFF</color>
+</resources>

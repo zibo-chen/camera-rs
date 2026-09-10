@@ -1,0 +1,67 @@
+plugins {
+    id 'com.android.application' version '8.7.3'
+}
+
+def rustProjectDir = file("${projectDir}/..")
+tasks.register('buildRustJni', Exec) {
+    inputs.files(fileTree("${rustProjectDir}/src"), fileTree("${rustProjectDir}/cpp"),
+        fileTree("${rustProjectDir}/3rdparty"), fileTree("${rustProjectDir}/cmake"),
+        fileTree("${rustProjectDir}/camera-android/src"), file("${rustProjectDir}/Cargo.toml"),
+        file("${rustProjectDir}/Cargo.lock"), file("${rustProjectDir}/camera-android/Cargo.toml"),
+        file("${rustProjectDir}/camera-android/Cargo.lock"), file("${rustProjectDir}/build.rs"))
+    inputs.file(file("${rustProjectDir}/scripts/build-android-adapter.sh"))
+    outputs.files(file("${projectDir}/src/main/jniLibs/arm64-v8a/libcamera_android.so"), file("${projectDir}/src/main/jniLibs/arm64-v8a/libc++_shared.so"))
+    commandLine 'bash', "${rustProjectDir}/scripts/build-android-adapter.sh", 'aarch64-linux-android'
+}
+tasks.matching { it.name == 'preBuild' }.configureEach { dependsOn 'buildRustJni' }
+
+android {
+    packaging { jniLibs { excludes += ['**/libmedivh_camera.so'] } }
+    namespace 'com.medivh.camera.demo'
+    compileSdk 34
+
+    defaultConfig {
+        applicationId "com.medivh.camera.demo"
+        minSdk 24
+        targetSdk 34
+        versionCode 1
+        versionName "1.0"
+
+        testInstrumentationRunner "androidx.test.runner.AndroidJUnitRunner"
+        
+        ndk {
+            abiFilters 'arm64-v8a'
+        }
+    }
+
+    buildTypes {
+        release {
+            minifyEnabled true        // 代码混淆
+            shrinkResources true      // 资源压缩
+            crunchPngs true           // PNG压缩
+            debuggable false          // 禁用调试
+            jniDebuggable false
+            renderscriptDebuggable false
+            proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'
+        }
+    }
+    
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_1_8
+        targetCompatibility JavaVersion.VERSION_1_8
+    }
+    
+    buildFeatures {
+        viewBinding true
+    }
+}
+
+dependencies {
+    implementation 'androidx.appcompat:appcompat:1.6.1'
+    implementation 'androidx.constraintlayout:constraintlayout:2.1.4'
+    implementation 'com.google.android.material:material:1.10.0'
+    
+    testImplementation 'junit:junit:4.13.2'
+    androidTestImplementation 'androidx.test.ext:junit:1.1.5'
+    androidTestImplementation 'androidx.test.espresso:espresso-core:3.5.1'
+}

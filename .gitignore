@@ -1,0 +1,17 @@
+android_example/build/
+/target/
+android_example/.gradle/
+android_example/.idea/
+target/
+node_modules/
+dist/
+build/
+.dart_tool/
+.gradle/
+.DS_Store
+*.db
+*.db-*
+output/
+outputs/
+/Android-ndk-camera-zh/
+/android_example/src/main/jniLibs/

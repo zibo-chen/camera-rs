@@ -1,0 +1,70 @@
+<resources>
+    <string name="app_name">Medivh Camera Demo</string>
+    
+    <!-- 设备选择 -->
+    <string name="device_selection">设备选择</string>
+    <string name="refresh_devices">刷新设备</string>
+    <string name="no_devices">未发现设备</string>
+    <string name="found_devices">发现 %d 个设备</string>
+    <string name="select_device">选择摄像头</string>
+    
+    <!-- 配置选择 -->
+    <string name="stream_config">流配置</string>
+    <string name="select_config">选择配置</string>
+    <string name="custom_config">自定义配置</string>
+    <string name="format">格式</string>
+    <string name="width">宽度</string>
+    <string name="height">高度</string>
+    <string name="fps">帧率</string>
+    
+    <!-- 流控制 -->
+    <string name="stream_control">流控制</string>
+    <string name="start_stream">▶ 开始预览</string>
+    <string name="stop_stream">⏹ 停止预览</string>
+    <string name="streaming">● 推流中</string>
+    <string name="stopped">● 已停止</string>
+    <string name="connecting">● 连接中...</string>
+    <string name="reconnecting">● 重连中...</string>
+    <string name="auto_recovery">自动重连</string>
+    
+    <!-- 统计信息 -->
+    <string name="statistics">统计信息</string>
+    <string name="total_frames">总帧数: %d</string>
+    <string name="dropped_frames">丢帧: %d</string>
+    <string name="current_fps">FPS: %.1f</string>
+    <string name="drop_rate">丢帧率: %.2f%%</string>
+    <string name="buffer_usage">缓冲: %d/%d (%.1f%%)</string>
+    <string name="uptime">运行时间: %ds</string>
+    
+    <!-- 摄像头控制 -->
+    <string name="camera_controls">摄像头控制</string>
+    <string name="no_controls">无可用控制</string>
+    <string name="exposure">曝光</string>
+    <string name="focus_zoom">对焦 &amp; 缩放</string>
+    <string name="image_adjustments">图像调整</string>
+    <string name="white_balance">白平衡</string>
+    <string name="reset_all">重置全部</string>
+    <string name="refresh">刷新</string>
+    <string name="auto">自动</string>
+    <string name="manual">手动</string>
+    
+    <!-- 错误信息 -->
+    <string name="error_no_device">没有可用设备</string>
+    <string name="error_open_camera">打开摄像头失败: %s</string>
+    <string name="error_start_stream">启动流失败: %s</string>
+    <string name="error_usb_permission">USB 权限被拒绝</string>
+    
+    <!-- 状态 -->
+    <string name="waiting_for_frames">等待帧数据...</string>
+    <string name="no_preview">无预览</string>
+    <string name="start_to_preview">启动流以开始预览</string>
+
+    <!-- 后端选择 -->
+    <string name="backend_uvc">UVC (USB)</string>
+    <string name="backend_camera2">Camera2 (内置)</string>
+
+    <!-- 权限 -->
+    <string name="camera_permission_required">需要授予摄像头权限</string>
+    <string name="disable_preview_render">关闭画面（仅后端采集）</string>
+    <string name="preview_disabled_backend_only">画面已关闭，仅 Rust 后端采集</string>
+</resources>
