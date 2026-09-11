@@ -26,7 +26,10 @@ tokio = { version = "1.0", features = ["sync", "time", "rt", "macros"] }
 ndarray = { version = "0.16", optional = true }
 
 # JPEG 解码，用于 UVC/Media Foundation/V4L2 的 MJPEG 路径。
-turbojpeg = { version = "1.3", optional = true }
+# SIMD is opportunistic: turbojpeg's default `require-simd` feature makes
+# Windows builds fail outright when NASM is unavailable instead of using its
+# supported scalar fallback.
+turbojpeg = { version = "1.3", optional = true, default-features = false, features = ["cmake"] }
 
 # Optional GUI example dependencies
 eframe = { version = "0.29", optional = true }
