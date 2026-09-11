@@ -1,6 +1,6 @@
 [package]
 name = "camera"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 description = "Cross-platform camera capture with owned sessions and shared native frames"
 rust-version = "1.88"

@@ -260,6 +260,7 @@ struct uvc_stream_handle {
   struct libusb_transfer *transfers[LIBUVC_NUM_TRANSFER_BUFS];
   uint8_t *transfer_bufs[LIBUVC_NUM_TRANSFER_BUFS];
   struct uvc_frame frame;
+  size_t frame_data_capacity, frame_metadata_capacity;
   enum uvc_frame_format frame_format;
   struct timespec capture_time_finished;
 

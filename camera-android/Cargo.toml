@@ -1,6 +1,6 @@
 [package]
 name = "camera-android"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 rust-version = "1.88"
 license = "MIT OR Apache-2.0"
@@ -11,7 +11,7 @@ description = "Android USB permission and JNI adapter for camera"
 [lib]
 crate-type = ["rlib", "cdylib", "staticlib"]
 [dependencies]
-camera = { path = "..", version = "0.2.0", default-features = false, features = ["backend-camera2", "backend-uvc", "backend-v4l2"] }
+camera = { path = "..", version = "0.3.0", default-features = false, features = ["backend-camera2", "backend-uvc", "backend-v4l2"] }
 jni = "0.21"
 log = "0.4"
 libc = "0.2"

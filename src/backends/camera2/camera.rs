@@ -356,6 +356,67 @@ unsafe fn native_frame_layout(
             vec![data],
         ));
     }
+    if frame.width <= 0
+        || frame.height <= 0
+        || frame.y_data.is_null()
+        || frame.y_len <= 0
+        || frame.row_stride_y <= 0
+        || frame.uv_data.is_null()
+        || frame.uv_len <= 0
+        || frame.row_stride_uv <= 0
+        || frame.pixel_stride_uv <= 0
+        || frame.v_data.is_null()
+        || frame.v_len <= 0
+        || frame.row_stride_v <= 0
+        || frame.pixel_stride_v <= 0
+    {
+        return Err(CameraError::InvalidFormat(
+            "Invalid Camera2 YUV plane".into(),
+        ));
+    }
+    let y = std::slice::from_raw_parts(frame.y_data, frame.y_len as usize);
+    let u_span = crate::format::ChromaPlaneSpan {
+        start: frame.uv_data as usize,
+        length: frame.uv_len as usize,
+        row_stride: frame.row_stride_uv as usize,
+        pixel_stride: frame.pixel_stride_uv as usize,
+    };
+    let v_span = crate::format::ChromaPlaneSpan {
+        start: frame.v_data as usize,
+        length: frame.v_len as usize,
+        row_stride: frame.row_stride_v as usize,
+        pixel_stride: frame.pixel_stride_v as usize,
+    };
+    if let Some(chroma) = crate::format::interleaved_chroma_layout(
+        frame.width as usize,
+        frame.height as usize,
+        u_span,
+        v_span,
+    ) {
+        let (chroma_ptr, chroma_length) = if chroma.format == PixelFormat::Nv12 {
+            (frame.uv_data, frame.uv_len as usize)
+        } else {
+            (frame.v_data, frame.v_len as usize)
+        };
+        let chroma_data = std::slice::from_raw_parts(chroma_ptr, chroma_length);
+        let mut layout =
+            FrameLayout::packed(frame.width as u32, frame.height as u32, chroma.format, 0, 0);
+        layout.planes = vec![
+            PlaneLayout {
+                offset: 0,
+                length: y.len(),
+                row_stride: frame.row_stride_y as usize,
+                pixel_stride: 1,
+            },
+            PlaneLayout {
+                offset: y.len(),
+                length: chroma.length,
+                row_stride: chroma.row_stride,
+                pixel_stride: 2,
+            },
+        ];
+        return Ok((layout, vec![y, chroma_data]));
+    }
     let mut layout = FrameLayout::packed(
         frame.width as u32,
         frame.height as u32,
@@ -381,11 +442,6 @@ unsafe fn native_frame_layout(
             frame.pixel_stride_v,
         ),
     ] {
-        if ptr.is_null() || len <= 0 || row <= 0 || pixel <= 0 {
-            return Err(CameraError::InvalidFormat(
-                "Invalid Camera2 YUV plane".into(),
-            ));
-        }
         parts.push(std::slice::from_raw_parts(ptr, len as usize));
         layout.planes.push(PlaneLayout {
             offset,

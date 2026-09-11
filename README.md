@@ -27,6 +27,17 @@ Optional features: `ndarray` for zero-copy RGB views, `jpeg` for explicit MJPEG 
 
 Native planes include stride, pixel stride, timestamps and known color metadata. Unknown metadata stays unknown. `RgbConverter` converts into caller-owned storage; H264 decoding and native GPU texture leases are not provided.
 
+For a slow preview or inference consumer, request `OutputFormat::Native` with the default `DeliveryPolicy::Latest`, then convert only the frame returned to that consumer. `ConversionRequest` accepts the RGB dimensions actually needed, so raw YUV/RGB is sampled directly into the smaller destination and MJPEG uses the smallest supported TurboJPEG DCT scale before any final resize:
+
+```rust
+use camera::{ConversionRequest, RgbConverter};
+# fn convert(converter: &mut RgbConverter, frame: &camera::CapturedFrame) -> camera::CameraResult<()> {
+let request = ConversionRequest::new(960, 540)?;
+let mut rgb = vec![0; request.output_len()?];
+converter.convert_into(frame, request, &mut rgb)?;
+# Ok(()) }
+```
+
 Licensed under MIT OR Apache-2.0. See [third-party notices](THIRD_PARTY.md), especially when enabling UVC.
 
 See [API and migration guide](docs/API.md), [build instructions](BUILD.md), and the [Android adapter](camera-android/README.md).

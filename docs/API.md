@@ -1,6 +1,6 @@
-# Camera API 0.2
+# Camera API 0.3
 
-This release deliberately replaces the 0.1 public API. Rust 1.88 or newer is required. The core requires a Tokio runtime with time support; the Android JNI adapter owns its runtime. Applications own logging and platform permission prompts.
+This release keeps the owned-session model introduced in 0.2 and deliberately replaces the old `RgbConverter` call shape with `ConversionRequest`. Rust 1.88 or newer is required. The core requires a Tokio runtime with time support; the Android JNI adapter owns its runtime. Applications own logging and platform permission prompts.
 
 ## Capture
 
@@ -38,7 +38,9 @@ The default is `Latest`, six storage slots, and a 192 MiB pixel-storage limit. C
 
 Frames are immutable `Arc<CapturedFrame>`. Retaining them or shared ndarray allocations keeps pool slots occupied. Exhaustion drops incoming frames without modifying any retained pixels. Copy deliberately with `copy_to`/`to_owned_bytes` for archival workloads. The byte budget includes reserved native `Vec` capacities, including variable-sized JPEG payloads; it excludes OS/driver queues, decoder scratch space, frame metadata, and application copies. Conversion runs outside the pool mutex, and late callbacks are rejected by a capture epoch check.
 
-The `ndarray` feature exposes borrowed views and shared RGB allocations without copying. Native frames require explicit conversion first. `RgbConverter` writes into caller-owned RGB storage and reuses its JPEG decoder. Full-range BT.601 YUV uses checked NEON kernels on ARM64; other color matrices/ranges and unusual layouts use the scalar path. Small rounding differences between integer kernels are possible. Orientation, tone mapping and transfer-function/primaries conversion are not applied.
+The `ndarray` feature exposes borrowed views and shared RGB allocations without copying. Native frames require explicit conversion first. `RgbConverter` writes into caller-owned RGB storage and reuses its JPEG decoder and scratch buffer. Its required `ConversionRequest` carries the target dimensions and optional color override. Same-size YUYV/UYVY, NV12/NV21 and I420 conversions use configured block kernels for BT.601/709/2020 and SMPTE 240M, in both Full and Limited range. ARM64 uses explicit NEON; x86_64 runtime-dispatches packed YUYV/UYVY, planar I420 and full/half-size NV12/NV21 rows to AVX2 when available; other paths retain scalar/compiler-vectorized kernels. BGRA/RGBA/ARGB channel reordering also uses NEON on ARM64. Smaller RGB outputs are sampled directly from raw frames without allocating a full-size RGB intermediate; half-size NV12/NV21 has a dedicated block kernel. MJPEG selects the smallest supported TurboJPEG DCT scale that still covers the requested size, then performs a final nearest-neighbor resize only when required. All SIMD paths preserve the configured integer coefficient and rounding contract. Orientation, tone mapping and transfer-function/primaries conversion are not applied.
+
+To avoid converting frames that a slower consumer will never observe, capture `OutputFormat::Native` with `DeliveryPolicy::Latest`; call `receiver.next()` after each processing cycle and convert that returned frame. Keep direct RGB capture for consumers that genuinely need every frame, because forcing Native capture there can add a copy before conversion.
 
 ## Metadata and measurements
 
@@ -58,7 +60,7 @@ Query `controls().await` before displaying controls. The descriptor has units, o
 
 ## Migration
 
-| 0.1 pattern | 0.2 replacement |
+| Pre-0.3 pattern | 0.3 replacement |
 | --- | --- |
 | Public backend factory and `*_arc` methods | `CameraSystem`, `Camera::start` |
 | Raw numeric device index persisted | Enumerate and retain `DeviceId` |
@@ -67,6 +69,7 @@ Query `controls().await` before displaying controls. The descriptor has units, o
 | Public `FrameHub`, recovery traits/wrappers | Owned `CaptureSession` with reconnect policy |
 | Restartable global device monitor | Owned `DeviceWatcher` |
 | Integer FPS | Reduced nonzero `FrameRate` fraction |
+| `RgbConverter` plus a separate color argument | `ConversionRequest` with target size and optional color override |
 | Ambiguous brightness/exposure integers | Typed control IDs, modes and units |
 | JNI and Android context in core crate | Separate `camera-android` package |
 

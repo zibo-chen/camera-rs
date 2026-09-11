@@ -335,6 +335,70 @@ pub struct PlaneLayout {
     pub row_stride: usize,
     pub pixel_stride: usize,
 }
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg(any(target_os = "android", test))]
+pub(crate) struct ChromaPlaneSpan {
+    pub start: usize,
+    pub length: usize,
+    pub row_stride: usize,
+    pub pixel_stride: usize,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg(any(target_os = "android", test))]
+pub(crate) struct InterleavedChromaLayout {
+    pub start: usize,
+    pub length: usize,
+    pub row_stride: usize,
+    pub format: PixelFormat,
+}
+
+/// Recognize the adjacent, overlapping U/V views commonly returned for
+/// YUV_420_888. The lower view must contain every byte described by the upper
+/// view and the complete visible chroma area; otherwise callers must retain the
+/// original three-plane representation.
+#[cfg(any(target_os = "android", test))]
+pub(crate) fn interleaved_chroma_layout(
+    width: usize,
+    height: usize,
+    u: ChromaPlaneSpan,
+    v: ChromaPlaneSpan,
+) -> Option<InterleavedChromaLayout> {
+    if width == 0
+        || height == 0
+        || u.pixel_stride != 2
+        || v.pixel_stride != 2
+        || u.row_stride != v.row_stride
+    {
+        return None;
+    }
+    let (base, other, format) = if u.start.checked_add(1) == Some(v.start) {
+        (u, v, PixelFormat::Nv12)
+    } else if v.start.checked_add(1) == Some(u.start) {
+        (v, u, PixelFormat::Nv21)
+    } else {
+        return None;
+    };
+    let base_end = base.start.checked_add(base.length)?;
+    let other_end = other.start.checked_add(other.length)?;
+    let row_bytes = width.div_ceil(2).checked_mul(2)?;
+    let required = height
+        .div_ceil(2)
+        .checked_sub(1)?
+        .checked_mul(base.row_stride)?
+        .checked_add(row_bytes)?;
+    if other_end > base_end || base.row_stride < row_bytes || base.length < required {
+        return None;
+    }
+    Some(InterleavedChromaLayout {
+        start: base.start,
+        length: base.length,
+        row_stride: base.row_stride,
+        format,
+    })
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FrameLayout {
     pub width: u32,
@@ -405,30 +469,49 @@ impl FrameLayout {
             return Err(invalid());
         }
         let (w, h) = (self.width as usize, self.height as usize);
-        let specs: Vec<(usize, usize, usize)> = match self.format {
-            PixelFormat::Mjpeg | PixelFormat::H264 => vec![(1, 1, 1)],
-            PixelFormat::Nv12 | PixelFormat::Nv21 => {
-                vec![(w, h, 1), (w.div_ceil(2), h.div_ceil(2), 2)]
+        let mut specs = [(0, 0, 0); 3];
+        let spec_count = match self.format {
+            PixelFormat::Mjpeg | PixelFormat::H264 => {
+                specs[0] = (1, 1, 1);
+                1
             }
-            PixelFormat::Yuv420p => vec![
-                (w, h, 1),
-                (w.div_ceil(2), h.div_ceil(2), 1),
-                (w.div_ceil(2), h.div_ceil(2), 1),
-            ],
-            PixelFormat::Rgb8 | PixelFormat::Bgr8 => vec![(w, h, 3)],
-            PixelFormat::Bgra8 | PixelFormat::Rgba8 | PixelFormat::Argb8 => vec![(w, h, 4)],
+            PixelFormat::Nv12 | PixelFormat::Nv21 => {
+                specs[0] = (w, h, 1);
+                specs[1] = (w.div_ceil(2), h.div_ceil(2), 2);
+                2
+            }
+            PixelFormat::Yuv420p => {
+                specs[0] = (w, h, 1);
+                specs[1] = (w.div_ceil(2), h.div_ceil(2), 1);
+                specs[2] = (w.div_ceil(2), h.div_ceil(2), 1);
+                3
+            }
+            PixelFormat::Rgb8 | PixelFormat::Bgr8 => {
+                specs[0] = (w, h, 3);
+                1
+            }
+            PixelFormat::Bgra8 | PixelFormat::Rgba8 | PixelFormat::Argb8 => {
+                specs[0] = (w, h, 4);
+                1
+            }
             PixelFormat::Yuyv | PixelFormat::Uyvy => {
                 if w % 2 != 0 {
                     return Err(invalid());
                 }
-                vec![(w, h, 2)]
+                specs[0] = (w, h, 2);
+                1
             }
-            PixelFormat::Gray8 => vec![(w, h, 1)],
+            PixelFormat::Gray8 => {
+                specs[0] = (w, h, 1);
+                1
+            }
         };
-        if self.planes.len() != specs.len() {
+        if self.planes.len() != spec_count {
             return Err(invalid());
         }
-        for (p, (cols, rows, channels)) in self.planes.iter().zip(specs) {
+        for (p, (cols, rows, channels)) in
+            self.planes.iter().zip(specs[..spec_count].iter().copied())
+        {
             if p.length == 0 || p.offset.checked_add(p.length).is_none_or(|n| n > length) {
                 return Err(invalid());
             }
@@ -452,5 +535,49 @@ impl FrameLayout {
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod interleaved_chroma_tests {
+    use super::*;
+
+    fn plane(start: usize, length: usize) -> ChromaPlaneSpan {
+        ChromaPlaneSpan {
+            start,
+            length,
+            row_stride: 4,
+            pixel_stride: 2,
+        }
+    }
+
+    #[test]
+    fn detects_overlapping_nv12_and_nv21_without_assuming_missing_tail_bytes() {
+        let nv12 = interleaved_chroma_layout(4, 4, plane(100, 8), plane(101, 7)).unwrap();
+        assert_eq!(nv12.start, 100);
+        assert_eq!(nv12.length, 8);
+        assert_eq!(nv12.row_stride, 4);
+        assert_eq!(nv12.format, PixelFormat::Nv12);
+
+        let nv21 = interleaved_chroma_layout(4, 4, plane(101, 7), plane(100, 8)).unwrap();
+        assert_eq!(nv21.start, 100);
+        assert_eq!(nv21.length, 8);
+        assert_eq!(nv21.format, PixelFormat::Nv21);
+
+        assert!(interleaved_chroma_layout(4, 4, plane(100, 8), plane(101, 8)).is_none());
+        assert!(interleaved_chroma_layout(4, 6, plane(100, 8), plane(101, 7)).is_none());
+    }
+
+    #[test]
+    fn rejects_disjoint_or_incompatible_chroma_planes() {
+        assert!(interleaved_chroma_layout(4, 4, plane(100, 8), plane(200, 8)).is_none());
+
+        let mut wrong_stride = plane(101, 7);
+        wrong_stride.row_stride = 6;
+        assert!(interleaved_chroma_layout(4, 4, plane(100, 8), wrong_stride).is_none());
+
+        let mut planar = plane(101, 7);
+        planar.pixel_stride = 1;
+        assert!(interleaved_chroma_layout(4, 4, plane(100, 8), planar).is_none());
     }
 }

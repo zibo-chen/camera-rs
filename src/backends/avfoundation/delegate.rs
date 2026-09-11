@@ -305,11 +305,34 @@ unsafe fn handle_sample_buffer_unsafe(sample_buffer: &CMSampleBuffer, state: &De
                 ));
             }
             match pixel_format {
-                0x42475241 => {
-                    bgra_to_rgb(base_address as *const u8, rgb, width, height, bytes_per_row)
-                }
-                0x00000020 => {
-                    argb_to_rgb(base_address as *const u8, rgb, width, height, bytes_per_row)
+                0x42475241 | 0x00000020 => {
+                    let source_length = (height as usize - 1)
+                        .checked_mul(bytes_per_row)
+                        .and_then(|bytes| bytes.checked_add(width as usize * 4))
+                        .ok_or_else(|| {
+                            crate::CameraError::InvalidFormat(
+                                "AVFoundation packed frame size overflow".into(),
+                            )
+                        })?;
+                    let source =
+                        std::slice::from_raw_parts(base_address as *const u8, source_length);
+                    if pixel_format == 0x42475241 {
+                        crate::utils::color_convert::bgra8888_to_rgb_into(
+                            source,
+                            width as usize,
+                            height as usize,
+                            bytes_per_row,
+                            rgb,
+                        )?;
+                    } else {
+                        crate::utils::color_convert::argb8888_to_rgb_into(
+                            source,
+                            width as usize,
+                            height as usize,
+                            bytes_per_row,
+                            rgb,
+                        )?;
+                    }
                 }
                 0x79757673 => {
                     yuyv_to_rgb(base_address as *const u8, rgb, width, height, bytes_per_row)
@@ -323,38 +346,6 @@ unsafe fn handle_sample_buffer_unsafe(sample_buffer: &CMSampleBuffer, state: &De
         });
     if let Err(error) = result {
         log::warn!("AVFoundation frame rejected: {}", error);
-    }
-}
-
-/// BGRA 转 RGB
-fn bgra_to_rgb(src: *const u8, dst: &mut [u8], width: u32, height: u32, bytes_per_row: usize) {
-    for y in 0..height as usize {
-        for x in 0..width as usize {
-            let src_offset = y * bytes_per_row + x * 4;
-            let dst_offset = (y * width as usize + x) * 3;
-
-            unsafe {
-                dst[dst_offset] = *src.add(src_offset + 2); // R
-                dst[dst_offset + 1] = *src.add(src_offset + 1); // G
-                dst[dst_offset + 2] = *src.add(src_offset); // B
-            }
-        }
-    }
-}
-
-/// ARGB 转 RGB
-fn argb_to_rgb(src: *const u8, dst: &mut [u8], width: u32, height: u32, bytes_per_row: usize) {
-    for y in 0..height as usize {
-        for x in 0..width as usize {
-            let src_offset = y * bytes_per_row + x * 4;
-            let dst_offset = (y * width as usize + x) * 3;
-
-            unsafe {
-                dst[dst_offset] = *src.add(src_offset + 1); // R
-                dst[dst_offset + 1] = *src.add(src_offset + 2); // G
-                dst[dst_offset + 2] = *src.add(src_offset + 3); // B
-            }
-        }
     }
 }
 

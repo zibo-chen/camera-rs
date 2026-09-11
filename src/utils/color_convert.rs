@@ -4,11 +4,16 @@
 //! - 标量实现（fallback）
 //! - SIMD 优化实现（使用 portable_simd 或平台特定 intrinsics）
 //!
-//! ARM64 uses checked NEON conversion with scalar-equivalent rounding. Other
-//! targets use scalar/compiler-vectorized loops. No parallel/GPU path is enabled;
-//! use the benchmark on the target device instead of assuming a speedup.
+//! ARM64 uses checked NEON conversion with scalar-equivalent rounding. x86_64
+//! runtime-dispatches packed 4:2:2, planar YUV420 and NV12/NV21 full/half-size
+//! rows to AVX2; other targets use scalar/compiler-vectorized loops. No
+//! parallel/GPU path is enabled; use the benchmark on the target device instead
+//! of assuming a speedup.
 
-use crate::error::{CameraError, Result};
+use crate::{
+    error::{CameraError, Result},
+    ColorInfo, ColorMatrix, ColorRange,
+};
 
 /// One Android YUV_420_888 plane. U and V may be disjoint (I420) or
 /// overlapping (NV12/NV21). The final row need not include trailing padding.
@@ -18,6 +23,17 @@ pub struct YuvPlane<'a> {
     pub row_stride: usize,
     pub pixel_stride: usize,
 }
+
+#[derive(Clone, Copy)]
+pub(crate) struct Yuv420Sp<'a> {
+    pub y: &'a [u8],
+    pub uv: &'a [u8],
+    pub y_stride: usize,
+    pub uv_stride: usize,
+    pub vu_order: bool,
+}
+
+const BT601_FULL_COEFFICIENTS: [i32; 6] = [1024, 1436, 352, 731, 1815, 0];
 
 impl YuvPlane<'_> {
     fn validate(&self, width: usize, height: usize) -> Result<()> {
@@ -41,6 +57,425 @@ impl YuvPlane<'_> {
     }
 }
 
+pub(crate) fn color_coefficients(color: ColorInfo) -> Result<[i32; 6]> {
+    if color.matrix == ColorMatrix::Bt601 && color.range == ColorRange::Full {
+        return Ok(BT601_FULL_COEFFICIENTS);
+    }
+    let (kr, kb): (f64, f64) = match color.matrix {
+        ColorMatrix::Bt601 => (0.299, 0.114),
+        ColorMatrix::Bt709 => (0.2126, 0.0722),
+        ColorMatrix::Bt2020 => (0.2627, 0.0593),
+        ColorMatrix::Smpte240M => (0.212, 0.087),
+        ColorMatrix::Unknown => {
+            return Err(CameraError::UnsupportedFormat(
+                "YUV color matrix is unknown; supply a color override".into(),
+            ));
+        }
+    };
+    let (sy, sc, offset) = match color.range {
+        ColorRange::Full => (1.0, 1.0, 0),
+        ColorRange::Limited => (255.0 / 219.0, 255.0 / 224.0, 16),
+        ColorRange::Unknown => {
+            return Err(CameraError::UnsupportedFormat(
+                "YUV quantization range is unknown; supply a color override".into(),
+            ));
+        }
+    };
+    let kg = 1.0 - kr - kb;
+    Ok([
+        (sy * 1024.0_f64).round() as i32,
+        ((2.0 - 2.0 * kr) * sc * 1024.0).round() as i32,
+        ((2.0 - 2.0 * kb) * kb / kg * sc * 1024.0).round() as i32,
+        ((2.0 - 2.0 * kr) * kr / kg * sc * 1024.0).round() as i32,
+        ((2.0 - 2.0 * kb) * sc * 1024.0).round() as i32,
+        offset,
+    ])
+}
+
+#[inline(always)]
+pub(crate) fn yuv_pixel(
+    [cy, cr, gu, gv, cb, offset]: [i32; 6],
+    y: u8,
+    u: u8,
+    v: u8,
+    out: &mut [u8],
+) {
+    let y = (y as i32 - offset) * cy;
+    let u = u as i32 - 128;
+    let v = v as i32 - 128;
+    out[0] = ((y + cr * v + 512) >> 10).clamp(0, 255) as u8;
+    out[1] = ((y - gu * u - gv * v + 512) >> 10).clamp(0, 255) as u8;
+    out[2] = ((y + cb * u + 512) >> 10).clamp(0, 255) as u8;
+}
+
+pub(crate) fn yuv420_to_rgb_with_coefficients_into(
+    y: YuvPlane<'_>,
+    u: YuvPlane<'_>,
+    v: YuvPlane<'_>,
+    width: usize,
+    height: usize,
+    coefficients: [i32; 6],
+    rgb: &mut [u8],
+) -> Result<()> {
+    y.validate(width, height)?;
+    u.validate(width.div_ceil(2), height.div_ceil(2))?;
+    v.validate(width.div_ceil(2), height.div_ceil(2))?;
+    let length = width
+        .checked_mul(height)
+        .and_then(|pixels| pixels.checked_mul(3))
+        .ok_or_else(|| CameraError::InvalidFormat("RGB size overflow".into()))?;
+    if rgb.len() < length {
+        return Err(CameraError::InvalidFormat("RGB buffer too short".into()));
+    }
+    for row in 0..height {
+        #[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
+        let start = if y.pixel_stride == 1 {
+            unsafe {
+                neon::planar_row_with_coefficients(
+                    &y.data[row * y.row_stride..][..width],
+                    &u.data[(row / 2) * u.row_stride..],
+                    &v.data[(row / 2) * v.row_stride..],
+                    (u.pixel_stride, v.pixel_stride),
+                    coefficients,
+                    &mut rgb[row * width * 3..][..width * 3],
+                )
+            }
+        } else {
+            0
+        };
+        #[cfg(target_arch = "x86_64")]
+        let start = if y.pixel_stride == 1
+            && u.pixel_stride == 1
+            && v.pixel_stride == 1
+            && std::arch::is_x86_feature_detected!("avx2")
+        {
+            unsafe {
+                x86::planar_row_avx2::<10, 512, 512>(
+                    &y.data[row * y.row_stride..][..width],
+                    &u.data[(row / 2) * u.row_stride..][..width.div_ceil(2)],
+                    &v.data[(row / 2) * v.row_stride..][..width.div_ceil(2)],
+                    &mut rgb[row * width * 3..][..width * 3],
+                    coefficients,
+                )
+            }
+        } else {
+            0
+        };
+        #[cfg(all(
+            not(all(target_arch = "aarch64", target_feature = "neon")),
+            not(target_arch = "x86_64")
+        ))]
+        let start = 0;
+        for column in (start..width).step_by(2) {
+            let u = u.data[(row / 2) * u.row_stride + (column / 2) * u.pixel_stride];
+            let v = v.data[(row / 2) * v.row_stride + (column / 2) * v.pixel_stride];
+            for x in column..(column + 2).min(width) {
+                yuv_pixel(
+                    coefficients,
+                    y.data[row * y.row_stride + x * y.pixel_stride],
+                    u,
+                    v,
+                    &mut rgb[(row * width + x) * 3..][..3],
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn yuv420sp_to_rgb_with_coefficients_into(
+    planes: Yuv420Sp<'_>,
+    width: usize,
+    height: usize,
+    coefficients: [i32; 6],
+    rgb: &mut [u8],
+) -> Result<()> {
+    let Yuv420Sp {
+        y: y_plane,
+        uv: uv_plane,
+        y_stride,
+        uv_stride,
+        vu_order,
+    } = planes;
+    #[cfg(all(
+        not(all(target_arch = "aarch64", target_feature = "neon")),
+        target_arch = "x86_64"
+    ))]
+    if coefficients == BT601_FULL_COEFFICIENTS
+        && !vu_order
+        && !std::arch::is_x86_feature_detected!("avx2")
+    {
+        return yuv420sp_bt601_full_to_rgb_into(
+            y_plane, uv_plane, width, height, y_stride, uv_stride, rgb,
+        );
+    }
+    #[cfg(all(
+        not(all(target_arch = "aarch64", target_feature = "neon")),
+        not(target_arch = "x86_64")
+    ))]
+    if coefficients == BT601_FULL_COEFFICIENTS && !vu_order {
+        return yuv420sp_bt601_full_to_rgb_into(
+            y_plane, uv_plane, width, height, y_stride, uv_stride, rgb,
+        );
+    }
+    YuvPlane {
+        data: y_plane,
+        row_stride: y_stride,
+        pixel_stride: 1,
+    }
+    .validate(width, height)?;
+    let chroma_row_bytes = width
+        .div_ceil(2)
+        .checked_mul(2)
+        .ok_or_else(|| CameraError::InvalidFormat("YUV420 size overflow".into()))?;
+    let chroma_rows = height.div_ceil(2);
+    let required_uv = (chroma_rows - 1)
+        .checked_mul(uv_stride)
+        .and_then(|bytes| bytes.checked_add(chroma_row_bytes))
+        .ok_or_else(|| CameraError::InvalidFormat("YUV420 size overflow".into()))?;
+    let required_rgb = width
+        .checked_mul(height)
+        .and_then(|pixels| pixels.checked_mul(3))
+        .ok_or_else(|| CameraError::InvalidFormat("RGB size overflow".into()))?;
+    if uv_stride < chroma_row_bytes || uv_plane.len() < required_uv || rgb.len() < required_rgb {
+        return Err(CameraError::InvalidFormat(
+            "invalid YUV420 UV stride or buffer size".into(),
+        ));
+    }
+    for row in 0..height {
+        let y_row = &y_plane[row * y_stride..][..width];
+        let uv_row = &uv_plane[(row / 2) * uv_stride..][..chroma_row_bytes];
+        let rgb_row = &mut rgb[row * width * 3..][..width * 3];
+        #[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
+        let start = unsafe {
+            neon::semiplanar_row_with_coefficients(y_row, uv_row, vu_order, coefficients, rgb_row)
+        };
+        #[cfg(all(
+            not(all(target_arch = "aarch64", target_feature = "neon")),
+            target_arch = "x86_64"
+        ))]
+        let start = if std::arch::is_x86_feature_detected!("avx2") {
+            unsafe {
+                if vu_order {
+                    x86::semiplanar_row_avx2::<true, 10, 512, 512>(
+                        y_row,
+                        uv_row,
+                        rgb_row,
+                        coefficients,
+                    )
+                } else {
+                    x86::semiplanar_row_avx2::<false, 10, 512, 512>(
+                        y_row,
+                        uv_row,
+                        rgb_row,
+                        coefficients,
+                    )
+                }
+            }
+        } else {
+            0
+        };
+        #[cfg(all(
+            not(all(target_arch = "aarch64", target_feature = "neon")),
+            not(target_arch = "x86_64")
+        ))]
+        let start = 0;
+        for column in (start..width).step_by(2) {
+            let chroma = (column / 2) * 2;
+            let (u, v) = if vu_order {
+                (uv_row[chroma + 1], uv_row[chroma])
+            } else {
+                (uv_row[chroma], uv_row[chroma + 1])
+            };
+            for x in column..(column + 2).min(width) {
+                yuv_pixel(coefficients, y_row[x], u, v, &mut rgb_row[x * 3..x * 3 + 3]);
+            }
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn yuv420sp_to_rgb_half_with_coefficients_into(
+    planes: Yuv420Sp<'_>,
+    width: usize,
+    height: usize,
+    coefficients: [i32; 6],
+    rgb: &mut [u8],
+) -> Result<()> {
+    if width == 0 || height == 0 || !width.is_multiple_of(2) || !height.is_multiple_of(2) {
+        return Err(CameraError::InvalidFormat(
+            "half-size YUV420 conversion requires positive even dimensions".into(),
+        ));
+    }
+    YuvPlane {
+        data: planes.y,
+        row_stride: planes.y_stride,
+        pixel_stride: 1,
+    }
+    .validate(width, height)?;
+    let chroma_rows = height / 2;
+    let required_uv = (chroma_rows - 1)
+        .checked_mul(planes.uv_stride)
+        .and_then(|bytes| bytes.checked_add(width))
+        .ok_or_else(|| CameraError::InvalidFormat("YUV420 size overflow".into()))?;
+    let output_width = width / 2;
+    let output_height = height / 2;
+    let required_rgb = output_width
+        .checked_mul(output_height)
+        .and_then(|pixels| pixels.checked_mul(3))
+        .ok_or_else(|| CameraError::InvalidFormat("RGB size overflow".into()))?;
+    if planes.uv_stride < width || planes.uv.len() < required_uv || rgb.len() < required_rgb {
+        return Err(CameraError::InvalidFormat(
+            "invalid YUV420 UV stride or half-size RGB buffer".into(),
+        ));
+    }
+    for row in 0..output_height {
+        let y_row = &planes.y[row * 2 * planes.y_stride..][..width];
+        let uv_row = &planes.uv[row * planes.uv_stride..][..width];
+        let rgb_row = &mut rgb[row * output_width * 3..][..output_width * 3];
+        #[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
+        let start = unsafe {
+            neon::semiplanar_half_row_with_coefficients(
+                y_row,
+                uv_row,
+                planes.vu_order,
+                coefficients,
+                rgb_row,
+            )
+        };
+        #[cfg(all(
+            not(all(target_arch = "aarch64", target_feature = "neon")),
+            target_arch = "x86_64"
+        ))]
+        let start = if std::arch::is_x86_feature_detected!("avx2") {
+            unsafe {
+                if planes.vu_order {
+                    x86::semiplanar_half_row_avx2::<true, 10, 512, 512>(
+                        y_row,
+                        uv_row,
+                        rgb_row,
+                        coefficients,
+                    )
+                } else {
+                    x86::semiplanar_half_row_avx2::<false, 10, 512, 512>(
+                        y_row,
+                        uv_row,
+                        rgb_row,
+                        coefficients,
+                    )
+                }
+            }
+        } else {
+            0
+        };
+        #[cfg(all(
+            not(all(target_arch = "aarch64", target_feature = "neon")),
+            not(target_arch = "x86_64")
+        ))]
+        let start = 0;
+        for column in start..output_width {
+            let (u, v) = if planes.vu_order {
+                (uv_row[column * 2 + 1], uv_row[column * 2])
+            } else {
+                (uv_row[column * 2], uv_row[column * 2 + 1])
+            };
+            yuv_pixel(
+                coefficients,
+                y_row[column * 2],
+                u,
+                v,
+                &mut rgb_row[column * 3..column * 3 + 3],
+            );
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn yuv422_to_rgb_with_coefficients_into(
+    source: &[u8],
+    width: usize,
+    height: usize,
+    stride: usize,
+    uyvy: bool,
+    coefficients: [i32; 6],
+    rgb: &mut [u8],
+) -> Result<()> {
+    let source_row_bytes = width
+        .checked_mul(2)
+        .ok_or_else(|| CameraError::InvalidFormat("YUV422 size overflow".into()))?;
+    let rgb_row_bytes = width
+        .checked_mul(3)
+        .ok_or_else(|| CameraError::InvalidFormat("RGB size overflow".into()))?;
+    if width == 0 || height == 0 || !width.is_multiple_of(2) || stride < source_row_bytes {
+        return Err(CameraError::InvalidFormat(
+            "invalid YUV422 dimensions or stride".into(),
+        ));
+    }
+    let required_source = (height - 1)
+        .checked_mul(stride)
+        .and_then(|bytes| bytes.checked_add(source_row_bytes))
+        .ok_or_else(|| CameraError::InvalidFormat("YUV422 size overflow".into()))?;
+    let required_rgb = height
+        .checked_mul(rgb_row_bytes)
+        .ok_or_else(|| CameraError::InvalidFormat("RGB size overflow".into()))?;
+    if source.len() < required_source || rgb.len() < required_rgb {
+        return Err(CameraError::InvalidFormat(
+            "YUV422 or RGB buffer is too small".into(),
+        ));
+    }
+    for row in 0..height {
+        let source_row = &source[row * stride..][..source_row_bytes];
+        let rgb_row = &mut rgb[row * rgb_row_bytes..][..rgb_row_bytes];
+        #[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
+        let start = unsafe {
+            neon::packed422_row_with_coefficients(source_row, uyvy, coefficients, rgb_row)
+        };
+        #[cfg(all(
+            not(all(target_arch = "aarch64", target_feature = "neon")),
+            target_arch = "x86_64"
+        ))]
+        let start = if std::arch::is_x86_feature_detected!("avx2") {
+            unsafe {
+                if uyvy {
+                    x86::packed422_avx2::<true, 10, 512, 512>(source_row, rgb_row, coefficients);
+                } else {
+                    x86::packed422_avx2::<false, 10, 512, 512>(source_row, rgb_row, coefficients);
+                }
+            }
+            width
+        } else {
+            0
+        };
+        #[cfg(all(
+            not(all(target_arch = "aarch64", target_feature = "neon")),
+            not(target_arch = "x86_64")
+        ))]
+        let start = 0;
+        for column in (start..width).step_by(2) {
+            let input = column * 2;
+            let output = column * 3;
+            let (y0, u, y1, v) = if uyvy {
+                (
+                    source_row[input + 1],
+                    source_row[input],
+                    source_row[input + 3],
+                    source_row[input + 2],
+                )
+            } else {
+                (
+                    source_row[input],
+                    source_row[input + 1],
+                    source_row[input + 2],
+                    source_row[input + 3],
+                )
+            };
+            yuv_pixel(coefficients, y0, u, v, &mut rgb_row[output..output + 3]);
+            yuv_pixel(coefficients, y1, u, v, &mut rgb_row[output + 3..output + 6]);
+        }
+    }
+    Ok(())
+}
+
 pub fn yuv420_to_rgb_into(
     y: YuvPlane<'_>,
     u: YuvPlane<'_>,
@@ -49,48 +484,7 @@ pub fn yuv420_to_rgb_into(
     height: usize,
     rgb: &mut [u8],
 ) -> Result<()> {
-    y.validate(width, height)?;
-    u.validate(width.div_ceil(2), height.div_ceil(2))?;
-    v.validate(width.div_ceil(2), height.div_ceil(2))?;
-    let length = width
-        .checked_mul(height)
-        .and_then(|n| n.checked_mul(3))
-        .ok_or_else(|| CameraError::InvalidFormat("RGB size overflow".into()))?;
-    if rgb.len() < length {
-        return Err(CameraError::InvalidFormat("RGB buffer too short".into()));
-    }
-    for row in 0..height {
-        let start = 0;
-        #[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
-        let start = if y.pixel_stride == 1 {
-            unsafe {
-                neon::planar_row(
-                    &y.data[row * y.row_stride..][..width],
-                    &u.data[(row / 2) * u.row_stride..],
-                    &v.data[(row / 2) * v.row_stride..],
-                    (u.pixel_stride, v.pixel_stride),
-                    &mut rgb[row * width * 3..][..width * 3],
-                )
-            }
-        } else {
-            start
-        };
-        for col in (start..width).step_by(2) {
-            let uu = u.data[(row / 2) * u.row_stride + (col / 2) * u.pixel_stride] as i32 - 128;
-            let vv = v.data[(row / 2) * v.row_stride + (col / 2) * v.pixel_stride] as i32 - 128;
-            let r = (359 * vv) >> 8;
-            let g = (88 * uu + 183 * vv) >> 8;
-            let b = (454 * uu) >> 8;
-            for x in col..(col + 2).min(width) {
-                let yy = y.data[row * y.row_stride + x * y.pixel_stride] as i32;
-                let out = &mut rgb[(row * width + x) * 3..][..3];
-                out[0] = (yy + r).clamp(0, 255) as u8;
-                out[1] = (yy - g).clamp(0, 255) as u8;
-                out[2] = (yy + b).clamp(0, 255) as u8;
-            }
-        }
-    }
-    Ok(())
+    yuv420_to_rgb_with_coefficients_into(y, u, v, width, height, BT601_FULL_COEFFICIENTS, rgb)
 }
 
 // ============================================================================
@@ -375,7 +769,7 @@ fn uyvy_to_rgb_scalar_into(uyvy_data: &[u8], rgb_buffer: &mut [u8]) -> Result<()
 
 // 根据目标架构选择最优实现：
 // - ARM64 (aarch64): 使用 NEON intrinsics
-// - x86_64: 使用循环展开帮助编译器自动向量化
+// - x86_64: 运行时检测 AVX2，未支持路径回退到通用实现
 // - 其他: 使用标量实现
 
 /// SIMD 优化的 YUYV 转 RGB
@@ -428,6 +822,54 @@ mod neon {
         )
     }
 
+    #[inline(always)]
+    unsafe fn rgb4_with_coefficients(
+        y: int16x4_t,
+        u: int16x4_t,
+        v: int16x4_t,
+        [cy, cr, gu, gv, cb, _]: [i32; 6],
+    ) -> (int16x4_t, int16x4_t, int16x4_t) {
+        let y = vmull_n_s16(y, cy as i16);
+        let rounding = vdupq_n_s32(512);
+        let r = vshrn_n_s32::<10>(vaddq_s32(vmlal_n_s16(y, v, cr as i16), rounding));
+        let g = vshrn_n_s32::<10>(vaddq_s32(
+            vmlsl_n_s16(vmlsl_n_s16(y, u, gu as i16), v, gv as i16),
+            rounding,
+        ));
+        let b = vshrn_n_s32::<10>(vaddq_s32(vmlal_n_s16(y, u, cb as i16), rounding));
+        (r, g, b)
+    }
+
+    #[inline(always)]
+    unsafe fn rgb8_with_coefficients(
+        y: uint8x8_t,
+        u: uint8x8_t,
+        v: uint8x8_t,
+        coefficients: [i32; 6],
+    ) -> uint8x8x3_t {
+        let offset = vdupq_n_s16(coefficients[5] as i16);
+        let y = vsubq_s16(vreinterpretq_s16_u16(vmovl_u8(y)), offset);
+        let u = vsubq_s16(vreinterpretq_s16_u16(vmovl_u8(u)), vdupq_n_s16(128));
+        let v = vsubq_s16(vreinterpretq_s16_u16(vmovl_u8(v)), vdupq_n_s16(128));
+        let low = rgb4_with_coefficients(
+            vget_low_s16(y),
+            vget_low_s16(u),
+            vget_low_s16(v),
+            coefficients,
+        );
+        let high = rgb4_with_coefficients(
+            vget_high_s16(y),
+            vget_high_s16(u),
+            vget_high_s16(v),
+            coefficients,
+        );
+        uint8x8x3_t(
+            vqmovun_s16(vcombine_s16(low.0, high.0)),
+            vqmovun_s16(vcombine_s16(low.1, high.1)),
+            vqmovun_s16(vcombine_s16(low.2, high.2)),
+        )
+    }
+
     #[inline]
     pub unsafe fn packed422<const UYVY: bool>(source: &[u8], rgb: &mut [u8]) {
         let groups = (source.len() / 32).min(rgb.len() / 48);
@@ -456,36 +898,464 @@ mod neon {
         }
     }
 
+    pub unsafe fn packed422_row_with_coefficients(
+        source: &[u8],
+        uyvy: bool,
+        coefficients: [i32; 6],
+        rgb: &mut [u8],
+    ) -> usize {
+        let groups = (source.len() / 32).min(rgb.len() / 48);
+        for group in 0..groups {
+            let pixels = vld4_u8(source.as_ptr().add(group * 32));
+            let (y0, u, y1, v) = if uyvy {
+                (pixels.1, pixels.0, pixels.3, pixels.2)
+            } else {
+                (pixels.0, pixels.1, pixels.2, pixels.3)
+            };
+            vst3_u8(
+                rgb.as_mut_ptr().add(group * 48),
+                rgb8_with_coefficients(
+                    vzip1_u8(y0, y1),
+                    vzip1_u8(u, u),
+                    vzip1_u8(v, v),
+                    coefficients,
+                ),
+            );
+            vst3_u8(
+                rgb.as_mut_ptr().add(group * 48 + 24),
+                rgb8_with_coefficients(
+                    vzip2_u8(y0, y1),
+                    vzip2_u8(u, u),
+                    vzip2_u8(v, v),
+                    coefficients,
+                ),
+            );
+        }
+        groups * 16
+    }
+
     pub unsafe fn yuyv_to_rgb_neon(source: &[u8], rgb: &mut [u8]) {
         packed422::<false>(source, rgb);
     }
 
-    // Four chroma samples are sufficient for eight pixels. Gather exactly
-    // those bytes; Android can omit the padding byte after the last sample.
-    pub unsafe fn planar_row(
+    #[inline]
+    pub unsafe fn packed_8888_row<const R: usize, const G: usize, const B: usize>(
+        source: &[u8],
+        rgb: &mut [u8],
+    ) -> usize {
+        let groups = (source.len() / 64).min(rgb.len() / 48);
+        for group in 0..groups {
+            let pixels = vld4q_u8(source.as_ptr().add(group * 64));
+            let channels = [pixels.0, pixels.1, pixels.2, pixels.3];
+            vst3q_u8(
+                rgb.as_mut_ptr().add(group * 48),
+                uint8x16x3_t(channels[R], channels[G], channels[B]),
+            );
+        }
+        groups * 16
+    }
+
+    pub unsafe fn planar_row_with_coefficients(
         y: &[u8],
         u: &[u8],
         v: &[u8],
         chroma_stride: (usize, usize),
+        coefficients: [i32; 6],
         rgb: &mut [u8],
     ) -> usize {
         let groups = (y.len() / 8).min(rgb.len() / 24);
         for group in 0..groups {
             let offset = group * 4;
-            let uu = u32::from_le_bytes(std::array::from_fn(|i| u[(offset + i) * chroma_stride.0]));
-            let vv = u32::from_le_bytes(std::array::from_fn(|i| v[(offset + i) * chroma_stride.1]));
-            let u = vcreate_u8(uu as u64);
-            let v = vcreate_u8(vv as u64);
+            let u = u32::from_le_bytes(std::array::from_fn(|index| {
+                u[(offset + index) * chroma_stride.0]
+            }));
+            let v = u32::from_le_bytes(std::array::from_fn(|index| {
+                v[(offset + index) * chroma_stride.1]
+            }));
+            let u = vcreate_u8(u as u64);
+            let v = vcreate_u8(v as u64);
             vst3_u8(
                 rgb.as_mut_ptr().add(group * 24),
-                rgb8(
+                rgb8_with_coefficients(
                     vld1_u8(y.as_ptr().add(group * 8)),
                     vzip1_u8(u, u),
                     vzip1_u8(v, v),
+                    coefficients,
                 ),
             );
         }
         groups * 8
+    }
+
+    pub unsafe fn semiplanar_row_with_coefficients(
+        y: &[u8],
+        uv: &[u8],
+        vu_order: bool,
+        coefficients: [i32; 6],
+        rgb: &mut [u8],
+    ) -> usize {
+        let groups = (y.len() / 16).min(uv.len() / 16).min(rgb.len() / 48);
+        for group in 0..groups {
+            let chroma = vld2_u8(uv.as_ptr().add(group * 16));
+            let (u, v) = if vu_order {
+                (chroma.1, chroma.0)
+            } else {
+                (chroma.0, chroma.1)
+            };
+            vst3_u8(
+                rgb.as_mut_ptr().add(group * 48),
+                rgb8_with_coefficients(
+                    vld1_u8(y.as_ptr().add(group * 16)),
+                    vzip1_u8(u, u),
+                    vzip1_u8(v, v),
+                    coefficients,
+                ),
+            );
+            vst3_u8(
+                rgb.as_mut_ptr().add(group * 48 + 24),
+                rgb8_with_coefficients(
+                    vld1_u8(y.as_ptr().add(group * 16 + 8)),
+                    vzip2_u8(u, u),
+                    vzip2_u8(v, v),
+                    coefficients,
+                ),
+            );
+        }
+        groups * 16
+    }
+
+    pub unsafe fn semiplanar_half_row_with_coefficients(
+        y: &[u8],
+        uv: &[u8],
+        vu_order: bool,
+        coefficients: [i32; 6],
+        rgb: &mut [u8],
+    ) -> usize {
+        let groups = (y.len() / 16).min(uv.len() / 16).min(rgb.len() / 24);
+        for group in 0..groups {
+            let luma = vld2_u8(y.as_ptr().add(group * 16)).0;
+            let chroma = vld2_u8(uv.as_ptr().add(group * 16));
+            let (u, v) = if vu_order {
+                (chroma.1, chroma.0)
+            } else {
+                (chroma.0, chroma.1)
+            };
+            vst3_u8(
+                rgb.as_mut_ptr().add(group * 24),
+                rgb8_with_coefficients(luma, u, v, coefficients),
+            );
+        }
+        groups * 8
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+mod x86 {
+    use std::arch::x86_64::*;
+
+    #[inline(always)]
+    unsafe fn combine_shuffled_halves(raw: __m256i, mask: __m128i) -> __m128i {
+        let low = _mm_shuffle_epi8(_mm256_castsi256_si128(raw), mask);
+        let high = _mm_shuffle_epi8(_mm256_extracti128_si256::<1>(raw), mask);
+        _mm_unpacklo_epi64(low, high)
+    }
+
+    #[inline(always)]
+    unsafe fn convert_eight<const SHIFT: i32, const ROUNDING: i32, const GREEN_ROUNDING: i32>(
+        y_bytes: __m128i,
+        u_bytes: __m128i,
+        v_bytes: __m128i,
+        [cy, cr, gu, gv, cb, offset]: [i32; 6],
+        output: &mut [u8],
+    ) {
+        let y = _mm256_mullo_epi32(
+            _mm256_sub_epi32(_mm256_cvtepu8_epi32(y_bytes), _mm256_set1_epi32(offset)),
+            _mm256_set1_epi32(cy),
+        );
+        let center = _mm256_set1_epi32(128);
+        let u = _mm256_sub_epi32(_mm256_cvtepu8_epi32(u_bytes), center);
+        let v = _mm256_sub_epi32(_mm256_cvtepu8_epi32(v_bytes), center);
+        let rounding = _mm256_set1_epi32(ROUNDING);
+        let red = _mm256_srai_epi32::<SHIFT>(_mm256_add_epi32(
+            _mm256_add_epi32(y, _mm256_mullo_epi32(v, _mm256_set1_epi32(cr))),
+            rounding,
+        ));
+        let green = _mm256_srai_epi32::<SHIFT>(_mm256_add_epi32(
+            _mm256_sub_epi32(
+                _mm256_sub_epi32(y, _mm256_mullo_epi32(u, _mm256_set1_epi32(gu))),
+                _mm256_mullo_epi32(v, _mm256_set1_epi32(gv)),
+            ),
+            _mm256_set1_epi32(GREEN_ROUNDING),
+        ));
+        let blue = _mm256_srai_epi32::<SHIFT>(_mm256_add_epi32(
+            _mm256_add_epi32(y, _mm256_mullo_epi32(u, _mm256_set1_epi32(cb))),
+            rounding,
+        ));
+        let zero = _mm256_setzero_si256();
+        let maximum = _mm256_set1_epi32(255);
+        let clamp = |value| _mm256_min_epi32(_mm256_max_epi32(value, zero), maximum);
+        let red = clamp(red);
+        let green = clamp(green);
+        let blue = clamp(blue);
+        let pack = |value: __m256i| {
+            let words = _mm_packus_epi32(
+                _mm256_castsi256_si128(value),
+                _mm256_extracti128_si256::<1>(value),
+            );
+            _mm_packus_epi16(words, words)
+        };
+        let red = pack(red);
+        let green = pack(green);
+        let blue = pack(blue);
+        let first = _mm_or_si128(
+            _mm_or_si128(
+                _mm_shuffle_epi8(
+                    red,
+                    _mm_setr_epi8(0, -1, -1, 1, -1, -1, 2, -1, -1, 3, -1, -1, 4, -1, -1, 5),
+                ),
+                _mm_shuffle_epi8(
+                    green,
+                    _mm_setr_epi8(-1, 0, -1, -1, 1, -1, -1, 2, -1, -1, 3, -1, -1, 4, -1, -1),
+                ),
+            ),
+            _mm_shuffle_epi8(
+                blue,
+                _mm_setr_epi8(-1, -1, 0, -1, -1, 1, -1, -1, 2, -1, -1, 3, -1, -1, 4, -1),
+            ),
+        );
+        let second = _mm_or_si128(
+            _mm_or_si128(
+                _mm_shuffle_epi8(
+                    red,
+                    _mm_setr_epi8(-1, -1, 6, -1, -1, 7, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1),
+                ),
+                _mm_shuffle_epi8(
+                    green,
+                    _mm_setr_epi8(5, -1, -1, 6, -1, -1, 7, -1, -1, -1, -1, -1, -1, -1, -1, -1),
+                ),
+            ),
+            _mm_shuffle_epi8(
+                blue,
+                _mm_setr_epi8(-1, 5, -1, -1, 6, -1, -1, 7, -1, -1, -1, -1, -1, -1, -1, -1),
+            ),
+        );
+        _mm_storeu_si128(output.as_mut_ptr().cast(), first);
+        _mm_storel_epi64(output.as_mut_ptr().add(16).cast(), second);
+    }
+
+    /// Convert complete YUV 4:2:2 pixel pairs. Callers must runtime-check AVX2.
+    #[target_feature(enable = "avx2")]
+    pub(super) unsafe fn packed422_avx2<
+        const UYVY: bool,
+        const SHIFT: i32,
+        const ROUNDING: i32,
+        const GREEN_ROUNDING: i32,
+    >(
+        source: &[u8],
+        rgb: &mut [u8],
+        coefficients: [i32; 6],
+    ) {
+        let pair_count = (source.len() / 4).min(rgb.len() / 6);
+        let (y_mask, u_mask, v_mask) = if UYVY {
+            (
+                _mm_setr_epi8(1, 3, 5, 7, 9, 11, 13, 15, -1, -1, -1, -1, -1, -1, -1, -1),
+                _mm_setr_epi8(0, 0, 4, 4, 8, 8, 12, 12, -1, -1, -1, -1, -1, -1, -1, -1),
+                _mm_setr_epi8(2, 2, 6, 6, 10, 10, 14, 14, -1, -1, -1, -1, -1, -1, -1, -1),
+            )
+        } else {
+            (
+                _mm_setr_epi8(0, 2, 4, 6, 8, 10, 12, 14, -1, -1, -1, -1, -1, -1, -1, -1),
+                _mm_setr_epi8(1, 1, 5, 5, 9, 9, 13, 13, -1, -1, -1, -1, -1, -1, -1, -1),
+                _mm_setr_epi8(3, 3, 7, 7, 11, 11, 15, 15, -1, -1, -1, -1, -1, -1, -1, -1),
+            )
+        };
+        let vectorized_pairs = pair_count / 8 * 8;
+        for pair in (0..vectorized_pairs).step_by(8) {
+            let raw = _mm256_loadu_si256(source.as_ptr().add(pair * 4).cast());
+            let y = combine_shuffled_halves(raw, y_mask);
+            let u = combine_shuffled_halves(raw, u_mask);
+            let v = combine_shuffled_halves(raw, v_mask);
+            let destination = &mut rgb[pair * 6..pair * 6 + 48];
+            convert_eight::<SHIFT, ROUNDING, GREEN_ROUNDING>(
+                y,
+                u,
+                v,
+                coefficients,
+                &mut destination[..24],
+            );
+            convert_eight::<SHIFT, ROUNDING, GREEN_ROUNDING>(
+                _mm_srli_si128::<8>(y),
+                _mm_srli_si128::<8>(u),
+                _mm_srli_si128::<8>(v),
+                coefficients,
+                &mut destination[24..],
+            );
+        }
+        for pair in vectorized_pairs..pair_count {
+            let source = &source[pair * 4..pair * 4 + 4];
+            let (y0, u, y1, v) = if UYVY {
+                (source[1], source[0], source[3], source[2])
+            } else {
+                (source[0], source[1], source[2], source[3])
+            };
+            let [cy, cr, gu, gv, cb, offset] = coefficients;
+            let y0 = (i32::from(y0) - offset) * cy;
+            let y1 = (i32::from(y1) - offset) * cy;
+            let u = i32::from(u) - 128;
+            let v = i32::from(v) - 128;
+            let red_chroma = cr * v + ROUNDING;
+            let green_chroma = -gu * u - gv * v + GREEN_ROUNDING;
+            let blue_chroma = cb * u + ROUNDING;
+            let destination = &mut rgb[pair * 6..pair * 6 + 6];
+            for (y, output) in [y0, y1].into_iter().zip(destination.chunks_exact_mut(3)) {
+                output.copy_from_slice(&[
+                    ((y + red_chroma) >> SHIFT).clamp(0, 255) as u8,
+                    ((y + green_chroma) >> SHIFT).clamp(0, 255) as u8,
+                    ((y + blue_chroma) >> SHIFT).clamp(0, 255) as u8,
+                ]);
+            }
+        }
+    }
+
+    /// Convert complete groups of sixteen pixels from one planar YUV420 row.
+    #[target_feature(enable = "avx2")]
+    pub(super) unsafe fn planar_row_avx2<
+        const SHIFT: i32,
+        const ROUNDING: i32,
+        const GREEN_ROUNDING: i32,
+    >(
+        y: &[u8],
+        u: &[u8],
+        v: &[u8],
+        rgb: &mut [u8],
+        coefficients: [i32; 6],
+    ) -> usize {
+        let groups = (y.len() / 16)
+            .min(u.len() / 8)
+            .min(v.len() / 8)
+            .min(rgb.len() / 48);
+        for group in 0..groups {
+            let y = _mm_loadu_si128(y.as_ptr().add(group * 16).cast());
+            let u = _mm_loadl_epi64(u.as_ptr().add(group * 8).cast());
+            let v = _mm_loadl_epi64(v.as_ptr().add(group * 8).cast());
+            let u = _mm_unpacklo_epi8(u, u);
+            let v = _mm_unpacklo_epi8(v, v);
+            let destination = &mut rgb[group * 48..group * 48 + 48];
+            convert_eight::<SHIFT, ROUNDING, GREEN_ROUNDING>(
+                y,
+                u,
+                v,
+                coefficients,
+                &mut destination[..24],
+            );
+            convert_eight::<SHIFT, ROUNDING, GREEN_ROUNDING>(
+                _mm_srli_si128::<8>(y),
+                _mm_srli_si128::<8>(u),
+                _mm_srli_si128::<8>(v),
+                coefficients,
+                &mut destination[24..],
+            );
+        }
+        groups * 16
+    }
+
+    /// Convert complete groups of sixteen pixels from one NV12/NV21 row.
+    #[target_feature(enable = "avx2")]
+    pub(super) unsafe fn semiplanar_row_avx2<
+        const VU_ORDER: bool,
+        const SHIFT: i32,
+        const ROUNDING: i32,
+        const GREEN_ROUNDING: i32,
+    >(
+        y: &[u8],
+        uv: &[u8],
+        rgb: &mut [u8],
+        coefficients: [i32; 6],
+    ) -> usize {
+        let groups = (y.len() / 16).min(uv.len() / 16).min(rgb.len() / 48);
+        let (u_mask, v_mask) = if VU_ORDER {
+            (
+                _mm_setr_epi8(1, 1, 3, 3, 5, 5, 7, 7, 9, 9, 11, 11, 13, 13, 15, 15),
+                _mm_setr_epi8(0, 0, 2, 2, 4, 4, 6, 6, 8, 8, 10, 10, 12, 12, 14, 14),
+            )
+        } else {
+            (
+                _mm_setr_epi8(0, 0, 2, 2, 4, 4, 6, 6, 8, 8, 10, 10, 12, 12, 14, 14),
+                _mm_setr_epi8(1, 1, 3, 3, 5, 5, 7, 7, 9, 9, 11, 11, 13, 13, 15, 15),
+            )
+        };
+        for group in 0..groups {
+            let y = _mm_loadu_si128(y.as_ptr().add(group * 16).cast());
+            let uv = _mm_loadu_si128(uv.as_ptr().add(group * 16).cast());
+            let u = _mm_shuffle_epi8(uv, u_mask);
+            let v = _mm_shuffle_epi8(uv, v_mask);
+            let destination = &mut rgb[group * 48..group * 48 + 48];
+            convert_eight::<SHIFT, ROUNDING, GREEN_ROUNDING>(
+                y,
+                u,
+                v,
+                coefficients,
+                &mut destination[..24],
+            );
+            convert_eight::<SHIFT, ROUNDING, GREEN_ROUNDING>(
+                _mm_srli_si128::<8>(y),
+                _mm_srli_si128::<8>(u),
+                _mm_srli_si128::<8>(v),
+                coefficients,
+                &mut destination[24..],
+            );
+        }
+        groups * 16
+    }
+
+    /// Convert one directly downsampled NV12/NV21 row (every second luma sample).
+    #[target_feature(enable = "avx2")]
+    pub(super) unsafe fn semiplanar_half_row_avx2<
+        const VU_ORDER: bool,
+        const SHIFT: i32,
+        const ROUNDING: i32,
+        const GREEN_ROUNDING: i32,
+    >(
+        y: &[u8],
+        uv: &[u8],
+        rgb: &mut [u8],
+        coefficients: [i32; 6],
+    ) -> usize {
+        let groups = (y.len() / 32).min(uv.len() / 32).min(rgb.len() / 48);
+        let even_mask = _mm_setr_epi8(0, 2, 4, 6, 8, 10, 12, 14, -1, -1, -1, -1, -1, -1, -1, -1);
+        let odd_mask = _mm_setr_epi8(1, 3, 5, 7, 9, 11, 13, 15, -1, -1, -1, -1, -1, -1, -1, -1);
+        for group in 0..groups {
+            let y = _mm256_loadu_si256(y.as_ptr().add(group * 32).cast());
+            let uv = _mm256_loadu_si256(uv.as_ptr().add(group * 32).cast());
+            let y = combine_shuffled_halves(y, even_mask);
+            let (u, v) = if VU_ORDER {
+                (
+                    combine_shuffled_halves(uv, odd_mask),
+                    combine_shuffled_halves(uv, even_mask),
+                )
+            } else {
+                (
+                    combine_shuffled_halves(uv, even_mask),
+                    combine_shuffled_halves(uv, odd_mask),
+                )
+            };
+            let destination = &mut rgb[group * 48..group * 48 + 48];
+            convert_eight::<SHIFT, ROUNDING, GREEN_ROUNDING>(
+                y,
+                u,
+                v,
+                coefficients,
+                &mut destination[..24],
+            );
+            convert_eight::<SHIFT, ROUNDING, GREEN_ROUNDING>(
+                _mm_srli_si128::<8>(y),
+                _mm_srli_si128::<8>(u),
+                _mm_srli_si128::<8>(v),
+                coefficients,
+                &mut destination[24..],
+            );
+        }
+        groups * 16
     }
 }
 
@@ -497,6 +1367,18 @@ fn yuyv_to_rgb_simd_into(yuyv_data: &[u8], rgb_buffer: &mut [u8]) -> Result<()> 
             neon::yuyv_to_rgb_neon(yuyv_data, rgb_buffer);
         }
         Ok(())
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    if std::arch::is_x86_feature_detected!("avx2") {
+        unsafe {
+            x86::packed422_avx2::<false, 8, 0, 255>(
+                yuyv_data,
+                rgb_buffer,
+                [256, 359, 88, 183, 454, 0],
+            );
+        }
+        return Ok(());
     }
 
     // 通用 SIMD 优化路径（循环展开 + 编译器自动向量化）
@@ -637,6 +1519,17 @@ fn uyvy_to_rgb_simd_into(uyvy_data: &[u8], rgb_buffer: &mut [u8]) -> Result<()> 
         }
         Ok(())
     }
+    #[cfg(target_arch = "x86_64")]
+    if std::arch::is_x86_feature_detected!("avx2") {
+        unsafe {
+            x86::packed422_avx2::<true, 8, 0, 255>(
+                uyvy_data,
+                rgb_buffer,
+                [256, 359, 88, 183, 454, 0],
+            );
+        }
+        return Ok(());
+    }
     #[cfg(not(all(target_arch = "aarch64", target_feature = "neon")))]
     uyvy_to_rgb_simd_generic(uyvy_data, rgb_buffer)
 }
@@ -713,6 +1606,55 @@ fn uyvy_to_rgb_simd_generic(uyvy_data: &[u8], rgb_buffer: &mut [u8]) -> Result<(
     Ok(())
 }
 
+fn packed_8888_to_rgb_into<const R: usize, const G: usize, const B: usize>(
+    packed: &[u8],
+    width: usize,
+    height: usize,
+    packed_stride: usize,
+    rgb: &mut [u8],
+) -> Result<()> {
+    let packed_row_bytes = width
+        .checked_mul(4)
+        .ok_or_else(|| CameraError::InvalidFormat("packed 8888 size overflow".to_string()))?;
+    let rgb_row_bytes = width
+        .checked_mul(3)
+        .ok_or_else(|| CameraError::InvalidFormat("RGB size overflow".to_string()))?;
+    if width == 0 || height == 0 || packed_stride < packed_row_bytes {
+        return Err(CameraError::InvalidFormat(
+            "invalid packed 8888 dimensions or stride".to_string(),
+        ));
+    }
+
+    let required_packed = (height - 1)
+        .checked_mul(packed_stride)
+        .and_then(|size| size.checked_add(packed_row_bytes))
+        .ok_or_else(|| CameraError::InvalidFormat("packed 8888 size overflow".to_string()))?;
+    let required_rgb = height
+        .checked_mul(rgb_row_bytes)
+        .ok_or_else(|| CameraError::InvalidFormat("RGB size overflow".to_string()))?;
+    if packed.len() < required_packed || rgb.len() < required_rgb {
+        return Err(CameraError::InvalidFormat(
+            "packed 8888 or RGB buffer is too small".to_string(),
+        ));
+    }
+
+    for row in 0..height {
+        let source = &packed[row * packed_stride..row * packed_stride + packed_row_bytes];
+        let destination = &mut rgb[row * rgb_row_bytes..(row + 1) * rgb_row_bytes];
+        #[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
+        let converted = unsafe { neon::packed_8888_row::<R, G, B>(source, destination) };
+        #[cfg(not(all(target_arch = "aarch64", target_feature = "neon")))]
+        let converted = 0;
+        for x in converted..width {
+            let source_pixel = &source[x * 4..x * 4 + 4];
+            let destination_pixel = &mut destination[x * 3..x * 3 + 3];
+            destination_pixel.copy_from_slice(&[source_pixel[R], source_pixel[G], source_pixel[B]]);
+        }
+    }
+
+    Ok(())
+}
+
 /// 将带行跨度的 RGBA8888 缓冲区压缩成紧凑 RGB。
 pub fn rgba8888_to_rgb_into(
     rgba: &[u8],
@@ -721,50 +1663,113 @@ pub fn rgba8888_to_rgb_into(
     rgba_stride: usize,
     rgb: &mut [u8],
 ) -> Result<()> {
-    let rgba_row_bytes = width
-        .checked_mul(4)
-        .ok_or_else(|| CameraError::InvalidFormat("RGBA size overflow".to_string()))?;
-    let rgb_row_bytes = width
-        .checked_mul(3)
-        .ok_or_else(|| CameraError::InvalidFormat("RGB size overflow".to_string()))?;
-    if width == 0 || height == 0 || rgba_stride < rgba_row_bytes {
+    packed_8888_to_rgb_into::<0, 1, 2>(rgba, width, height, rgba_stride, rgb)
+}
+
+/// 将带行跨度的 BGRA8888 缓冲区压缩成紧凑 RGB。
+pub fn bgra8888_to_rgb_into(
+    bgra: &[u8],
+    width: usize,
+    height: usize,
+    bgra_stride: usize,
+    rgb: &mut [u8],
+) -> Result<()> {
+    packed_8888_to_rgb_into::<2, 1, 0>(bgra, width, height, bgra_stride, rgb)
+}
+
+/// 将带行跨度的 ARGB8888 缓冲区压缩成紧凑 RGB。
+pub fn argb8888_to_rgb_into(
+    argb: &[u8],
+    width: usize,
+    height: usize,
+    argb_stride: usize,
+    rgb: &mut [u8],
+) -> Result<()> {
+    packed_8888_to_rgb_into::<1, 2, 3>(argb, width, height, argb_stride, rgb)
+}
+
+/// 将双平面 YUV420SP（UV 交错）转换为紧凑 RGB。
+///
+/// 每个 UV 对服务同一行中的两个像素，避免逐像素重复读取色度和执行除法。
+#[cfg(not(all(target_arch = "aarch64", target_feature = "neon")))]
+fn yuv420sp_bt601_full_to_rgb_into(
+    y_plane: &[u8],
+    uv_plane: &[u8],
+    width: usize,
+    height: usize,
+    y_stride: usize,
+    uv_stride: usize,
+    rgb: &mut [u8],
+) -> Result<()> {
+    if width == 0 || height == 0 || y_stride < width {
         return Err(CameraError::InvalidFormat(
-            "invalid RGBA dimensions or stride".to_string(),
+            "invalid YUV420 dimensions or Y stride".to_string(),
         ));
     }
 
-    let required_rgba = (height - 1)
-        .checked_mul(rgba_stride)
-        .and_then(|size| size.checked_add(rgba_row_bytes))
-        .ok_or_else(|| CameraError::InvalidFormat("RGBA size overflow".to_string()))?;
-    let required_rgb = height
-        .checked_mul(rgb_row_bytes)
-        .ok_or_else(|| CameraError::InvalidFormat("RGB size overflow".to_string()))?;
-    if rgba.len() < required_rgba || rgb.len() < required_rgb {
+    let chroma_row_bytes = width
+        .div_ceil(2)
+        .checked_mul(2)
+        .ok_or_else(|| CameraError::InvalidFormat("YUV420 size overflow".to_string()))?;
+    if uv_stride < chroma_row_bytes {
         return Err(CameraError::InvalidFormat(
-            "RGBA or RGB buffer is too small".to_string(),
+            "invalid YUV420 UV stride".to_string(),
+        ));
+    }
+
+    let required_y = (height - 1)
+        .checked_mul(y_stride)
+        .and_then(|size| size.checked_add(width))
+        .ok_or_else(|| CameraError::InvalidFormat("YUV420 Y size overflow".to_string()))?;
+    let chroma_rows = height.div_ceil(2);
+    let required_uv = (chroma_rows - 1)
+        .checked_mul(uv_stride)
+        .and_then(|size| size.checked_add(chroma_row_bytes))
+        .ok_or_else(|| CameraError::InvalidFormat("YUV420 UV size overflow".to_string()))?;
+    let required_rgb = width
+        .checked_mul(height)
+        .and_then(|pixels| pixels.checked_mul(3))
+        .ok_or_else(|| CameraError::InvalidFormat("RGB size overflow".to_string()))?;
+
+    if y_plane.len() < required_y || uv_plane.len() < required_uv || rgb.len() < required_rgb {
+        return Err(CameraError::InvalidFormat(
+            "YUV420 or RGB buffer is too small".to_string(),
         ));
     }
 
     for row in 0..height {
-        let source = &rgba[row * rgba_stride..row * rgba_stride + rgba_row_bytes];
-        let destination = &mut rgb[row * rgb_row_bytes..(row + 1) * rgb_row_bytes];
-        for (source_pixel, destination_pixel) in source
-            .as_chunks::<4>()
-            .0
-            .iter()
-            .zip(destination.as_chunks_mut::<3>().0.iter_mut())
-        {
-            destination_pixel.copy_from_slice(&source_pixel[..3]);
+        let y_row = &y_plane[row * y_stride..];
+        let uv_row = &uv_plane[(row / 2) * uv_stride..];
+        let rgb_row_start = row * width * 3;
+
+        for column in (0..width).step_by(2) {
+            let uv_offset = (column / 2) * 2;
+            let u = uv_row[uv_offset] as i32 - 128;
+            let v = uv_row[uv_offset + 1] as i32 - 128;
+            let red_chroma = BT601_FULL_COEFFICIENTS[1] * v + 512;
+            let green_chroma =
+                -BT601_FULL_COEFFICIENTS[2] * u - BT601_FULL_COEFFICIENTS[3] * v + 512;
+            let blue_chroma = BT601_FULL_COEFFICIENTS[4] * u + 512;
+
+            let write_pixel = |y: u8, destination: &mut [u8]| {
+                let y = i32::from(y) * BT601_FULL_COEFFICIENTS[0];
+                destination[0] = ((y + red_chroma) >> 10).clamp(0, 255) as u8;
+                destination[1] = ((y + green_chroma) >> 10).clamp(0, 255) as u8;
+                destination[2] = ((y + blue_chroma) >> 10).clamp(0, 255) as u8;
+            };
+
+            let first_rgb = rgb_row_start + column * 3;
+            write_pixel(y_row[column], &mut rgb[first_rgb..first_rgb + 3]);
+            if column + 1 < width {
+                let second_rgb = first_rgb + 3;
+                write_pixel(y_row[column + 1], &mut rgb[second_rgb..second_rgb + 3]);
+            }
         }
     }
 
     Ok(())
 }
 
-/// 将双平面 YUV420SP（UV 交错）转换为紧凑 RGB。
-///
-/// 每个 UV 对服务同一行中的两个像素，避免逐像素重复读取色度和执行除法。
 pub fn yuv420sp_to_rgb_into(
     y_plane: &[u8],
     uv_plane: &[u8],
@@ -774,105 +1779,19 @@ pub fn yuv420sp_to_rgb_into(
     uv_stride: usize,
     rgb: &mut [u8],
 ) -> Result<()> {
-    #[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
-    {
-        if uv_plane.is_empty() {
-            return Err(CameraError::InvalidFormat("Empty UV plane".into()));
-        }
-        yuv420_to_rgb_into(
-            YuvPlane {
-                data: y_plane,
-                row_stride: y_stride,
-                pixel_stride: 1,
-            },
-            YuvPlane {
-                data: uv_plane,
-                row_stride: uv_stride,
-                pixel_stride: 2,
-            },
-            YuvPlane {
-                data: &uv_plane[1..],
-                row_stride: uv_stride,
-                pixel_stride: 2,
-            },
-            width,
-            height,
-            rgb,
-        )
-    }
-    // Keep the specialized packed-UV scalar loop on x86; the generic plane
-    // indexing is measurably slower there. Both paths share reference tests.
-    #[cfg(not(all(target_arch = "aarch64", target_feature = "neon")))]
-    {
-        if width == 0 || height == 0 || y_stride < width {
-            return Err(CameraError::InvalidFormat(
-                "invalid YUV420 dimensions or Y stride".to_string(),
-            ));
-        }
-
-        let chroma_row_bytes = width
-            .div_ceil(2)
-            .checked_mul(2)
-            .ok_or_else(|| CameraError::InvalidFormat("YUV420 size overflow".to_string()))?;
-        if uv_stride < chroma_row_bytes {
-            return Err(CameraError::InvalidFormat(
-                "invalid YUV420 UV stride".to_string(),
-            ));
-        }
-
-        let required_y = (height - 1)
-            .checked_mul(y_stride)
-            .and_then(|size| size.checked_add(width))
-            .ok_or_else(|| CameraError::InvalidFormat("YUV420 Y size overflow".to_string()))?;
-        let chroma_rows = height.div_ceil(2);
-        let required_uv = (chroma_rows - 1)
-            .checked_mul(uv_stride)
-            .and_then(|size| size.checked_add(chroma_row_bytes))
-            .ok_or_else(|| CameraError::InvalidFormat("YUV420 UV size overflow".to_string()))?;
-        let required_rgb = width
-            .checked_mul(height)
-            .and_then(|pixels| pixels.checked_mul(3))
-            .ok_or_else(|| CameraError::InvalidFormat("RGB size overflow".to_string()))?;
-
-        if y_plane.len() < required_y || uv_plane.len() < required_uv || rgb.len() < required_rgb {
-            return Err(CameraError::InvalidFormat(
-                "YUV420 or RGB buffer is too small".to_string(),
-            ));
-        }
-
-        for row in 0..height {
-            let y_row = &y_plane[row * y_stride..];
-            let uv_row = &uv_plane[(row / 2) * uv_stride..];
-            let rgb_row_start = row * width * 3;
-
-            for column in (0..width).step_by(2) {
-                let uv_offset = (column / 2) * 2;
-                let u = uv_row[uv_offset] as i32 - 128;
-                let v = uv_row[uv_offset + 1] as i32 - 128;
-                let v_r = (yuv_coefficients::V_TO_R * v) >> 8;
-                let uv_g = (yuv_coefficients::U_TO_G * u + yuv_coefficients::V_TO_G * v) >> 8;
-                let u_b = (yuv_coefficients::U_TO_B * u) >> 8;
-
-                let write_pixel = |y: i32, destination: &mut [u8]| {
-                    destination[0] = (y + v_r).clamp(0, 255) as u8;
-                    destination[1] = (y - uv_g).clamp(0, 255) as u8;
-                    destination[2] = (y + u_b).clamp(0, 255) as u8;
-                };
-
-                let first_rgb = rgb_row_start + column * 3;
-                write_pixel(y_row[column] as i32, &mut rgb[first_rgb..first_rgb + 3]);
-                if column + 1 < width {
-                    let second_rgb = first_rgb + 3;
-                    write_pixel(
-                        y_row[column + 1] as i32,
-                        &mut rgb[second_rgb..second_rgb + 3],
-                    );
-                }
-            }
-        }
-
-        Ok(())
-    }
+    yuv420sp_to_rgb_with_coefficients_into(
+        Yuv420Sp {
+            y: y_plane,
+            uv: uv_plane,
+            y_stride,
+            uv_stride,
+            vu_order: false,
+        },
+        width,
+        height,
+        BT601_FULL_COEFFICIENTS,
+        rgb,
+    )
 }
 
 // ============================================================================
@@ -1011,6 +1930,263 @@ mod tests {
         assert_eq!(rgb, [10, 20, 30, 50, 60, 70]);
     }
 
+    #[test]
+    fn packed_8888_channel_orders_share_checked_conversion() {
+        let bgra = [30, 20, 10, 40, 70, 60, 50, 80, 0, 0, 0, 0];
+        let argb = [40, 10, 20, 30, 80, 50, 60, 70, 0, 0, 0, 0];
+        let mut rgb = [0u8; 6];
+
+        bgra8888_to_rgb_into(&bgra, 2, 1, 12, &mut rgb).expect("BGRA conversion");
+        assert_eq!(rgb, [10, 20, 30, 50, 60, 70]);
+        argb8888_to_rgb_into(&argb, 2, 1, 12, &mut rgb).expect("ARGB conversion");
+        assert_eq!(rgb, [10, 20, 30, 50, 60, 70]);
+
+        assert!(bgra8888_to_rgb_into(&bgra[..7], 2, 1, 8, &mut rgb).is_err());
+        assert!(argb8888_to_rgb_into(&argb, 2, 1, 7, &mut rgb).is_err());
+    }
+
+    #[test]
+    fn configured_packed_422_kernel_matches_color_reference() {
+        let color = crate::ColorInfo {
+            matrix: crate::ColorMatrix::Bt709,
+            range: crate::ColorRange::Limited,
+            ..Default::default()
+        };
+        let coefficients = color_coefficients(color).unwrap();
+        let width = 34;
+        let height = 3;
+        let stride = width * 2 + 6;
+        let mut source = vec![0; stride * height];
+        for (index, byte) in source.iter_mut().enumerate() {
+            *byte = index.wrapping_mul(37).wrapping_add(19) as u8;
+        }
+        let mut actual = vec![0; width * height * 3];
+        yuv422_to_rgb_with_coefficients_into(
+            &source,
+            width,
+            height,
+            stride,
+            false,
+            coefficients,
+            &mut actual,
+        )
+        .unwrap();
+
+        let mut expected = vec![0; actual.len()];
+        for row in 0..height {
+            for column in (0..width).step_by(2) {
+                let input = row * stride + column * 2;
+                let output = (row * width + column) * 3;
+                yuv_pixel(
+                    coefficients,
+                    source[input],
+                    source[input + 1],
+                    source[input + 3],
+                    &mut expected[output..output + 3],
+                );
+                yuv_pixel(
+                    coefficients,
+                    source[input + 2],
+                    source[input + 1],
+                    source[input + 3],
+                    &mut expected[output + 3..output + 6],
+                );
+            }
+        }
+        assert_eq!(actual, expected);
+
+        let mut uyvy = source.clone();
+        for row in 0..height {
+            for column in (0..width).step_by(2) {
+                let offset = row * stride + column * 2;
+                let [y0, u, y1, v] = source[offset..offset + 4] else {
+                    unreachable!()
+                };
+                uyvy[offset..offset + 4].copy_from_slice(&[u, y0, v, y1]);
+            }
+        }
+        yuv422_to_rgb_with_coefficients_into(
+            &uyvy,
+            width,
+            height,
+            stride,
+            true,
+            coefficients,
+            &mut actual,
+        )
+        .unwrap();
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn configured_yuv420_kernels_match_reference_for_all_color_modes_and_tails() {
+        let (width, height): (usize, usize) = (19, 7);
+        let y_stride = width + 3;
+        let uv_stride = width.div_ceil(2) * 2 + 4;
+        let chroma_stride = width.div_ceil(2) + 2;
+        let mut y = vec![0; y_stride * height];
+        let mut uv = vec![0; uv_stride * height.div_ceil(2)];
+        let mut u = vec![0; chroma_stride * height.div_ceil(2)];
+        let mut v = vec![0; chroma_stride * height.div_ceil(2)];
+        for row in 0..height {
+            for column in 0..width {
+                y[row * y_stride + column] = row.wrapping_mul(31).wrapping_add(column * 17) as u8;
+            }
+        }
+        for row in 0..height.div_ceil(2) {
+            for column in 0..width.div_ceil(2) {
+                let uu = row.wrapping_mul(47).wrapping_add(column * 29) as u8;
+                let vv = row.wrapping_mul(13).wrapping_add(column * 53) as u8;
+                uv[row * uv_stride + column * 2] = uu;
+                uv[row * uv_stride + column * 2 + 1] = vv;
+                u[row * chroma_stride + column] = uu;
+                v[row * chroma_stride + column] = vv;
+            }
+        }
+        let mut vu = uv.clone();
+        for row in 0..height.div_ceil(2) {
+            for column in 0..width.div_ceil(2) {
+                let offset = row * uv_stride + column * 2;
+                vu.swap(offset, offset + 1);
+            }
+        }
+        for matrix in [
+            crate::ColorMatrix::Bt601,
+            crate::ColorMatrix::Bt709,
+            crate::ColorMatrix::Bt2020,
+            crate::ColorMatrix::Smpte240M,
+        ] {
+            for range in [crate::ColorRange::Full, crate::ColorRange::Limited] {
+                let coefficients = color_coefficients(crate::ColorInfo {
+                    matrix,
+                    range,
+                    ..Default::default()
+                })
+                .unwrap();
+                let mut expected = vec![0; width * height * 3];
+                for row in 0..height {
+                    for column in 0..width {
+                        yuv_pixel(
+                            coefficients,
+                            y[row * y_stride + column],
+                            u[(row / 2) * chroma_stride + column / 2],
+                            v[(row / 2) * chroma_stride + column / 2],
+                            &mut expected[(row * width + column) * 3..][..3],
+                        );
+                    }
+                }
+                let mut semiplanar = vec![0; expected.len()];
+                yuv420sp_to_rgb_with_coefficients_into(
+                    Yuv420Sp {
+                        y: &y,
+                        uv: &uv,
+                        y_stride,
+                        uv_stride,
+                        vu_order: false,
+                    },
+                    width,
+                    height,
+                    coefficients,
+                    &mut semiplanar,
+                )
+                .unwrap();
+                assert_eq!(semiplanar, expected, "{matrix:?} {range:?} NV12");
+
+                yuv420sp_to_rgb_with_coefficients_into(
+                    Yuv420Sp {
+                        y: &y,
+                        uv: &vu,
+                        y_stride,
+                        uv_stride,
+                        vu_order: true,
+                    },
+                    width,
+                    height,
+                    coefficients,
+                    &mut semiplanar,
+                )
+                .unwrap();
+                assert_eq!(semiplanar, expected, "{matrix:?} {range:?} NV21");
+
+                let mut planar = vec![0; expected.len()];
+                yuv420_to_rgb_with_coefficients_into(
+                    YuvPlane {
+                        data: &y,
+                        row_stride: y_stride,
+                        pixel_stride: 1,
+                    },
+                    YuvPlane {
+                        data: &u,
+                        row_stride: chroma_stride,
+                        pixel_stride: 1,
+                    },
+                    YuvPlane {
+                        data: &v,
+                        row_stride: chroma_stride,
+                        pixel_stride: 1,
+                    },
+                    width,
+                    height,
+                    coefficients,
+                    &mut planar,
+                )
+                .unwrap();
+                assert_eq!(planar, expected, "{matrix:?} {range:?} I420");
+            }
+        }
+    }
+
+    #[test]
+    fn configured_nv12_half_kernel_matches_direct_sampling_reference() {
+        let (width, height): (usize, usize) = (34, 10);
+        let y_stride = width + 5;
+        let uv_stride = width + 4;
+        let mut y = vec![0; y_stride * height];
+        let mut uv = vec![0; uv_stride * height.div_ceil(2)];
+        for (index, byte) in y.iter_mut().enumerate() {
+            *byte = index.wrapping_mul(31).wrapping_add(17) as u8;
+        }
+        for (index, byte) in uv.iter_mut().enumerate() {
+            *byte = index.wrapping_mul(43).wrapping_add(23) as u8;
+        }
+        let coefficients = color_coefficients(crate::ColorInfo {
+            matrix: crate::ColorMatrix::Bt709,
+            range: crate::ColorRange::Limited,
+            ..Default::default()
+        })
+        .unwrap();
+        let (output_width, output_height) = (width / 2, height / 2);
+        let mut expected = vec![0; output_width * output_height * 3];
+        for row in 0..output_height {
+            for column in 0..output_width {
+                let chroma = row * uv_stride + column * 2;
+                yuv_pixel(
+                    coefficients,
+                    y[row * 2 * y_stride + column * 2],
+                    uv[chroma],
+                    uv[chroma + 1],
+                    &mut expected[(row * output_width + column) * 3..][..3],
+                );
+            }
+        }
+        let mut actual = vec![0; expected.len()];
+        yuv420sp_to_rgb_half_with_coefficients_into(
+            Yuv420Sp {
+                y: &y,
+                uv: &uv,
+                y_stride,
+                uv_stride,
+                vu_order: false,
+            },
+            width,
+            height,
+            coefficients,
+            &mut actual,
+        )
+        .unwrap();
+        assert_eq!(actual, expected);
+    }
+
     #[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
     #[test]
     fn neon_extreme_chroma_and_unaligned_tails_match_scalar() {
@@ -1089,14 +2265,14 @@ mod tests {
                 .unwrap();
                 for row in 0..height {
                     for col in 0..width {
-                        let y = yy[row * ys + col] as i32;
-                        let u = uu[row / 2 * cs + col / 2 * pixel_stride] as i32 - 128;
-                        let v = vv[row / 2 * cs + col / 2 * pixel_stride] as i32 - 128;
-                        let expected = [
-                            (y + ((359 * v) >> 8)).clamp(0, 255) as u8,
-                            (y - ((88 * u + 183 * v) >> 8)).clamp(0, 255) as u8,
-                            (y + ((454 * u) >> 8)).clamp(0, 255) as u8,
-                        ];
+                        let mut expected = [0; 3];
+                        yuv_pixel(
+                            BT601_FULL_COEFFICIENTS,
+                            yy[row * ys + col],
+                            uu[row / 2 * cs + col / 2 * pixel_stride],
+                            vv[row / 2 * cs + col / 2 * pixel_stride],
+                            &mut expected,
+                        );
                         assert_eq!(&actual[(row * width + col) * 3..][..3], &expected);
                     }
                 }
@@ -1121,6 +2297,214 @@ mod tests {
         assert_eq!(scalar_result.len(), simd_result.len());
         for (i, (s, m)) in scalar_result.iter().zip(simd_result.iter()).enumerate() {
             assert_eq!(s, m, "Mismatch at index {}", i);
+        }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn x86_avx2_packed_422_matches_scalar_for_unaligned_inputs_and_tails() {
+        if !std::arch::is_x86_feature_detected!("avx2") {
+            return;
+        }
+        for uyvy in [false, true] {
+            for pairs in 1..=33 {
+                let input_len = pairs * 4;
+                let output_len = pairs * 6;
+                let mut state = (pairs as u32).wrapping_mul(0x9e37_79b9);
+                let mut input = vec![0x5a; input_len + 2];
+                for value in &mut input[1..=input_len] {
+                    state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                    *value = (state >> 24) as u8;
+                }
+                let source = &input[1..=input_len];
+                let mut expected = vec![0xa5; output_len + 2];
+                let mut actual = vec![0xa5; output_len + 2];
+                if uyvy {
+                    uyvy_to_rgb_scalar_into(source, &mut expected[1..=output_len]).unwrap();
+                    unsafe {
+                        x86::packed422_avx2::<true, 8, 0, 255>(
+                            source,
+                            &mut actual[1..=output_len],
+                            [256, 359, 88, 183, 454, 0],
+                        );
+                    }
+                } else {
+                    yuyv_to_rgb_scalar_into(source, &mut expected[1..=output_len]).unwrap();
+                    unsafe {
+                        x86::packed422_avx2::<false, 8, 0, 255>(
+                            source,
+                            &mut actual[1..=output_len],
+                            [256, 359, 88, 183, 454, 0],
+                        );
+                    }
+                }
+                assert_eq!(actual, expected, "uyvy={uyvy} pairs={pairs}");
+            }
+        }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn x86_avx2_semiplanar_rows_match_configured_reference() {
+        if !std::arch::is_x86_feature_detected!("avx2") {
+            return;
+        }
+        let coefficients = color_coefficients(ColorInfo {
+            matrix: ColorMatrix::Bt709,
+            range: ColorRange::Limited,
+            ..Default::default()
+        })
+        .unwrap();
+        for vu_order in [false, true] {
+            for width in [16_usize, 32, 48] {
+                let mut y_storage = vec![0x5a; width + 2];
+                let mut uv_storage = vec![0xa5; width + 2];
+                for column in 0..width {
+                    y_storage[column + 1] = column.wrapping_mul(37).wrapping_add(19) as u8;
+                    uv_storage[column + 1] = column.wrapping_mul(53).wrapping_add(11) as u8;
+                }
+                let y = &y_storage[1..=width];
+                let uv = &uv_storage[1..=width];
+                let mut actual = vec![0; width * 3];
+                let converted = unsafe {
+                    if vu_order {
+                        x86::semiplanar_row_avx2::<true, 10, 512, 512>(
+                            y,
+                            uv,
+                            &mut actual,
+                            coefficients,
+                        )
+                    } else {
+                        x86::semiplanar_row_avx2::<false, 10, 512, 512>(
+                            y,
+                            uv,
+                            &mut actual,
+                            coefficients,
+                        )
+                    }
+                };
+                assert_eq!(converted, width);
+                let mut expected = vec![0; actual.len()];
+                for column in 0..width {
+                    let chroma = column / 2 * 2;
+                    let (u, v) = if vu_order {
+                        (uv[chroma + 1], uv[chroma])
+                    } else {
+                        (uv[chroma], uv[chroma + 1])
+                    };
+                    yuv_pixel(
+                        coefficients,
+                        y[column],
+                        u,
+                        v,
+                        &mut expected[column * 3..column * 3 + 3],
+                    );
+                }
+                assert_eq!(actual, expected, "vu_order={vu_order} width={width}");
+            }
+        }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn x86_avx2_planar_rows_match_configured_reference() {
+        if !std::arch::is_x86_feature_detected!("avx2") {
+            return;
+        }
+        let coefficients = color_coefficients(ColorInfo {
+            matrix: ColorMatrix::Bt2020,
+            range: ColorRange::Limited,
+            ..Default::default()
+        })
+        .unwrap();
+        for width in [16_usize, 32, 48] {
+            let chroma_width = width / 2;
+            let mut y_storage = vec![0x5a; width + 2];
+            let mut u_storage = vec![0xa5; chroma_width + 2];
+            let mut v_storage = vec![0x3c; chroma_width + 2];
+            for column in 0..width {
+                y_storage[column + 1] = column.wrapping_mul(37).wrapping_add(19) as u8;
+            }
+            for column in 0..chroma_width {
+                u_storage[column + 1] = column.wrapping_mul(53).wrapping_add(11) as u8;
+                v_storage[column + 1] = column.wrapping_mul(71).wrapping_add(23) as u8;
+            }
+            let y = &y_storage[1..=width];
+            let u = &u_storage[1..=chroma_width];
+            let v = &v_storage[1..=chroma_width];
+            let mut actual = vec![0; width * 3];
+            let converted =
+                unsafe { x86::planar_row_avx2::<10, 512, 512>(y, u, v, &mut actual, coefficients) };
+            assert_eq!(converted, width);
+            let mut expected = vec![0; actual.len()];
+            for column in 0..width {
+                yuv_pixel(
+                    coefficients,
+                    y[column],
+                    u[column / 2],
+                    v[column / 2],
+                    &mut expected[column * 3..column * 3 + 3],
+                );
+            }
+            assert_eq!(actual, expected, "width={width}");
+        }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn x86_avx2_half_semiplanar_rows_match_direct_sampling_reference() {
+        if !std::arch::is_x86_feature_detected!("avx2") {
+            return;
+        }
+        let coefficients = BT601_FULL_COEFFICIENTS;
+        for vu_order in [false, true] {
+            for output_width in [16_usize, 32] {
+                let source_width = output_width * 2;
+                let mut y_storage = vec![0x5a; source_width + 2];
+                let mut uv_storage = vec![0xa5; source_width + 2];
+                for column in 0..source_width {
+                    y_storage[column + 1] = column.wrapping_mul(37).wrapping_add(19) as u8;
+                    uv_storage[column + 1] = column.wrapping_mul(53).wrapping_add(11) as u8;
+                }
+                let y = &y_storage[1..=source_width];
+                let uv = &uv_storage[1..=source_width];
+                let mut actual = vec![0; output_width * 3];
+                let converted = unsafe {
+                    if vu_order {
+                        x86::semiplanar_half_row_avx2::<true, 10, 512, 512>(
+                            y,
+                            uv,
+                            &mut actual,
+                            coefficients,
+                        )
+                    } else {
+                        x86::semiplanar_half_row_avx2::<false, 10, 512, 512>(
+                            y,
+                            uv,
+                            &mut actual,
+                            coefficients,
+                        )
+                    }
+                };
+                assert_eq!(converted, output_width);
+                let mut expected = vec![0; actual.len()];
+                for column in 0..output_width {
+                    let chroma = column * 2;
+                    let (u, v) = if vu_order {
+                        (uv[chroma + 1], uv[chroma])
+                    } else {
+                        (uv[chroma], uv[chroma + 1])
+                    };
+                    yuv_pixel(
+                        coefficients,
+                        y[column * 2],
+                        u,
+                        v,
+                        &mut expected[column * 3..column * 3 + 3],
+                    );
+                }
+                assert_eq!(actual, expected, "vu_order={vu_order} width={output_width}");
+            }
         }
     }
 

@@ -52,7 +52,7 @@ pub use controls::{
     ControlDescriptor, ControlId, ControlMode, ControlOutcome, ControlRange, ControlReadback,
     ControlUnit, ControlValue,
 };
-pub use conversion::RgbConverter;
+pub use conversion::{ConversionRequest, RgbConverter};
 pub use error::{CameraError, Result};
 pub use format::*;
 pub(crate) use frame::FrameHub;

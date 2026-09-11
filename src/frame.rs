@@ -545,14 +545,13 @@ impl FrameHub {
         let begin = Instant::now();
         let result = convert(lease.data.as_mut().unwrap().bytes_mut());
         let elapsed = begin.elapsed().as_nanos().min(u64::MAX as u128) as u64;
-        let mut pool = self.pool.lock();
-        let mut published = false;
         if let Err(error) = result {
             if self.session() == session {
-                pool.metrics.conversion_errors += 1;
+                self.pool.lock().metrics.conversion_errors += 1;
             }
             return Err(error);
         }
+        let mut published = false;
         self.state.send_if_modified(|state| {
             if !state.active || state.session != session {
                 return false;
@@ -607,6 +606,10 @@ impl FrameHub {
             true
         });
         if published {
+            let mut pool = self.pool.lock();
+            if self.session() != session {
+                return Ok(true);
+            }
             pool.metrics.published += 1;
             pool.metrics.conversion_total_ns =
                 pool.metrics.conversion_total_ns.saturating_add(elapsed);
@@ -624,12 +627,22 @@ impl FrameHub {
                 pool.recent.pop_front();
             }
         }
-        drop(pool);
         Ok(published)
     }
     pub fn metrics(&self) -> FrameMetrics {
-        let p = self.pool.lock();
-        let mut samples: Vec<_> = p.conversion_samples.iter().copied().collect();
+        let (mut samples, allocated_buffers, allocated_bytes, retained_buffers, metrics) = {
+            let p = self.pool.lock();
+            (
+                p.conversion_samples.iter().copied().collect::<Vec<_>>(),
+                p.slots.len(),
+                p.slots.iter().map(|s| s.bytes).sum(),
+                p.slots
+                    .iter()
+                    .filter(|s| s.data.as_ref().is_none_or(Storage::retained))
+                    .count(),
+                p.metrics.clone(),
+            )
+        };
         samples.sort_unstable();
         let quantile = |percent: usize| {
             samples
@@ -640,14 +653,10 @@ impl FrameHub {
         FrameMetrics {
             conversion_p50_ns: quantile(50),
             conversion_p95_ns: quantile(95),
-            allocated_buffers: p.slots.len(),
-            allocated_bytes: p.slots.iter().map(|s| s.bytes).sum(),
-            retained_buffers: p
-                .slots
-                .iter()
-                .filter(|s| s.data.as_ref().is_none_or(Storage::retained))
-                .count(),
-            ..p.metrics.clone()
+            allocated_buffers,
+            allocated_bytes,
+            retained_buffers,
+            ..metrics
         }
     }
     pub fn stats(&self) -> StreamStats {

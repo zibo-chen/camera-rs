@@ -6,7 +6,11 @@ Native adapters retain platform threading rules: Media Foundation uses a COM wor
 
 All backends publish through one internal `FrameHub`. It reserves a bounded slot under the pool lock, releases that lock during conversion/copying, checks the capture epoch again, and then publishes one immutable snapshot to independent bounded subscriber queues. A lease returns storage even when conversion fails or panics. Strong frame/ndarray references keep slots occupied; weak references cannot cause mutation of shared storage or an `Arc::get_mut` panic.
 
-The core stores copied native frames in pooled memory. This deliberately avoids exposing native pointers whose lifetimes end with callbacks. Platform GPU buffers/textures and decoder plugins require separate ownership, synchronization and release-thread contracts; they are not represented by no-op preferences.
+The pool mutex is not held while subscriber queues are updated, and metrics percentile sorting operates on a copied sample snapshot. Explicit native delivery plus per-consumer `ConversionRequest` separates capture rate from RGB processing rate: Latest consumers convert only the frame they select, while buffered/every-frame RGB workloads retain the direct backend-to-pool path.
+
+The core stores copied native frames in pooled memory. Camera2 recognizes strictly adjacent, overlapping U/V views and copies their shared NV12/NV21 chroma storage once; disjoint or ambiguous planes retain the three-plane representation. This deliberately avoids exposing native pointers whose lifetimes end with callbacks. Platform GPU buffers/textures and decoder plugins require separate ownership, synchronization and release-thread contracts; they are not represented by no-op preferences.
+
+CPU color conversion is selected per target at runtime where required: ARM64 uses NEON, while x86_64 checks AVX2 before entering packed YUYV/UYVY, planar I420 or full/half-size NV12/NV21 kernels. Unsupported CPUs and unhandled tails fall back to the same integer conversion contract, so backend code does not branch on SIMD capabilities.
 
 The optional ndarray adapter is isolated from core frame storage. Android USB permission/context/JNI code lives in a separate `camera-android` package. JNI uses a per-handle lifecycle gate, catches Rust panics at the boundary, copies to caller-owned writable direct buffers, and reports actual operation failures. Core Camera2 capture does not require a Java context.
 

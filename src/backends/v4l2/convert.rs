@@ -1,7 +1,10 @@
 use crate::utils::color_convert::{
-    uyvy_to_rgb_into, yuv420_to_rgb_into, yuyv_to_rgb_into, YuvPlane,
+    color_coefficients, yuv420sp_to_rgb_with_coefficients_into,
+    yuv422_to_rgb_with_coefficients_into, Yuv420Sp,
 };
-use crate::{CameraConfig, CameraError, CameraResult, VideoFormat};
+use crate::{
+    CameraConfig, CameraError, CameraResult, ColorInfo, ColorMatrix, ColorRange, VideoFormat,
+};
 use turbojpeg::{Decompressor, Image, PixelFormat};
 
 #[derive(Clone, Copy)]
@@ -55,57 +58,45 @@ fn check_rows(plane: &Plane<'_>, row_bytes: usize, height: usize) -> CameraResul
 
 pub(super) struct Converter {
     jpeg: Decompressor,
-    coefficients: Option<[i32; 6]>,
+    coefficients: [i32; 6],
 }
 
 impl Converter {
     pub fn new() -> CameraResult<Self> {
         Ok(Self {
-            coefficients: None,
+            coefficients: color_coefficients(ColorInfo {
+                matrix: ColorMatrix::Bt601,
+                range: ColorRange::Full,
+                ..Default::default()
+            })?,
             jpeg: Decompressor::new().map_err(|e| invalid(&e.to_string()))?,
         })
     }
 
-    // Preserve the negotiated YCbCr matrix and quantization. Common full-range
-    // BT.601 frames keep using the shared SIMD converter.
+    // Preserve the negotiated YCbCr matrix and quantization while selecting the
+    // shared configured SIMD kernel for every supported color mode.
     pub fn set_colorimetry(&mut self, matrix: u32, full: bool) -> CameraResult<()> {
-        let (kr, kb): (f64, f64) = match matrix {
-            1 | 3 | 5 => (0.299, 0.114),
-            2 | 4 => (0.2126, 0.0722),
-            6 => (0.2627, 0.0593),
-            8 => (0.212, 0.087),
+        let matrix = match matrix {
+            1 | 3 | 5 => ColorMatrix::Bt601,
+            2 | 4 => ColorMatrix::Bt709,
+            6 => ColorMatrix::Bt2020,
+            8 => ColorMatrix::Smpte240M,
             _ => {
                 return Err(CameraError::UnsupportedFormat(format!(
                     "V4L2 YCbCr encoding {matrix}"
                 )))
             }
         };
-        if full && matches!(matrix, 1 | 3 | 5) {
-            self.coefficients = None;
-            return Ok(());
-        }
-        let scale_y = if full { 1.0 } else { 255.0 / 219.0 };
-        let scale_c = if full { 1.0 } else { 255.0 / 224.0 };
-        let kg = 1.0 - kr - kb;
-        self.coefficients = Some([
-            (scale_y * 1024.0_f64).round() as i32,
-            ((2.0 - 2.0 * kr) * scale_c * 1024.0).round() as i32,
-            ((2.0 - 2.0 * kb) * kb / kg * scale_c * 1024.0).round() as i32,
-            ((2.0 - 2.0 * kr) * kr / kg * scale_c * 1024.0).round() as i32,
-            ((2.0 - 2.0 * kb) * scale_c * 1024.0).round() as i32,
-            if full { 0 } else { 16 },
-        ]);
+        self.coefficients = color_coefficients(ColorInfo {
+            matrix,
+            range: if full {
+                ColorRange::Full
+            } else {
+                ColorRange::Limited
+            },
+            ..Default::default()
+        })?;
         Ok(())
-    }
-
-    fn pixel(&self, y: u8, u: u8, v: u8, rgb: &mut [u8]) {
-        let [cy, cr, cg_u, cg_v, cb, offset] = self.coefficients.unwrap();
-        let y = (i32::from(y) - offset) * cy;
-        let u = i32::from(u) - 128;
-        let v = i32::from(v) - 128;
-        rgb[0] = ((y + cr * v + 512) >> 10).clamp(0, 255) as u8;
-        rgb[1] = ((y - cg_u * u - cg_v * v + 512) >> 10).clamp(0, 255) as u8;
-        rgb[2] = ((y + cb * u + 512) >> 10).clamp(0, 255) as u8;
     }
 
     pub fn convert(
@@ -172,43 +163,37 @@ impl Converter {
                     &uv
                 };
                 check_rows(first, w, h)?;
-                check_rows(second, w, h / 2)?;
-                if self.coefficients.is_some() {
-                    for row in 0..h {
-                        for col in 0..w {
-                            let chroma = (row / 2) * second.stride + (col / 2) * 2;
-                            self.pixel(
-                                first.data[row * first.stride + col],
-                                second.data[chroma],
-                                second.data[chroma + 1],
-                                &mut rgb[(row * w + col) * 3..][..3],
-                            );
-                        }
-                    }
-                    return Ok(());
-                }
-                yuv420_to_rgb_into(
-                    YuvPlane {
-                        data: first.data,
-                        row_stride: first.stride,
-                        pixel_stride: 1,
-                    },
-                    YuvPlane {
-                        data: second.data,
-                        row_stride: second.stride,
-                        pixel_stride: 2,
-                    },
-                    YuvPlane {
-                        data: &second.data[1..],
-                        row_stride: second.stride,
-                        pixel_stride: 2,
+                check_rows(second, w, h.div_ceil(2))?;
+                yuv420sp_to_rgb_with_coefficients_into(
+                    Yuv420Sp {
+                        y: first.data,
+                        uv: second.data,
+                        y_stride: first.stride,
+                        uv_stride: second.stride,
+                        vu_order: false,
                     },
                     w,
                     h,
+                    self.coefficients,
                     rgb,
                 )?;
             }
-            VideoFormat::RGB | VideoFormat::Gray | VideoFormat::YUYV | VideoFormat::UYVY => {
+            VideoFormat::YUYV | VideoFormat::UYVY => {
+                let row_bytes = w
+                    .checked_mul(config.format.bytes_per_pixel().unwrap())
+                    .ok_or_else(|| invalid("V4L2 row size overflow"))?;
+                check_rows(first, row_bytes, h)?;
+                yuv422_to_rgb_with_coefficients_into(
+                    first.data,
+                    w,
+                    h,
+                    first.stride,
+                    config.format == VideoFormat::UYVY,
+                    self.coefficients,
+                    rgb,
+                )?;
+            }
+            VideoFormat::RGB | VideoFormat::Gray => {
                 let row_bytes = w
                     .checked_mul(config.format.bytes_per_pixel().unwrap())
                     .ok_or_else(|| invalid("V4L2 row size overflow"))?;
@@ -216,25 +201,6 @@ impl Converter {
                 for row in 0..h {
                     let input = &first.data[row * first.stride..][..row_bytes];
                     let output = &mut rgb[row * w * 3..][..w * 3];
-                    if self.coefficients.is_some()
-                        && matches!(config.format, VideoFormat::YUYV | VideoFormat::UYVY)
-                    {
-                        for (pair, out) in input
-                            .as_chunks::<4>()
-                            .0
-                            .iter()
-                            .zip(output.as_chunks_mut::<6>().0.iter_mut())
-                        {
-                            let (y0, y1, u, v) = if config.format == VideoFormat::YUYV {
-                                (pair[0], pair[2], pair[1], pair[3])
-                            } else {
-                                (pair[1], pair[3], pair[0], pair[2])
-                            };
-                            self.pixel(y0, u, v, &mut out[..3]);
-                            self.pixel(y1, u, v, &mut out[3..]);
-                        }
-                        continue;
-                    }
                     match config.format {
                         VideoFormat::RGB => output.copy_from_slice(input),
                         VideoFormat::Gray => {
@@ -244,8 +210,6 @@ impl Converter {
                                 pixel.fill(gray);
                             }
                         }
-                        VideoFormat::YUYV => yuyv_to_rgb_into(input, config.width, 1, output)?,
-                        VideoFormat::UYVY => uyvy_to_rgb_into(input, config.width, 1, output)?,
                         _ => unreachable!(),
                     }
                 }

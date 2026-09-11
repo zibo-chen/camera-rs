@@ -71,7 +71,7 @@ uvc_frame_desc_t *uvc_find_frame_desc_stream(uvc_stream_handle_t *strmh,
 uvc_frame_desc_t *uvc_find_frame_desc(uvc_device_handle_t *devh,
     uint16_t format_id, uint16_t frame_id);
 void *_uvc_user_caller(void *arg);
-void _uvc_populate_frame(uvc_stream_handle_t *strmh);
+uvc_error_t _uvc_populate_frame(uvc_stream_handle_t *strmh);
 
 static uvc_streaming_interface_t *_uvc_get_stream_if(uvc_device_handle_t *devh, int interface_idx);
 static uvc_stream_handle_t *_uvc_get_stream_by_interface(uvc_device_handle_t *devh, int interface_idx);
@@ -1317,7 +1317,10 @@ void *_uvc_user_caller(void *arg) {
     }
     
     last_seq = strmh->hold_seq;
-    _uvc_populate_frame(strmh);
+    if (_uvc_populate_frame(strmh) != UVC_SUCCESS) {
+      pthread_mutex_unlock(&strmh->cb_mutex);
+      continue;
+    }
     
     pthread_mutex_unlock(&strmh->cb_mutex);
     
@@ -1331,7 +1334,7 @@ void *_uvc_user_caller(void *arg) {
  * @brief Populate the fields of a frame to be handed to user code
  * must be called with stream cb lock held!
  */
-void _uvc_populate_frame(uvc_stream_handle_t *strmh) {
+uvc_error_t _uvc_populate_frame(uvc_stream_handle_t *strmh) {
   uvc_frame_t *frame = &strmh->frame;
   uvc_frame_desc_t *frame_desc;
 
@@ -1375,22 +1378,36 @@ void _uvc_populate_frame(uvc_stream_handle_t *strmh) {
   frame->sequence = strmh->hold_seq;
   frame->capture_time_finished = strmh->capture_time_finished;
 
-  /* copy the image data from the hold buffer to the frame (unnecessary extra buf?) */
-  if (frame->data_bytes < strmh->hold_bytes) {
-    frame->data = realloc(frame->data, strmh->hold_bytes);
+  /* data_bytes is the current payload length, not allocation capacity. */
+  if (strmh->frame_data_capacity < strmh->hold_bytes) {
+    void *data = realloc(frame->data, strmh->hold_bytes);
+    if (!data)
+      return UVC_ERROR_NO_MEM;
+    frame->data = data;
+    strmh->frame_data_capacity = strmh->hold_bytes;
   }
   frame->data_bytes = strmh->hold_bytes;
-  memcpy(frame->data, strmh->holdbuf, frame->data_bytes);
+  if (frame->data_bytes > 0)
+    memcpy(frame->data, strmh->holdbuf, frame->data_bytes);
 
   if (strmh->meta_hold_bytes > 0)
   {
-      if (frame->metadata_bytes < strmh->meta_hold_bytes)
+      if (strmh->frame_metadata_capacity < strmh->meta_hold_bytes)
       {
-          frame->metadata = realloc(frame->metadata, strmh->meta_hold_bytes);
+          void *metadata = realloc(frame->metadata, strmh->meta_hold_bytes);
+          if (!metadata)
+            return UVC_ERROR_NO_MEM;
+          frame->metadata = metadata;
+          strmh->frame_metadata_capacity = strmh->meta_hold_bytes;
       }
       frame->metadata_bytes = strmh->meta_hold_bytes;
       memcpy(frame->metadata, strmh->meta_holdbuf, frame->metadata_bytes);
   }
+  else
+  {
+      frame->metadata_bytes = 0;
+  }
+  return UVC_SUCCESS;
 }
 
 /** Poll for a frame
@@ -1406,6 +1423,7 @@ uvc_error_t uvc_stream_get_frame(uvc_stream_handle_t *strmh,
   time_t add_secs;
   time_t add_nsecs;
   struct timespec ts;
+  uvc_error_t populate_result;
 
   if (!strmh->running)
     return UVC_ERROR_INVALID_PARAM;
@@ -1416,7 +1434,12 @@ uvc_error_t uvc_stream_get_frame(uvc_stream_handle_t *strmh,
   pthread_mutex_lock(&strmh->cb_mutex);
 
   if (strmh->last_polled_seq < strmh->hold_seq) {
-    _uvc_populate_frame(strmh);
+    populate_result = _uvc_populate_frame(strmh);
+    if (populate_result != UVC_SUCCESS) {
+      *frame = NULL;
+      pthread_mutex_unlock(&strmh->cb_mutex);
+      return populate_result;
+    }
     *frame = &strmh->frame;
     strmh->last_polled_seq = strmh->hold_seq;
   } else if (timeout_us != -1) {
@@ -1458,7 +1481,12 @@ uvc_error_t uvc_stream_get_frame(uvc_stream_handle_t *strmh,
     }
     
     if (strmh->last_polled_seq < strmh->hold_seq) {
-      _uvc_populate_frame(strmh);
+      populate_result = _uvc_populate_frame(strmh);
+      if (populate_result != UVC_SUCCESS) {
+        *frame = NULL;
+        pthread_mutex_unlock(&strmh->cb_mutex);
+        return populate_result;
+      }
       *frame = &strmh->frame;
       strmh->last_polled_seq = strmh->hold_seq;
     } else {
@@ -1553,6 +1581,8 @@ void uvc_stream_close(uvc_stream_handle_t *strmh) {
 
   if (strmh->frame.data)
     free(strmh->frame.data);
+  if (strmh->frame.metadata)
+    free(strmh->frame.metadata);
 
   free(strmh->outbuf);
   free(strmh->holdbuf);
