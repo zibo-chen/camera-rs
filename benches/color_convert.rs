@@ -137,6 +137,12 @@ fn run(label: &str, layout: &FrameLayout, data: &[u8], request: ConversionReques
     samples.sort_unstable();
     let percentile = |percent: usize| samples[(samples.len() * percent).div_ceil(100) - 1];
     let mean = samples.iter().sum::<u64>() as f64 / samples.len() as f64;
+    let kernel = selected_kernel(layout, request);
+    let strides: Vec<_> = layout.planes.iter().map(|plane| plane.row_stride).collect();
+    println!(
+        "case={label} kernel={kernel} strides={strides:?} output={}x{}",
+        request.width, request.height
+    );
     println!(
         "{label:<28} mean={:.3} p50={:.3} p95={:.3} p99={:.3} ms",
         mean / 1_000_000.0,
@@ -146,8 +152,59 @@ fn run(label: &str, layout: &FrameLayout, data: &[u8], request: ConversionReques
     );
 }
 
-fn main() {
-    let (width, height) = (1920, 1080);
+#[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
+fn selected_kernel(layout: &FrameLayout, request: ConversionRequest) -> &'static str {
+    match layout.format {
+        PixelFormat::Yuv420p => "neon-planar-contiguous-two-row",
+        PixelFormat::Nv12 | PixelFormat::Nv21
+            if request.width < layout.width || request.height < layout.height =>
+        {
+            "neon-semiplanar-direct-half"
+        }
+        PixelFormat::Nv12 | PixelFormat::Nv21 => "neon-semiplanar-two-row",
+        PixelFormat::Bgra8 | PixelFormat::Rgba8 | PixelFormat::Argb8 => "neon-packed8888",
+        PixelFormat::Yuyv | PixelFormat::Uyvy => "neon-packed422",
+        _ => "scalar",
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+fn selected_kernel(layout: &FrameLayout, request: ConversionRequest) -> &'static str {
+    if std::arch::is_x86_feature_detected!("avx2") {
+        return match layout.format {
+            PixelFormat::Yuv420p => "avx2-planar",
+            PixelFormat::Nv12 | PixelFormat::Nv21
+                if request.width < layout.width || request.height < layout.height =>
+            {
+                "avx2-semiplanar-direct-half"
+            }
+            PixelFormat::Nv12 | PixelFormat::Nv21 => "avx2-semiplanar",
+            PixelFormat::Bgra8 | PixelFormat::Rgba8 | PixelFormat::Argb8 => "avx2-packed8888",
+            PixelFormat::Yuyv | PixelFormat::Uyvy => "avx2-packed422",
+            _ => "scalar",
+        };
+    }
+    if std::arch::is_x86_feature_detected!("ssse3")
+        && matches!(
+            layout.format,
+            PixelFormat::Bgra8 | PixelFormat::Rgba8 | PixelFormat::Argb8
+        )
+    {
+        "ssse3-packed8888"
+    } else {
+        "scalar"
+    }
+}
+
+#[cfg(not(any(
+    all(target_arch = "aarch64", target_feature = "neon"),
+    target_arch = "x86_64"
+)))]
+fn selected_kernel(_layout: &FrameLayout, _request: ConversionRequest) -> &'static str {
+    "scalar"
+}
+
+fn benchmark_resolution(width: usize, height: usize) {
     let full_601 = color(ColorMatrix::Bt601, ColorRange::Full);
     let limited_709 = color(ColorMatrix::Bt709, ColorRange::Limited);
     let cases = [
@@ -178,13 +235,35 @@ fn main() {
         ),
     ];
     for (label, (layout, data)) in &cases {
-        run(label, layout, data, ConversionRequest::for_layout(layout));
+        run(
+            &format!("{label} {width}x{height}"),
+            layout,
+            data,
+            ConversionRequest::for_layout(layout),
+        );
     }
     let (layout, data) = nv12(width, height, PixelFormat::Nv12, full_601);
     run(
-        "NV12 1080p -> 540p",
+        &format!("NV12 half {width}x{height}"),
         &layout,
         &data,
-        ConversionRequest::new(960, 540).unwrap(),
+        ConversionRequest::new((width / 2) as u32, (height / 2) as u32).unwrap(),
     );
+}
+
+fn main() {
+    let revision = std::env::var("CAMERA_BENCH_REVISION").unwrap_or_else(|_| "unknown".into());
+    println!(
+        "environment arch={} os={} profile={} revision={revision}",
+        std::env::consts::ARCH,
+        std::env::consts::OS,
+        if cfg!(debug_assertions) {
+            "debug"
+        } else {
+            "release"
+        }
+    );
+    for (width, height) in [(1280, 720), (1920, 1080), (3840, 2160)] {
+        benchmark_resolution(width, height);
+    }
 }

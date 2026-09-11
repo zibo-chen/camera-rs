@@ -6,9 +6,10 @@
 //!
 //! ARM64 uses checked NEON conversion with scalar-equivalent rounding. x86_64
 //! runtime-dispatches packed 4:2:2, planar YUV420 and NV12/NV21 full/half-size
-//! rows to AVX2; other targets use scalar/compiler-vectorized loops. No
-//! parallel/GPU path is enabled; use the benchmark on the target device instead
-//! of assuming a speedup.
+//! rows to AVX2, and packed 8888 channel reordering to AVX2 or SSSE3; other
+//! targets use scalar/compiler-vectorized loops. No parallel/GPU path is
+//! enabled; use the benchmark on the target device instead of assuming a
+//! speedup.
 
 use crate::{
     error::{CameraError, Result},
@@ -127,28 +128,108 @@ pub(crate) fn yuv420_to_rgb_with_coefficients_into(
     if rgb.len() < length {
         return Err(CameraError::InvalidFormat("RGB buffer too short".into()));
     }
+    #[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
+    if y.pixel_stride == 1 && u.pixel_stride == 1 && v.pixel_stride == 1 {
+        let rgb_row_bytes = width * 3;
+        let chroma_width = width.div_ceil(2);
+        let paired_rows = height / 2 * 2;
+        for row in (0..paired_rows).step_by(2) {
+            let y0 = &y.data[row * y.row_stride..][..width];
+            let y1 = &y.data[(row + 1) * y.row_stride..][..width];
+            let chroma_row = row / 2;
+            let u_row = &u.data[chroma_row * u.row_stride..][..chroma_width];
+            let v_row = &v.data[chroma_row * v.row_stride..][..chroma_width];
+            let rgb_offset = row * rgb_row_bytes;
+            let (before, after) = rgb.split_at_mut(rgb_offset + rgb_row_bytes);
+            let rgb0 = &mut before[rgb_offset..][..rgb_row_bytes];
+            let rgb1 = &mut after[..rgb_row_bytes];
+            let start = unsafe {
+                neon::planar_contiguous_two_rows_with_coefficients(
+                    y0,
+                    y1,
+                    u_row,
+                    v_row,
+                    coefficients,
+                    rgb0,
+                    rgb1,
+                )
+            };
+            for column in (start..width).step_by(2) {
+                let chroma = column / 2;
+                for (luma, output) in [(y0, &mut *rgb0), (y1, &mut *rgb1)] {
+                    for x in column..(column + 2).min(width) {
+                        yuv_pixel(
+                            coefficients,
+                            luma[x],
+                            u_row[chroma],
+                            v_row[chroma],
+                            &mut output[x * 3..x * 3 + 3],
+                        );
+                    }
+                }
+            }
+        }
+        if paired_rows != height {
+            let row = paired_rows;
+            let y_row = &y.data[row * y.row_stride..][..width];
+            let chroma_row = row / 2;
+            let u_row = &u.data[chroma_row * u.row_stride..][..chroma_width];
+            let v_row = &v.data[chroma_row * v.row_stride..][..chroma_width];
+            let rgb_row = &mut rgb[row * rgb_row_bytes..][..rgb_row_bytes];
+            let start = unsafe {
+                neon::planar_contiguous_row_with_coefficients(
+                    y_row,
+                    u_row,
+                    v_row,
+                    coefficients,
+                    rgb_row,
+                )
+            };
+            for column in (start..width).step_by(2) {
+                let chroma = column / 2;
+                for x in column..(column + 2).min(width) {
+                    yuv_pixel(
+                        coefficients,
+                        y_row[x],
+                        u_row[chroma],
+                        v_row[chroma],
+                        &mut rgb_row[x * 3..x * 3 + 3],
+                    );
+                }
+            }
+        }
+        return Ok(());
+    }
+    #[cfg(target_arch = "x86_64")]
+    let avx2 = std::arch::is_x86_feature_detected!("avx2");
     for row in 0..height {
         #[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
         let start = if y.pixel_stride == 1 {
             unsafe {
-                neon::planar_row_with_coefficients(
-                    &y.data[row * y.row_stride..][..width],
-                    &u.data[(row / 2) * u.row_stride..],
-                    &v.data[(row / 2) * v.row_stride..],
-                    (u.pixel_stride, v.pixel_stride),
-                    coefficients,
-                    &mut rgb[row * width * 3..][..width * 3],
-                )
+                if u.pixel_stride == 1 && v.pixel_stride == 1 {
+                    neon::planar_contiguous_row_with_coefficients(
+                        &y.data[row * y.row_stride..][..width],
+                        &u.data[(row / 2) * u.row_stride..][..width.div_ceil(2)],
+                        &v.data[(row / 2) * v.row_stride..][..width.div_ceil(2)],
+                        coefficients,
+                        &mut rgb[row * width * 3..][..width * 3],
+                    )
+                } else {
+                    neon::planar_row_with_coefficients(
+                        &y.data[row * y.row_stride..][..width],
+                        &u.data[(row / 2) * u.row_stride..],
+                        &v.data[(row / 2) * v.row_stride..],
+                        (u.pixel_stride, v.pixel_stride),
+                        coefficients,
+                        &mut rgb[row * width * 3..][..width * 3],
+                    )
+                }
             }
         } else {
             0
         };
         #[cfg(target_arch = "x86_64")]
-        let start = if y.pixel_stride == 1
-            && u.pixel_stride == 1
-            && v.pixel_stride == 1
-            && std::arch::is_x86_feature_detected!("avx2")
-        {
+        let start = if y.pixel_stride == 1 && u.pixel_stride == 1 && v.pixel_stride == 1 && avx2 {
             unsafe {
                 x86::planar_row_avx2::<10, 512, 512>(
                     &y.data[row * y.row_stride..][..width],
@@ -242,19 +323,79 @@ pub(crate) fn yuv420sp_to_rgb_with_coefficients_into(
             "invalid YUV420 UV stride or buffer size".into(),
         ));
     }
+    #[cfg(target_arch = "x86_64")]
+    let avx2 = std::arch::is_x86_feature_detected!("avx2");
+    #[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
+    {
+        let rgb_row_bytes = width * 3;
+        let paired_rows = height / 2 * 2;
+        for row in (0..paired_rows).step_by(2) {
+            let y0 = &y_plane[row * y_stride..][..width];
+            let y1 = &y_plane[(row + 1) * y_stride..][..width];
+            let uv_row = &uv_plane[(row / 2) * uv_stride..][..chroma_row_bytes];
+            let rgb_offset = row * rgb_row_bytes;
+            let (before, after) = rgb.split_at_mut(rgb_offset + rgb_row_bytes);
+            let rgb0 = &mut before[rgb_offset..][..rgb_row_bytes];
+            let rgb1 = &mut after[..rgb_row_bytes];
+            let start = unsafe {
+                neon::semiplanar_two_rows_with_coefficients(
+                    y0,
+                    y1,
+                    uv_row,
+                    vu_order,
+                    coefficients,
+                    rgb0,
+                    rgb1,
+                )
+            };
+            for column in (start..width).step_by(2) {
+                let chroma = column / 2 * 2;
+                let (u, v) = if vu_order {
+                    (uv_row[chroma + 1], uv_row[chroma])
+                } else {
+                    (uv_row[chroma], uv_row[chroma + 1])
+                };
+                for x in column..(column + 2).min(width) {
+                    yuv_pixel(coefficients, y0[x], u, v, &mut rgb0[x * 3..x * 3 + 3]);
+                    yuv_pixel(coefficients, y1[x], u, v, &mut rgb1[x * 3..x * 3 + 3]);
+                }
+            }
+        }
+        if paired_rows != height {
+            let row = paired_rows;
+            let y_row = &y_plane[row * y_stride..][..width];
+            let uv_row = &uv_plane[(row / 2) * uv_stride..][..chroma_row_bytes];
+            let rgb_row = &mut rgb[row * rgb_row_bytes..][..rgb_row_bytes];
+            let start = unsafe {
+                neon::semiplanar_row_with_coefficients(
+                    y_row,
+                    uv_row,
+                    vu_order,
+                    coefficients,
+                    rgb_row,
+                )
+            };
+            for column in (start..width).step_by(2) {
+                let chroma = column / 2 * 2;
+                let (u, v) = if vu_order {
+                    (uv_row[chroma + 1], uv_row[chroma])
+                } else {
+                    (uv_row[chroma], uv_row[chroma + 1])
+                };
+                for x in column..(column + 2).min(width) {
+                    yuv_pixel(coefficients, y_row[x], u, v, &mut rgb_row[x * 3..x * 3 + 3]);
+                }
+            }
+        }
+        Ok(())
+    }
+    #[cfg(not(all(target_arch = "aarch64", target_feature = "neon")))]
     for row in 0..height {
         let y_row = &y_plane[row * y_stride..][..width];
         let uv_row = &uv_plane[(row / 2) * uv_stride..][..chroma_row_bytes];
         let rgb_row = &mut rgb[row * width * 3..][..width * 3];
-        #[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
-        let start = unsafe {
-            neon::semiplanar_row_with_coefficients(y_row, uv_row, vu_order, coefficients, rgb_row)
-        };
-        #[cfg(all(
-            not(all(target_arch = "aarch64", target_feature = "neon")),
-            target_arch = "x86_64"
-        ))]
-        let start = if std::arch::is_x86_feature_detected!("avx2") {
+        #[cfg(target_arch = "x86_64")]
+        let start = if avx2 {
             unsafe {
                 if vu_order {
                     x86::semiplanar_row_avx2::<true, 10, 512, 512>(
@@ -275,10 +416,7 @@ pub(crate) fn yuv420sp_to_rgb_with_coefficients_into(
         } else {
             0
         };
-        #[cfg(all(
-            not(all(target_arch = "aarch64", target_feature = "neon")),
-            not(target_arch = "x86_64")
-        ))]
+        #[cfg(not(target_arch = "x86_64"))]
         let start = 0;
         for column in (start..width).step_by(2) {
             let chroma = (column / 2) * 2;
@@ -292,6 +430,7 @@ pub(crate) fn yuv420sp_to_rgb_with_coefficients_into(
             }
         }
     }
+    #[cfg(not(all(target_arch = "aarch64", target_feature = "neon")))]
     Ok(())
 }
 
@@ -329,6 +468,8 @@ pub(crate) fn yuv420sp_to_rgb_half_with_coefficients_into(
             "invalid YUV420 UV stride or half-size RGB buffer".into(),
         ));
     }
+    #[cfg(target_arch = "x86_64")]
+    let avx2 = std::arch::is_x86_feature_detected!("avx2");
     for row in 0..output_height {
         let y_row = &planes.y[row * 2 * planes.y_stride..][..width];
         let uv_row = &planes.uv[row * planes.uv_stride..][..width];
@@ -347,7 +488,7 @@ pub(crate) fn yuv420sp_to_rgb_half_with_coefficients_into(
             not(all(target_arch = "aarch64", target_feature = "neon")),
             target_arch = "x86_64"
         ))]
-        let start = if std::arch::is_x86_feature_detected!("avx2") {
+        let start = if avx2 {
             unsafe {
                 if planes.vu_order {
                     x86::semiplanar_half_row_avx2::<true, 10, 512, 512>(
@@ -423,6 +564,8 @@ pub(crate) fn yuv422_to_rgb_with_coefficients_into(
             "YUV422 or RGB buffer is too small".into(),
         ));
     }
+    #[cfg(target_arch = "x86_64")]
+    let avx2 = std::arch::is_x86_feature_detected!("avx2");
     for row in 0..height {
         let source_row = &source[row * stride..][..source_row_bytes];
         let rgb_row = &mut rgb[row * rgb_row_bytes..][..rgb_row_bytes];
@@ -434,7 +577,7 @@ pub(crate) fn yuv422_to_rgb_with_coefficients_into(
             not(all(target_arch = "aarch64", target_feature = "neon")),
             target_arch = "x86_64"
         ))]
-        let start = if std::arch::is_x86_feature_detected!("avx2") {
+        let start = if avx2 {
             unsafe {
                 if uyvy {
                     x86::packed422_avx2::<true, 10, 512, 512>(source_row, rgb_row, coefficients);
@@ -840,6 +983,74 @@ mod neon {
         (r, g, b)
     }
 
+    type PreparedChroma4 = (int32x4_t, int32x4_t, int32x4_t);
+
+    #[inline(always)]
+    unsafe fn prepare_chroma4(
+        u: int16x4_t,
+        v: int16x4_t,
+        [_, cr, gu, gv, cb, _]: [i32; 6],
+    ) -> PreparedChroma4 {
+        (
+            vmull_n_s16(v, cr as i16),
+            vnegq_s32(vmlal_n_s16(vmull_n_s16(u, gu as i16), v, gv as i16)),
+            vmull_n_s16(u, cb as i16),
+        )
+    }
+
+    #[inline(always)]
+    unsafe fn rgb4_with_prepared_chroma(
+        y: int16x4_t,
+        chroma: &PreparedChroma4,
+        cy: i16,
+    ) -> (int16x4_t, int16x4_t, int16x4_t) {
+        let y = vmull_n_s16(y, cy);
+        let rounding = vdupq_n_s32(512);
+        (
+            vshrn_n_s32::<10>(vaddq_s32(vaddq_s32(y, chroma.0), rounding)),
+            vshrn_n_s32::<10>(vaddq_s32(vaddq_s32(y, chroma.1), rounding)),
+            vshrn_n_s32::<10>(vaddq_s32(vaddq_s32(y, chroma.2), rounding)),
+        )
+    }
+
+    #[inline(always)]
+    unsafe fn rgb8_with_prepared_chroma(
+        y: uint8x8_t,
+        low_chroma: &PreparedChroma4,
+        high_chroma: &PreparedChroma4,
+        [cy, _, _, _, _, offset]: [i32; 6],
+    ) -> uint8x8x3_t {
+        let y = vsubq_s16(
+            vreinterpretq_s16_u16(vmovl_u8(y)),
+            vdupq_n_s16(offset as i16),
+        );
+        let low = rgb4_with_prepared_chroma(vget_low_s16(y), low_chroma, cy as i16);
+        let high = rgb4_with_prepared_chroma(vget_high_s16(y), high_chroma, cy as i16);
+        uint8x8x3_t(
+            vqmovun_s16(vcombine_s16(low.0, high.0)),
+            vqmovun_s16(vcombine_s16(low.1, high.1)),
+            vqmovun_s16(vcombine_s16(low.2, high.2)),
+        )
+    }
+
+    #[inline(always)]
+    unsafe fn rgb8_two_luma_with_coefficients(
+        y0: uint8x8_t,
+        y1: uint8x8_t,
+        u: uint8x8_t,
+        v: uint8x8_t,
+        coefficients: [i32; 6],
+    ) -> (uint8x8x3_t, uint8x8x3_t) {
+        let u = vsubq_s16(vreinterpretq_s16_u16(vmovl_u8(u)), vdupq_n_s16(128));
+        let v = vsubq_s16(vreinterpretq_s16_u16(vmovl_u8(v)), vdupq_n_s16(128));
+        let low = prepare_chroma4(vget_low_s16(u), vget_low_s16(v), coefficients);
+        let high = prepare_chroma4(vget_high_s16(u), vget_high_s16(v), coefficients);
+        (
+            rgb8_with_prepared_chroma(y0, &low, &high, coefficients),
+            rgb8_with_prepared_chroma(y1, &low, &high, coefficients),
+        )
+    }
+
     #[inline(always)]
     unsafe fn rgb8_with_coefficients(
         y: uint8x8_t,
@@ -987,6 +1198,82 @@ mod neon {
         groups * 8
     }
 
+    pub unsafe fn planar_contiguous_row_with_coefficients(
+        y: &[u8],
+        u: &[u8],
+        v: &[u8],
+        coefficients: [i32; 6],
+        rgb: &mut [u8],
+    ) -> usize {
+        let groups = (y.len() / 16)
+            .min(u.len() / 8)
+            .min(v.len() / 8)
+            .min(rgb.len() / 48);
+        for group in 0..groups {
+            let u = vld1_u8(u.as_ptr().add(group * 8));
+            let v = vld1_u8(v.as_ptr().add(group * 8));
+            vst3_u8(
+                rgb.as_mut_ptr().add(group * 48),
+                rgb8_with_coefficients(
+                    vld1_u8(y.as_ptr().add(group * 16)),
+                    vzip1_u8(u, u),
+                    vzip1_u8(v, v),
+                    coefficients,
+                ),
+            );
+            vst3_u8(
+                rgb.as_mut_ptr().add(group * 48 + 24),
+                rgb8_with_coefficients(
+                    vld1_u8(y.as_ptr().add(group * 16 + 8)),
+                    vzip2_u8(u, u),
+                    vzip2_u8(v, v),
+                    coefficients,
+                ),
+            );
+        }
+        groups * 16
+    }
+
+    pub unsafe fn planar_contiguous_two_rows_with_coefficients(
+        y0: &[u8],
+        y1: &[u8],
+        u: &[u8],
+        v: &[u8],
+        coefficients: [i32; 6],
+        rgb0: &mut [u8],
+        rgb1: &mut [u8],
+    ) -> usize {
+        let groups = (y0.len() / 16)
+            .min(y1.len() / 16)
+            .min(u.len() / 8)
+            .min(v.len() / 8)
+            .min(rgb0.len() / 48)
+            .min(rgb1.len() / 48);
+        for group in 0..groups {
+            let u = vld1_u8(u.as_ptr().add(group * 8));
+            let v = vld1_u8(v.as_ptr().add(group * 8));
+            let low = rgb8_two_luma_with_coefficients(
+                vld1_u8(y0.as_ptr().add(group * 16)),
+                vld1_u8(y1.as_ptr().add(group * 16)),
+                vzip1_u8(u, u),
+                vzip1_u8(v, v),
+                coefficients,
+            );
+            let high = rgb8_two_luma_with_coefficients(
+                vld1_u8(y0.as_ptr().add(group * 16 + 8)),
+                vld1_u8(y1.as_ptr().add(group * 16 + 8)),
+                vzip2_u8(u, u),
+                vzip2_u8(v, v),
+                coefficients,
+            );
+            vst3_u8(rgb0.as_mut_ptr().add(group * 48), low.0);
+            vst3_u8(rgb1.as_mut_ptr().add(group * 48), low.1);
+            vst3_u8(rgb0.as_mut_ptr().add(group * 48 + 24), high.0);
+            vst3_u8(rgb1.as_mut_ptr().add(group * 48 + 24), high.1);
+        }
+        groups * 16
+    }
+
     pub unsafe fn semiplanar_row_with_coefficients(
         y: &[u8],
         uv: &[u8],
@@ -1020,6 +1307,49 @@ mod neon {
                     coefficients,
                 ),
             );
+        }
+        groups * 16
+    }
+
+    pub unsafe fn semiplanar_two_rows_with_coefficients(
+        y0: &[u8],
+        y1: &[u8],
+        uv: &[u8],
+        vu_order: bool,
+        coefficients: [i32; 6],
+        rgb0: &mut [u8],
+        rgb1: &mut [u8],
+    ) -> usize {
+        let groups = (y0.len() / 16)
+            .min(y1.len() / 16)
+            .min(uv.len() / 16)
+            .min(rgb0.len() / 48)
+            .min(rgb1.len() / 48);
+        for group in 0..groups {
+            let chroma = vld2_u8(uv.as_ptr().add(group * 16));
+            let (u, v) = if vu_order {
+                (chroma.1, chroma.0)
+            } else {
+                (chroma.0, chroma.1)
+            };
+            let low = rgb8_two_luma_with_coefficients(
+                vld1_u8(y0.as_ptr().add(group * 16)),
+                vld1_u8(y1.as_ptr().add(group * 16)),
+                vzip1_u8(u, u),
+                vzip1_u8(v, v),
+                coefficients,
+            );
+            let high = rgb8_two_luma_with_coefficients(
+                vld1_u8(y0.as_ptr().add(group * 16 + 8)),
+                vld1_u8(y1.as_ptr().add(group * 16 + 8)),
+                vzip2_u8(u, u),
+                vzip2_u8(v, v),
+                coefficients,
+            );
+            vst3_u8(rgb0.as_mut_ptr().add(group * 48), low.0);
+            vst3_u8(rgb1.as_mut_ptr().add(group * 48), low.1);
+            vst3_u8(rgb0.as_mut_ptr().add(group * 48 + 24), high.0);
+            vst3_u8(rgb1.as_mut_ptr().add(group * 48 + 24), high.1);
         }
         groups * 16
     }
@@ -1058,6 +1388,15 @@ mod x86 {
         let low = _mm_shuffle_epi8(_mm256_castsi256_si128(raw), mask);
         let high = _mm_shuffle_epi8(_mm256_extracti128_si256::<1>(raw), mask);
         _mm_unpacklo_epi64(low, high)
+    }
+
+    #[inline(always)]
+    unsafe fn store_twelve_bytes(value: __m128i, output: *mut u8) {
+        _mm_storel_epi64(output.cast(), value);
+        std::ptr::write_unaligned(
+            output.add(8).cast::<u32>(),
+            _mm_cvtsi128_si32(_mm_srli_si128::<8>(value)) as u32,
+        );
     }
 
     #[inline(always)]
@@ -1215,6 +1554,83 @@ mod x86 {
                 ]);
             }
         }
+    }
+
+    /// Convert complete groups of four packed 8888 pixels into RGB24.
+    #[target_feature(enable = "ssse3")]
+    pub(super) unsafe fn packed_8888_row_ssse3<const R: usize, const G: usize, const B: usize>(
+        source: &[u8],
+        rgb: &mut [u8],
+    ) -> usize {
+        let groups = (source.len() / 16).min(rgb.len() / 12);
+        let mask = _mm_setr_epi8(
+            R as i8,
+            G as i8,
+            B as i8,
+            (4 + R) as i8,
+            (4 + G) as i8,
+            (4 + B) as i8,
+            (8 + R) as i8,
+            (8 + G) as i8,
+            (8 + B) as i8,
+            (12 + R) as i8,
+            (12 + G) as i8,
+            (12 + B) as i8,
+            -1,
+            -1,
+            -1,
+            -1,
+        );
+        let output = rgb.as_mut_ptr();
+        for group in 0..groups {
+            let pixels = _mm_shuffle_epi8(
+                _mm_loadu_si128(source.as_ptr().add(group * 16).cast()),
+                mask,
+            );
+            store_twelve_bytes(pixels, output.add(group * 12));
+        }
+        groups * 4
+    }
+
+    /// Convert complete groups of eight packed 8888 pixels into RGB24.
+    #[target_feature(enable = "avx2")]
+    pub(super) unsafe fn packed_8888_row_avx2<const R: usize, const G: usize, const B: usize>(
+        source: &[u8],
+        rgb: &mut [u8],
+    ) -> usize {
+        let groups = (source.len() / 32).min(rgb.len() / 24);
+        let mask = _mm_setr_epi8(
+            R as i8,
+            G as i8,
+            B as i8,
+            (4 + R) as i8,
+            (4 + G) as i8,
+            (4 + B) as i8,
+            (8 + R) as i8,
+            (8 + G) as i8,
+            (8 + B) as i8,
+            (12 + R) as i8,
+            (12 + G) as i8,
+            (12 + B) as i8,
+            -1,
+            -1,
+            -1,
+            -1,
+        );
+        let mask = _mm256_broadcastsi128_si256(mask);
+        let output = rgb.as_mut_ptr();
+        for group in 0..groups {
+            let pixels = _mm256_shuffle_epi8(
+                _mm256_loadu_si256(source.as_ptr().add(group * 32).cast()),
+                mask,
+            );
+            store_twelve_bytes(_mm256_castsi256_si128(pixels), output.add(group * 24));
+            store_twelve_bytes(
+                _mm256_extracti128_si256::<1>(pixels),
+                output.add(group * 24 + 12),
+            );
+        }
+        groups * 8
     }
 
     /// Convert complete groups of sixteen pixels from one planar YUV420 row.
@@ -1638,12 +2054,27 @@ fn packed_8888_to_rgb_into<const R: usize, const G: usize, const B: usize>(
         ));
     }
 
+    #[cfg(target_arch = "x86_64")]
+    let avx2 = std::arch::is_x86_feature_detected!("avx2");
+    #[cfg(target_arch = "x86_64")]
+    let ssse3 = !avx2 && std::arch::is_x86_feature_detected!("ssse3");
     for row in 0..height {
         let source = &packed[row * packed_stride..row * packed_stride + packed_row_bytes];
         let destination = &mut rgb[row * rgb_row_bytes..(row + 1) * rgb_row_bytes];
         #[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
         let converted = unsafe { neon::packed_8888_row::<R, G, B>(source, destination) };
-        #[cfg(not(all(target_arch = "aarch64", target_feature = "neon")))]
+        #[cfg(target_arch = "x86_64")]
+        let converted = if avx2 {
+            unsafe { x86::packed_8888_row_avx2::<R, G, B>(source, destination) }
+        } else if ssse3 {
+            unsafe { x86::packed_8888_row_ssse3::<R, G, B>(source, destination) }
+        } else {
+            0
+        };
+        #[cfg(all(
+            not(all(target_arch = "aarch64", target_feature = "neon")),
+            not(target_arch = "x86_64")
+        ))]
         let converted = 0;
         for x in converted..width {
             let source_pixel = &source[x * 4..x * 4 + 4];
@@ -2030,13 +2461,25 @@ mod tests {
         let mut v = vec![0; chroma_stride * height.div_ceil(2)];
         for row in 0..height {
             for column in 0..width {
-                y[row * y_stride + column] = row.wrapping_mul(31).wrapping_add(column * 17) as u8;
+                y[row * y_stride + column] = match column % 11 {
+                    0 => 0,
+                    1 => 255,
+                    _ => row.wrapping_mul(31).wrapping_add(column * 17) as u8,
+                };
             }
         }
         for row in 0..height.div_ceil(2) {
             for column in 0..width.div_ceil(2) {
-                let uu = row.wrapping_mul(47).wrapping_add(column * 29) as u8;
-                let vv = row.wrapping_mul(13).wrapping_add(column * 53) as u8;
+                let uu = match column % 7 {
+                    0 => 0,
+                    1 => 255,
+                    _ => row.wrapping_mul(47).wrapping_add(column * 29) as u8,
+                };
+                let vv = match column % 7 {
+                    0 => 255,
+                    1 => 0,
+                    _ => row.wrapping_mul(13).wrapping_add(column * 53) as u8,
+                };
                 uv[row * uv_stride + column * 2] = uu;
                 uv[row * uv_stride + column * 2 + 1] = vv;
                 u[row * chroma_stride + column] = uu;
@@ -2214,6 +2657,158 @@ mod tests {
         }
     }
 
+    #[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
+    #[test]
+    fn neon_contiguous_planar_row_matches_reference_without_overwrite() {
+        let coefficients = color_coefficients(ColorInfo {
+            matrix: ColorMatrix::Bt2020,
+            range: ColorRange::Limited,
+            ..Default::default()
+        })
+        .unwrap();
+        for width in [16_usize, 32, 48] {
+            let mut y_storage = vec![0x5a; width + 2];
+            let mut u_storage = vec![0xa5; width / 2 + 2];
+            let mut v_storage = vec![0x3c; width / 2 + 2];
+            for (index, value) in y_storage[1..=width].iter_mut().enumerate() {
+                *value = index.wrapping_mul(37).wrapping_add(19) as u8;
+            }
+            for (index, value) in u_storage[1..=width / 2].iter_mut().enumerate() {
+                *value = index.wrapping_mul(53).wrapping_add(11) as u8;
+            }
+            for (index, value) in v_storage[1..=width / 2].iter_mut().enumerate() {
+                *value = index.wrapping_mul(71).wrapping_add(23) as u8;
+            }
+            let y = &y_storage[1..=width];
+            let u = &u_storage[1..=width / 2];
+            let v = &v_storage[1..=width / 2];
+            let mut actual = vec![0xcc; width * 3 + 2];
+            let converted = unsafe {
+                neon::planar_contiguous_row_with_coefficients(
+                    y,
+                    u,
+                    v,
+                    coefficients,
+                    &mut actual[1..=width * 3],
+                )
+            };
+            assert_eq!(converted, width);
+            let mut expected = vec![0; width * 3];
+            for column in 0..width {
+                yuv_pixel(
+                    coefficients,
+                    y[column],
+                    u[column / 2],
+                    v[column / 2],
+                    &mut expected[column * 3..column * 3 + 3],
+                );
+            }
+            assert_eq!(&actual[1..=width * 3], expected);
+            assert_eq!((actual[0], actual[width * 3 + 1]), (0xcc, 0xcc));
+        }
+    }
+
+    #[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
+    #[test]
+    fn neon_contiguous_planar_two_rows_match_reference_without_overwrite() {
+        let coefficients = color_coefficients(ColorInfo {
+            matrix: ColorMatrix::Bt709,
+            range: ColorRange::Limited,
+            ..Default::default()
+        })
+        .unwrap();
+        for width in [16_usize, 32, 48] {
+            let y0: Vec<u8> = (0..width).map(|x| (x * 37 + 19) as u8).collect();
+            let y1: Vec<u8> = (0..width).map(|x| (x * 29 + 7) as u8).collect();
+            let u: Vec<u8> = (0..width / 2).map(|x| (x * 53 + 11) as u8).collect();
+            let v: Vec<u8> = (0..width / 2).map(|x| (x * 71 + 23) as u8).collect();
+            let mut row0 = vec![0xcc; width * 3 + 2];
+            let mut row1 = vec![0xdd; width * 3 + 2];
+            let converted = unsafe {
+                neon::planar_contiguous_two_rows_with_coefficients(
+                    &y0,
+                    &y1,
+                    &u,
+                    &v,
+                    coefficients,
+                    &mut row0[1..=width * 3],
+                    &mut row1[1..=width * 3],
+                )
+            };
+            assert_eq!(converted, width);
+            for column in 0..width {
+                let mut expected0 = [0; 3];
+                let mut expected1 = [0; 3];
+                yuv_pixel(
+                    coefficients,
+                    y0[column],
+                    u[column / 2],
+                    v[column / 2],
+                    &mut expected0,
+                );
+                yuv_pixel(
+                    coefficients,
+                    y1[column],
+                    u[column / 2],
+                    v[column / 2],
+                    &mut expected1,
+                );
+                assert_eq!(&row0[1 + column * 3..][..3], &expected0);
+                assert_eq!(&row1[1 + column * 3..][..3], &expected1);
+            }
+            assert_eq!((row0[0], row0[width * 3 + 1]), (0xcc, 0xcc));
+            assert_eq!((row1[0], row1[width * 3 + 1]), (0xdd, 0xdd));
+        }
+    }
+
+    #[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
+    #[test]
+    fn neon_semiplanar_two_rows_match_reference_without_overwrite() {
+        let coefficients = color_coefficients(ColorInfo {
+            matrix: ColorMatrix::Bt709,
+            range: ColorRange::Limited,
+            ..Default::default()
+        })
+        .unwrap();
+        for vu_order in [false, true] {
+            for width in [16_usize, 32, 48] {
+                let y0: Vec<u8> = (0..width).map(|x| (x * 37 + 19) as u8).collect();
+                let y1: Vec<u8> = (0..width).map(|x| (x * 29 + 7) as u8).collect();
+                let uv: Vec<u8> = (0..width).map(|x| (x * 53 + 11) as u8).collect();
+                let mut row0 = vec![0xcc; width * 3 + 2];
+                let mut row1 = vec![0xdd; width * 3 + 2];
+                let converted = unsafe {
+                    neon::semiplanar_two_rows_with_coefficients(
+                        &y0,
+                        &y1,
+                        &uv,
+                        vu_order,
+                        coefficients,
+                        &mut row0[1..=width * 3],
+                        &mut row1[1..=width * 3],
+                    )
+                };
+                assert_eq!(converted, width);
+                for column in 0..width {
+                    let chroma = column / 2 * 2;
+                    let (u, v) = if vu_order {
+                        (uv[chroma + 1], uv[chroma])
+                    } else {
+                        (uv[chroma], uv[chroma + 1])
+                    };
+                    let mut expected0 = [0; 3];
+                    let mut expected1 = [0; 3];
+                    yuv_pixel(coefficients, y0[column], u, v, &mut expected0);
+                    yuv_pixel(coefficients, y1[column], u, v, &mut expected1);
+                    assert_eq!(&row0[1 + column * 3..][..3], &expected0);
+                    assert_eq!(&row1[1 + column * 3..][..3], &expected1);
+                }
+                assert_eq!((row0[0], row0[width * 3 + 1]), (0xcc, 0xcc));
+                assert_eq!((row1[0], row1[width * 3 + 1]), (0xdd, 0xdd));
+            }
+        }
+    }
+
     #[test]
     fn packed_dispatch_matches_scalar_for_all_uv_pairs() {
         let input: Vec<u8> = (0..65536u32)
@@ -2341,6 +2936,86 @@ mod tests {
                 assert_eq!(actual, expected, "uyvy={uyvy} pairs={pairs}");
             }
         }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn x86_avx2_packed_8888_matches_all_channel_orders_without_overwrite() {
+        if !std::arch::is_x86_feature_detected!("avx2") {
+            return;
+        }
+        fn check<const R: usize, const G: usize, const B: usize>() {
+            for pixels in 1..=41 {
+                let mut source = vec![0x5a; pixels * 4 + 2];
+                for (index, value) in source[1..=pixels * 4].iter_mut().enumerate() {
+                    *value = index.wrapping_mul(37).wrapping_add(19) as u8;
+                }
+                let source = &source[1..=pixels * 4];
+                let converted = pixels / 8 * 8;
+                let mut actual = vec![0xcc; pixels * 3 + 2];
+                let result = unsafe {
+                    x86::packed_8888_row_avx2::<R, G, B>(source, &mut actual[1..=pixels * 3])
+                };
+                assert_eq!(result, converted);
+                for pixel in 0..converted {
+                    assert_eq!(
+                        &actual[1 + pixel * 3..][..3],
+                        &[
+                            source[pixel * 4 + R],
+                            source[pixel * 4 + G],
+                            source[pixel * 4 + B],
+                        ]
+                    );
+                }
+                assert!(actual[1 + converted * 3..=pixels * 3]
+                    .iter()
+                    .all(|value| *value == 0xcc));
+                assert_eq!((actual[0], actual[pixels * 3 + 1]), (0xcc, 0xcc));
+            }
+        }
+        check::<0, 1, 2>();
+        check::<2, 1, 0>();
+        check::<1, 2, 3>();
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn x86_ssse3_packed_8888_matches_all_channel_orders_without_overwrite() {
+        if !std::arch::is_x86_feature_detected!("ssse3") {
+            return;
+        }
+        fn check<const R: usize, const G: usize, const B: usize>() {
+            for pixels in 1..=41 {
+                let mut source = vec![0x5a; pixels * 4 + 2];
+                for (index, value) in source[1..=pixels * 4].iter_mut().enumerate() {
+                    *value = index.wrapping_mul(37).wrapping_add(19) as u8;
+                }
+                let source = &source[1..=pixels * 4];
+                let converted = pixels / 4 * 4;
+                let mut actual = vec![0xcc; pixels * 3 + 2];
+                let result = unsafe {
+                    x86::packed_8888_row_ssse3::<R, G, B>(source, &mut actual[1..=pixels * 3])
+                };
+                assert_eq!(result, converted);
+                for pixel in 0..converted {
+                    assert_eq!(
+                        &actual[1 + pixel * 3..][..3],
+                        &[
+                            source[pixel * 4 + R],
+                            source[pixel * 4 + G],
+                            source[pixel * 4 + B],
+                        ]
+                    );
+                }
+                assert!(actual[1 + converted * 3..=pixels * 3]
+                    .iter()
+                    .all(|value| *value == 0xcc));
+                assert_eq!((actual[0], actual[pixels * 3 + 1]), (0xcc, 0xcc));
+            }
+        }
+        check::<0, 1, 2>();
+        check::<2, 1, 0>();
+        check::<1, 2, 3>();
     }
 
     #[cfg(target_arch = "x86_64")]
