@@ -1,6 +1,6 @@
 [package]
 name = "camera-rs-android"
-version = "0.5.0"
+version = "0.5.1"
 edition = "2021"
 authors = ["ChenZibo <qw.54@163.com>"]
 rust-version = "1.88"
@@ -15,7 +15,7 @@ description = "Android USB permission and JNI adapter for camera"
 name = "camera_android"
 crate-type = ["rlib", "cdylib", "staticlib"]
 [dependencies]
-camera = { package = "camera-rs", path = "..", version = "0.5.0", default-features = false, features = ["runtime-tokio"] }
+camera = { package = "camera-rs", path = "..", version = "0.5.1", default-features = false, features = ["runtime-tokio"] }
 jni = "0.21"
 log = "0.4"
 libc = "0.2"

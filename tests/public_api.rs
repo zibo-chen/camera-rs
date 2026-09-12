@@ -18,7 +18,7 @@ use std::{
 
 #[test]
 fn public_contract_is_the_breaking_0_5_api() {
-    assert_eq!(env!("CARGO_PKG_VERSION"), "0.5.0");
+    assert!(env!("CARGO_PKG_VERSION").starts_with("0.5."));
 
     let request = CaptureRequest::builder()
         .preferred_resolution(1280, 720)
