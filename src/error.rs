@@ -619,7 +619,13 @@ impl CameraError {
             UvcErrorCode::from_code(code).message().into(),
         )
     }
-    #[cfg(any(feature = "backend-uvc", test))]
+    #[cfg(any(
+        test,
+        all(
+            feature = "backend-uvc",
+            any(target_os = "linux", target_os = "macos", target_os = "android")
+        )
+    ))]
     pub(crate) fn uvc(code: i32, operation: String) -> Self {
         let mut error = Self::uvc_backend(code, operation);
         error.kind = match error.kind {
