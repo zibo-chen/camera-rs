@@ -8,6 +8,7 @@ fn package_identity_is_safe_for_publication() {
     assert!(!manifest.contains("ssh://"));
     assert!(!manifest.contains("file://"));
     assert!(manifest.contains("documentation = \"https://docs.rs/camera-rs\""));
+    assert!(manifest.contains("repository = \"https://github.com/zibo-chen/camera-rs\""));
 }
 
 #[test]
@@ -22,6 +23,7 @@ fn copyright_and_dual_license_are_explicit() {
     let adapter_manifest = include_str!("../camera-android/Cargo.toml");
     assert!(adapter_manifest.contains("authors = [\"ChenZibo <qw.54@163.com>\"]"));
     assert!(adapter_manifest.contains("license = \"MIT OR Apache-2.0\""));
+    assert!(adapter_manifest.contains("repository = \"https://github.com/zibo-chen/camera-rs\""));
 }
 
 #[test]

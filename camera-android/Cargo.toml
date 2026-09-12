@@ -7,7 +7,8 @@ rust-version = "1.88"
 license = "MIT OR Apache-2.0"
 readme = "README.md"
 documentation = "https://docs.rs/camera-rs-android"
-homepage = "https://docs.rs/camera-rs-android"
+homepage = "https://github.com/zibo-chen/camera-rs"
+repository = "https://github.com/zibo-chen/camera-rs"
 include = ["src/**", "java/**", "tests/**", "Cargo.toml", "README.md", "LICENSE-*"]
 description = "Android USB permission and JNI adapter for camera"
 [lib]
