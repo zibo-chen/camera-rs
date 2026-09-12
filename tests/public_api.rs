@@ -9,9 +9,10 @@ use camera::{
 };
 use std::{
     sync::{
-        atomic::{AtomicBool, Ordering},
-        Arc,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+        Arc, Mutex as StdMutex,
     },
+    thread::JoinHandle,
     time::Duration,
 };
 
@@ -204,30 +205,24 @@ impl BackendDevice for TestDevice {
 
     fn start(&mut self, sink: FrameSink, plan: &camera::CapturePlan) -> CameraResult<()> {
         self.running.store(true, Ordering::Release);
-        let running = self.running.clone();
         let config = plan.selected.capture.clone();
-        std::thread::spawn(move || {
-            std::thread::sleep(Duration::from_millis(10));
-            if running.load(Ordering::Acquire) {
-                let layout = FrameLayout {
-                    width: config.width,
-                    height: config.height,
-                    format: PixelFormat::Rgb8,
-                    planes: vec![PlaneLayout {
-                        offset: 0,
-                        length: (config.width * config.height * 3) as usize,
-                        row_stride: (config.width * 3) as usize,
-                        pixel_stride: 3,
-                    }],
-                    color: Default::default(),
-                    orientation: Default::default(),
-                    bottom_up: false,
-                };
-                let mut lease = sink.writable(layout).unwrap();
-                lease.bytes_mut().fill(7);
-                lease.commit().unwrap();
-            }
-        });
+        let layout = FrameLayout {
+            width: config.width,
+            height: config.height,
+            format: PixelFormat::Rgb8,
+            planes: vec![PlaneLayout {
+                offset: 0,
+                length: (config.width * config.height * 3) as usize,
+                row_stride: (config.width * 3) as usize,
+                pixel_stride: 3,
+            }],
+            color: Default::default(),
+            orientation: Default::default(),
+            bottom_up: false,
+        };
+        let mut lease = sink.writable(layout)?;
+        lease.bytes_mut().fill(7);
+        lease.commit()?;
         Ok(())
     }
 
@@ -235,6 +230,756 @@ impl BackendDevice for TestDevice {
         self.running.store(false, Ordering::Release);
         Ok(())
     }
+}
+
+#[test]
+fn persisted_device_id_rejects_malformed_unicode_without_panicking() {
+    let result = std::panic::catch_unwind(|| camera::DeviceId::parse("synthetic|中a"));
+    assert!(result.is_ok());
+    assert!(result.unwrap().is_err());
+    assert!(camera::DeviceId::parse(&format!("synthetic|{}", "00".repeat(4097))).is_err());
+
+    let original = camera::DeviceId::new(BackendId::SYNTHETIC, "摄像头-📷").unwrap();
+    assert_eq!(
+        camera::DeviceId::parse(&original.to_persistent_string()).unwrap(),
+        original
+    );
+}
+
+#[derive(Debug)]
+struct MultiModeProvider;
+
+impl BackendProvider for MultiModeProvider {
+    fn id(&self) -> BackendId {
+        BackendId::custom("com.example", "multi-mode").unwrap()
+    }
+
+    fn enumerate(&self) -> CameraResult<Vec<BackendDeviceInfo>> {
+        Ok(vec![BackendDeviceInfo {
+            native_id: "multi".into(),
+            name: "Multi-mode test camera".into(),
+            description: String::new(),
+            stability: IdentityStability::Native,
+            facing: CameraFacing::External,
+            usb: None,
+        }])
+    }
+
+    fn open(&self, _native_id: &str) -> CameraResult<Box<dyn BackendDevice>> {
+        Ok(Box::new(MultiModeDevice))
+    }
+}
+
+struct MultiModeDevice;
+
+impl BackendDevice for MultiModeDevice {
+    fn capabilities(&self) -> CameraResult<DeviceCapabilities> {
+        DeviceCapabilities::from_modes([
+            camera::CaptureMode {
+                format: CaptureFormat::Nv12,
+                width: 640,
+                height: 480,
+                frame_rate: FrameRate::new(15, 1).unwrap(),
+            },
+            camera::CaptureMode {
+                format: CaptureFormat::Rgb8,
+                width: 1280,
+                height: 720,
+                frame_rate: FrameRate::new(15, 1).unwrap(),
+            },
+        ])
+    }
+
+    fn start(&mut self, sink: FrameSink, plan: &camera::CapturePlan) -> CameraResult<()> {
+        let selected = &plan.selected.capture;
+        let (format, length, row_stride, pixel_stride) = match selected.format {
+            CaptureFormat::Nv12 => (
+                PixelFormat::Nv12,
+                (selected.width * selected.height * 3 / 2) as usize,
+                selected.width as usize,
+                1,
+            ),
+            CaptureFormat::Rgb8 => (
+                PixelFormat::Rgb8,
+                (selected.width * selected.height * 3) as usize,
+                (selected.width * 3) as usize,
+                3,
+            ),
+            other => panic!("unexpected test format: {other:?}"),
+        };
+        let layout = FrameLayout {
+            width: selected.width,
+            height: selected.height,
+            format,
+            planes: vec![PlaneLayout {
+                offset: 0,
+                length,
+                row_stride,
+                pixel_stride,
+            }],
+            color: Default::default(),
+            orientation: Default::default(),
+            bottom_up: false,
+        };
+        sink.publish_bytes(layout, None, &vec![1; length])?;
+        Ok(())
+    }
+
+    fn stop(&mut self) -> CameraResult<()> {
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn public_multi_mode_capabilities_drive_plan_and_start_constraints() {
+    let backend = BackendId::custom("com.example", "multi-mode").unwrap();
+    let system = CameraSystem::builder()
+        .register_backend(MultiModeProvider)
+        .backend_policy(BackendPolicy::Require(backend))
+        .build()
+        .unwrap();
+    let request = CaptureRequest::builder()
+        .exact_resolution(1280, 720)
+        .preferred_frame_rate(FrameRate::new(30, 1).unwrap())
+        .minimum_frame_rate(FrameRate::new(15, 1).unwrap())
+        .preferred_formats([CaptureFormat::Nv12, CaptureFormat::Rgb8])
+        .build()
+        .unwrap();
+    let plan = system
+        .plan(DeviceSelector::Default, request.clone())
+        .await
+        .unwrap();
+    assert_eq!(
+        plan.selected.capture.frame_rate,
+        FrameRate::new(15, 1).unwrap()
+    );
+    assert_eq!(plan.selected.capture.format, CaptureFormat::Rgb8);
+
+    let mut camera = system.open(DeviceSelector::Default).await.unwrap();
+    let session = camera.start(request).await.unwrap();
+    assert_eq!(
+        session.negotiated().capture.frame_rate,
+        FrameRate::new(15, 1).unwrap()
+    );
+    session.close().await.unwrap();
+}
+
+#[derive(Debug, Default)]
+struct SlowControlProvider {
+    dropped_devices: Option<Arc<AtomicUsize>>,
+}
+
+impl BackendProvider for SlowControlProvider {
+    fn id(&self) -> BackendId {
+        BackendId::custom("com.example", "slow-control").unwrap()
+    }
+
+    fn enumerate(&self) -> CameraResult<Vec<BackendDeviceInfo>> {
+        Ok(vec![BackendDeviceInfo {
+            native_id: "slow".into(),
+            name: "Slow control camera".into(),
+            description: String::new(),
+            stability: IdentityStability::Native,
+            facing: CameraFacing::External,
+            usb: None,
+        }])
+    }
+
+    fn open(&self, _native_id: &str) -> CameraResult<Box<dyn BackendDevice>> {
+        std::thread::sleep(Duration::from_millis(80));
+        Ok(Box::new(SlowControlDevice {
+            dropped_devices: self.dropped_devices.clone(),
+        }))
+    }
+}
+
+struct SlowControlDevice {
+    dropped_devices: Option<Arc<AtomicUsize>>,
+}
+
+impl Drop for SlowControlDevice {
+    fn drop(&mut self) {
+        if let Some(dropped) = &self.dropped_devices {
+            dropped.fetch_add(1, Ordering::Release);
+        }
+    }
+}
+
+impl BackendDevice for SlowControlDevice {
+    fn capabilities(&self) -> CameraResult<DeviceCapabilities> {
+        std::thread::sleep(Duration::from_millis(80));
+        Ok(DeviceCapabilities::single_native(
+            CaptureFormat::Rgb8,
+            4,
+            2,
+            FrameRate::new(30, 1).unwrap(),
+        ))
+    }
+
+    fn start(&mut self, sink: FrameSink, plan: &camera::CapturePlan) -> CameraResult<()> {
+        let selected = &plan.selected.capture;
+        let length = (selected.width * selected.height * 3) as usize;
+        sink.publish_bytes(
+            FrameLayout {
+                width: selected.width,
+                height: selected.height,
+                format: PixelFormat::Rgb8,
+                planes: vec![PlaneLayout {
+                    offset: 0,
+                    length,
+                    row_stride: (selected.width * 3) as usize,
+                    pixel_stride: 3,
+                }],
+                color: Default::default(),
+                orientation: Default::default(),
+                bottom_up: false,
+            },
+            None,
+            &vec![3; length],
+        )?;
+        Ok(())
+    }
+
+    fn stop(&mut self) -> CameraResult<()> {
+        Ok(())
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn external_backend_control_calls_do_not_block_the_async_runtime() {
+    let backend = BackendId::custom("com.example", "slow-control").unwrap();
+    let system = CameraSystem::builder()
+        .register_backend(SlowControlProvider::default())
+        .backend_policy(BackendPolicy::Require(backend))
+        .build()
+        .unwrap();
+
+    let open_task = tokio::spawn(async move { system.open(DeviceSelector::Default).await });
+    let timer_started = std::time::Instant::now();
+    tokio::time::sleep(Duration::from_millis(10)).await;
+    assert!(timer_started.elapsed() < Duration::from_millis(40));
+    let mut device = open_task.await.unwrap().unwrap();
+
+    let start_task = tokio::spawn(async move {
+        let session = device
+            .start(
+                CaptureRequest::builder()
+                    .preferred_resolution(4, 2)
+                    .build()
+                    .unwrap(),
+            )
+            .await?;
+        session.close().await
+    });
+    let timer_started = std::time::Instant::now();
+    tokio::time::sleep(Duration::from_millis(10)).await;
+    assert!(timer_started.elapsed() < Duration::from_millis(40));
+    start_task.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn startup_timeout_covers_external_capability_queries() {
+    let backend = BackendId::custom("com.example", "slow-control").unwrap();
+    let system = CameraSystem::builder()
+        .register_backend(SlowControlProvider::default())
+        .backend_policy(BackendPolicy::Require(backend))
+        .build()
+        .unwrap();
+    let mut device = system.open(DeviceSelector::Default).await.unwrap();
+    let result = device
+        .start(
+            CaptureRequest::builder()
+                .preferred_resolution(4, 2)
+                .startup_timeout(Duration::from_millis(20))
+                .build()
+                .unwrap(),
+        )
+        .await;
+    assert!(matches!(
+        result,
+        Err(CameraError::Timeout {
+            stage: camera::OperationStage::Startup
+        })
+    ));
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let session = device
+        .start(
+            CaptureRequest::builder()
+                .preferred_resolution(4, 2)
+                .build()
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    session.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn capture_builder_startup_timeout_is_one_total_deadline() {
+    let backend = BackendId::custom("com.example", "slow-control").unwrap();
+    let system = CameraSystem::builder()
+        .register_backend(SlowControlProvider::default())
+        .backend_policy(BackendPolicy::Require(backend))
+        .build()
+        .unwrap();
+    let result = system
+        .capture(DeviceSelector::Default)
+        .request(
+            CaptureRequest::builder()
+                .preferred_resolution(4, 2)
+                .startup_timeout(Duration::from_millis(120))
+                .build()
+                .unwrap(),
+        )
+        .start()
+        .await;
+
+    assert!(matches!(result, Err(CameraError::Timeout { .. })));
+}
+
+#[derive(Debug)]
+struct DelayedOpenProvider {
+    id: BackendId,
+    delay: Duration,
+    fail: bool,
+}
+
+impl BackendProvider for DelayedOpenProvider {
+    fn id(&self) -> BackendId {
+        self.id.clone()
+    }
+
+    fn enumerate(&self) -> CameraResult<Vec<BackendDeviceInfo>> {
+        Ok(vec![BackendDeviceInfo {
+            native_id: "delayed".into(),
+            name: "Delayed camera".into(),
+            description: String::new(),
+            stability: IdentityStability::Native,
+            facing: CameraFacing::External,
+            usb: None,
+        }])
+    }
+
+    fn open(&self, _native_id: &str) -> CameraResult<Box<dyn BackendDevice>> {
+        std::thread::sleep(self.delay);
+        if self.fail {
+            Err(CameraError::DeviceOpenFailed("fixture failure".into()))
+        } else {
+            Ok(Box::new(TestDevice {
+                running: Arc::new(AtomicBool::new(false)),
+            }))
+        }
+    }
+}
+
+#[tokio::test]
+async fn preferred_backend_attempts_share_the_startup_deadline() {
+    let first = BackendId::custom("com.example", "delayed-first").unwrap();
+    let second = BackendId::custom("com.example", "delayed-second").unwrap();
+    let system = CameraSystem::builder()
+        .register_backend(DelayedOpenProvider {
+            id: first.clone(),
+            delay: Duration::from_millis(45),
+            fail: true,
+        })
+        .register_backend(DelayedOpenProvider {
+            id: second.clone(),
+            delay: Duration::from_millis(45),
+            fail: false,
+        })
+        .backend_policy(BackendPolicy::Prefer(vec![first, second]))
+        .build()
+        .unwrap();
+    let result = system
+        .capture(DeviceSelector::Default)
+        .request(
+            CaptureRequest::builder()
+                .preferred_resolution(4, 2)
+                .startup_timeout(Duration::from_millis(70))
+                .build()
+                .unwrap(),
+        )
+        .start()
+        .await;
+
+    assert!(matches!(result, Err(CameraError::BackendAttemptsFailed(_))));
+}
+
+#[tokio::test]
+async fn external_open_and_capability_queries_have_explicit_timeouts() {
+    let backend = BackendId::custom("com.example", "slow-control").unwrap();
+    let dropped_devices = Arc::new(AtomicUsize::new(0));
+    let system = CameraSystem::builder()
+        .register_backend(SlowControlProvider {
+            dropped_devices: Some(dropped_devices.clone()),
+        })
+        .backend_policy(BackendPolicy::Require(backend))
+        .build()
+        .unwrap();
+    let id = system.devices().await.unwrap().remove(0).id;
+
+    assert!(matches!(
+        system
+            .open_timeout(DeviceSelector::Default, Duration::from_millis(20))
+            .await,
+        Err(CameraError::Timeout {
+            stage: camera::OperationStage::Open
+        })
+    ));
+    tokio::time::timeout(Duration::from_millis(200), async {
+        while dropped_devices.load(Ordering::Acquire) == 0 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert!(matches!(
+        system
+            .capabilities_timeout(&id, Duration::from_millis(20))
+            .await,
+        Err(CameraError::Timeout {
+            stage: camera::OperationStage::Capabilities
+        })
+    ));
+}
+
+#[derive(Debug)]
+struct ActivityProvider {
+    emitting: Arc<AtomicBool>,
+    disconnecting: Arc<AtomicBool>,
+    starts: Arc<AtomicUsize>,
+}
+
+impl BackendProvider for ActivityProvider {
+    fn id(&self) -> BackendId {
+        BackendId::custom("com.example", "activity").unwrap()
+    }
+
+    fn enumerate(&self) -> CameraResult<Vec<BackendDeviceInfo>> {
+        Ok(vec![BackendDeviceInfo {
+            native_id: "activity-device".into(),
+            name: "Activity camera".into(),
+            description: String::new(),
+            stability: IdentityStability::Native,
+            facing: CameraFacing::External,
+            usb: None,
+        }])
+    }
+
+    fn open(&self, _native_id: &str) -> CameraResult<Box<dyn BackendDevice>> {
+        Ok(Box::new(ActivityDevice {
+            emitting: self.emitting.clone(),
+            disconnecting: self.disconnecting.clone(),
+            starts: self.starts.clone(),
+            running: Arc::new(AtomicBool::new(false)),
+            worker: None,
+        }))
+    }
+}
+
+struct ActivityDevice {
+    emitting: Arc<AtomicBool>,
+    disconnecting: Arc<AtomicBool>,
+    starts: Arc<AtomicUsize>,
+    running: Arc<AtomicBool>,
+    worker: Option<JoinHandle<()>>,
+}
+
+impl BackendDevice for ActivityDevice {
+    fn capabilities(&self) -> CameraResult<DeviceCapabilities> {
+        Ok(DeviceCapabilities::single_native(
+            CaptureFormat::Rgb8,
+            2,
+            1,
+            FrameRate::new(30, 1).unwrap(),
+        ))
+    }
+
+    fn start(&mut self, sink: FrameSink, _plan: &camera::CapturePlan) -> CameraResult<()> {
+        self.stop()?;
+        self.starts.fetch_add(1, Ordering::AcqRel);
+        self.running.store(true, Ordering::Release);
+        let running = self.running.clone();
+        let emitting = self.emitting.clone();
+        let disconnecting = self.disconnecting.clone();
+        self.worker = Some(std::thread::spawn(move || {
+            let layout = FrameLayout {
+                width: 2,
+                height: 1,
+                format: PixelFormat::Rgb8,
+                planes: vec![PlaneLayout {
+                    offset: 0,
+                    length: 6,
+                    row_stride: 6,
+                    pixel_stride: 3,
+                }],
+                color: Default::default(),
+                orientation: Default::default(),
+                bottom_up: false,
+            };
+            while running.load(Ordering::Acquire) {
+                if disconnecting.swap(false, Ordering::AcqRel) {
+                    sink.disconnect();
+                    break;
+                }
+                if emitting.load(Ordering::Acquire) {
+                    let _ = sink.publish_bytes(layout.clone(), None, &[9; 6]);
+                }
+                std::thread::sleep(Duration::from_millis(2));
+            }
+        }));
+        Ok(())
+    }
+
+    fn stop(&mut self) -> CameraResult<()> {
+        self.running.store(false, Ordering::Release);
+        if let Some(worker) = self.worker.take() {
+            worker.join().unwrap();
+        }
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn pool_pressure_is_activity_but_a_true_source_stall_recovers() {
+    let emitting = Arc::new(AtomicBool::new(true));
+    let disconnecting = Arc::new(AtomicBool::new(false));
+    let starts = Arc::new(AtomicUsize::new(0));
+    let backend = BackendId::custom("com.example", "activity").unwrap();
+    let system = CameraSystem::builder()
+        .register_backend(ActivityProvider {
+            emitting: emitting.clone(),
+            disconnecting,
+            starts: starts.clone(),
+        })
+        .backend_policy(BackendPolicy::Require(backend))
+        .build()
+        .unwrap();
+    let mut device = system.open(DeviceSelector::Default).await.unwrap();
+    let session = device
+        .start(
+            CaptureRequest::builder()
+                .exact_resolution(2, 1)
+                .preferred_formats([CaptureFormat::Rgb8])
+                .memory_budget(MemoryBudget {
+                    buffers: 2,
+                    bytes: 1024,
+                })
+                .reconnect(camera::ReconnectPolicy {
+                    max_attempts: Some(3),
+                    delay: Duration::from_millis(3),
+                    stall_timeout: Duration::from_millis(12),
+                })
+                .build()
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let mut frames = session.subscribe(SubscriptionOptions::latest()).unwrap();
+    let first = frames
+        .next_timeout(Duration::from_millis(30))
+        .await
+        .unwrap();
+    let second = frames
+        .next_timeout(Duration::from_millis(30))
+        .await
+        .unwrap();
+    let capture_session = first.key.session;
+
+    tokio::time::sleep(Duration::from_millis(35)).await;
+    assert!(session.metrics().pool_drops > 0);
+    assert!(session.state().is_streaming());
+    assert_eq!(starts.load(Ordering::Acquire), 1);
+
+    drop(first);
+    let resumed = frames
+        .next_timeout(Duration::from_millis(30))
+        .await
+        .unwrap();
+    assert_eq!(resumed.key.session, capture_session);
+    drop((second, resumed));
+
+    emitting.store(false, Ordering::Release);
+    tokio::time::timeout(Duration::from_millis(100), async {
+        while !matches!(session.state(), camera::SessionState::Recovering { .. })
+            || starts.load(Ordering::Acquire) < 2
+        {
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+    })
+    .await
+    .unwrap();
+    session.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn an_explicit_backend_disconnect_starts_recovery_without_stall_timeout_delay() {
+    let emitting = Arc::new(AtomicBool::new(true));
+    let disconnecting = Arc::new(AtomicBool::new(false));
+    let starts = Arc::new(AtomicUsize::new(0));
+    let backend = BackendId::custom("com.example", "activity").unwrap();
+    let system = CameraSystem::builder()
+        .register_backend(ActivityProvider {
+            emitting,
+            disconnecting: disconnecting.clone(),
+            starts: starts.clone(),
+        })
+        .backend_policy(BackendPolicy::Require(backend))
+        .build()
+        .unwrap();
+    let mut device = system.open(DeviceSelector::Default).await.unwrap();
+    let session = device
+        .start(
+            CaptureRequest::builder()
+                .exact_resolution(2, 1)
+                .preferred_formats([CaptureFormat::Rgb8])
+                .reconnect(camera::ReconnectPolicy {
+                    max_attempts: Some(3),
+                    delay: Duration::from_secs(1),
+                    stall_timeout: Duration::from_secs(5),
+                })
+                .build()
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let mut frames = session.subscribe(SubscriptionOptions::latest()).unwrap();
+    frames
+        .next_timeout(Duration::from_millis(100))
+        .await
+        .unwrap();
+
+    disconnecting.store(true, Ordering::Release);
+
+    tokio::time::timeout(Duration::from_millis(500), async {
+        while starts.load(Ordering::Acquire) < 2 || !session.state().is_streaming() {
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+    })
+    .await
+    .expect("disconnect signal should bypass the five-second stall timeout");
+    frames
+        .next_timeout(Duration::from_millis(100))
+        .await
+        .expect("the original receiver must continue on the recovered epoch");
+    session.close().await.unwrap();
+}
+
+#[derive(Debug)]
+struct FormatFallbackProvider {
+    attempted: Arc<StdMutex<Vec<CaptureFormat>>>,
+}
+
+impl BackendProvider for FormatFallbackProvider {
+    fn id(&self) -> BackendId {
+        BackendId::custom("com.example", "format-fallback").unwrap()
+    }
+
+    fn enumerate(&self) -> CameraResult<Vec<BackendDeviceInfo>> {
+        Ok(vec![BackendDeviceInfo {
+            native_id: "same-handle".into(),
+            name: "Format fallback camera".into(),
+            description: String::new(),
+            stability: IdentityStability::Native,
+            facing: CameraFacing::External,
+            usb: None,
+        }])
+    }
+
+    fn open(&self, _native_id: &str) -> CameraResult<Box<dyn BackendDevice>> {
+        Ok(Box::new(FormatFallbackDevice {
+            attempted: self.attempted.clone(),
+        }))
+    }
+}
+
+struct FormatFallbackDevice {
+    attempted: Arc<StdMutex<Vec<CaptureFormat>>>,
+}
+
+impl BackendDevice for FormatFallbackDevice {
+    fn capabilities(&self) -> CameraResult<DeviceCapabilities> {
+        DeviceCapabilities::from_modes([
+            camera::CaptureMode {
+                format: CaptureFormat::Mjpeg,
+                width: 4,
+                height: 2,
+                frame_rate: FrameRate::new(30, 1).unwrap(),
+            },
+            camera::CaptureMode {
+                format: CaptureFormat::Yuyv,
+                width: 4,
+                height: 2,
+                frame_rate: FrameRate::new(30, 1).unwrap(),
+            },
+        ])
+    }
+
+    fn start(&mut self, sink: FrameSink, plan: &camera::CapturePlan) -> CameraResult<()> {
+        let format = plan.selected.capture.format;
+        self.attempted.lock().unwrap().push(format);
+        if format == CaptureFormat::Mjpeg {
+            return Err(CameraError::UnsupportedFormat(
+                "fixture rejects MJPEG".into(),
+            ));
+        }
+        sink.publish_bytes(
+            FrameLayout {
+                width: 4,
+                height: 2,
+                format: PixelFormat::Yuyv,
+                planes: vec![PlaneLayout {
+                    offset: 0,
+                    length: 16,
+                    row_stride: 8,
+                    pixel_stride: 2,
+                }],
+                color: Default::default(),
+                orientation: Default::default(),
+                bottom_up: false,
+            },
+            None,
+            &[4; 16],
+        )?;
+        Ok(())
+    }
+
+    fn stop(&mut self) -> CameraResult<()> {
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn format_fallback_reuses_the_selected_device_identity() {
+    let attempted = Arc::new(StdMutex::new(Vec::new()));
+    let backend = BackendId::custom("com.example", "format-fallback").unwrap();
+    let system = CameraSystem::builder()
+        .register_backend(FormatFallbackProvider {
+            attempted: attempted.clone(),
+        })
+        .backend_policy(BackendPolicy::Require(backend.clone()))
+        .build()
+        .unwrap();
+    let mut device = system.open(DeviceSelector::Default).await.unwrap();
+    let selected_id = device.device().id.clone();
+    let session = device
+        .start(
+            CaptureRequest::builder()
+                .exact_resolution(4, 2)
+                .preferred_formats([CaptureFormat::Mjpeg, CaptureFormat::Yuyv])
+                .build()
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(session.device().id, selected_id);
+    assert_eq!(session.device().id.backend(), &backend);
+    assert_eq!(
+        *attempted.lock().unwrap(),
+        vec![CaptureFormat::Mjpeg, CaptureFormat::Yuyv]
+    );
+    session.close().await.unwrap();
 }
 
 #[tokio::test]

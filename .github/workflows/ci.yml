@@ -30,8 +30,9 @@ jobs:
       - name: Public async and blocking contracts
         run: |
           cargo test --no-default-features --features runtime-tokio,convert-rgb --tests
+          cargo test --no-default-features --features runtime-tokio,serde --test session_api frame_rate_deserialization_validates_and_normalizes
           cargo test --no-default-features --features blocking --test blocking_api
-          cargo check --manifest-path tests/consumer/Cargo.toml
+          cargo run --manifest-path tests/consumer/Cargo.toml
       - name: Minimal feature dependency boundaries
         shell: bash
         run: |

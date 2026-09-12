@@ -260,6 +260,192 @@ fn arbitrary_scaling_matches_full_conversion_for_packed_and_yuv_formats() {
 }
 
 #[test]
+fn exact_rational_nv12_scaling_matches_full_conversion() {
+    let width = 12;
+    let height = 12;
+    let y_len = width * height;
+    let uv_len = width * height / 2;
+    let layout = FrameLayout {
+        width: width as u32,
+        height: height as u32,
+        format: PixelFormat::Nv12,
+        planes: vec![
+            PlaneLayout {
+                offset: 0,
+                length: y_len,
+                row_stride: width,
+                pixel_stride: 1,
+            },
+            PlaneLayout {
+                offset: y_len,
+                length: uv_len,
+                row_stride: width,
+                pixel_stride: 2,
+            },
+        ],
+        color: ColorInfo {
+            matrix: ColorMatrix::Bt601,
+            range: ColorRange::Full,
+            ..Default::default()
+        },
+        orientation: Orientation::default(),
+        bottom_up: false,
+    };
+    let data = (0..y_len + uv_len)
+        .map(|value| (value * 29 + 17) as u8)
+        .collect::<Vec<_>>();
+    let mut converter = RgbConverter::new();
+    let mut full = vec![0; width * height * 3];
+    converter
+        .convert_layout_into(
+            &layout,
+            &data,
+            ConversionRequest::for_layout(&layout),
+            &mut full,
+        )
+        .unwrap();
+    let mut scaled = vec![0; 8 * 8 * 3];
+    converter
+        .convert_layout_into(
+            &layout,
+            &data,
+            ConversionRequest::new(8, 8).unwrap(),
+            &mut scaled,
+        )
+        .unwrap();
+
+    assert_eq!(scaled, nearest_rgb_reference(&full, width, height, 8, 8));
+
+    let mut three_quarters = vec![0; 9 * 9 * 3];
+    converter
+        .convert_layout_into(
+            &layout,
+            &data,
+            ConversionRequest::new(9, 9).unwrap(),
+            &mut three_quarters,
+        )
+        .unwrap();
+    assert_eq!(
+        three_quarters,
+        nearest_rgb_reference(&full, width, height, 9, 9)
+    );
+}
+
+#[test]
+fn exact_rational_padded_nv12_scaling_matches_full_conversion() {
+    let (width, height, stride) = (12, 12, 16);
+    let y_length = (height - 1) * stride + width;
+    let uv_offset = stride * height;
+    let uv_length = (height / 2 - 1) * stride + width;
+    let layout = FrameLayout {
+        width: width as u32,
+        height: height as u32,
+        format: PixelFormat::Nv12,
+        planes: vec![
+            PlaneLayout {
+                offset: 0,
+                length: y_length,
+                row_stride: stride,
+                pixel_stride: 1,
+            },
+            PlaneLayout {
+                offset: uv_offset,
+                length: uv_length,
+                row_stride: stride,
+                pixel_stride: 2,
+            },
+        ],
+        color: ColorInfo {
+            matrix: ColorMatrix::Bt709,
+            range: ColorRange::Limited,
+            ..Default::default()
+        },
+        orientation: Orientation::default(),
+        bottom_up: false,
+    };
+    let data = (0..uv_offset + uv_length)
+        .map(|value| (value * 37 + 11) as u8)
+        .collect::<Vec<_>>();
+    let mut converter = RgbConverter::new();
+    let mut full = vec![0; width * height * 3];
+    converter
+        .convert_layout_into(
+            &layout,
+            &data,
+            ConversionRequest::for_layout(&layout),
+            &mut full,
+        )
+        .unwrap();
+    let mut scaled = vec![0; 8 * 8 * 3];
+    converter
+        .convert_layout_into(
+            &layout,
+            &data,
+            ConversionRequest::new(8, 8).unwrap(),
+            &mut scaled,
+        )
+        .unwrap();
+
+    assert_eq!(scaled, nearest_rgb_reference(&full, width, height, 8, 8));
+}
+
+#[test]
+fn exact_rational_padded_rgb8_scaling_matches_reference() {
+    let (width, height, stride) = (12, 12, 40);
+    let length = (height - 1) * stride + width * 3;
+    let layout = FrameLayout {
+        width: width as u32,
+        height: height as u32,
+        format: PixelFormat::Rgb8,
+        planes: vec![PlaneLayout {
+            offset: 0,
+            length,
+            row_stride: stride,
+            pixel_stride: 3,
+        }],
+        color: ColorInfo::default(),
+        orientation: Orientation::default(),
+        bottom_up: false,
+    };
+    let data = (0..length)
+        .map(|value| (value * 41 + 23) as u8)
+        .collect::<Vec<_>>();
+    let mut converter = RgbConverter::new();
+    let mut full = vec![0; width * height * 3];
+    converter
+        .convert_layout_into(
+            &layout,
+            &data,
+            ConversionRequest::for_layout(&layout),
+            &mut full,
+        )
+        .unwrap();
+    for (output_width, output_height) in [(8, 8), (9, 9)] {
+        let mut scaled = vec![0; output_width * output_height * 3];
+        converter
+            .convert_layout_into(
+                &layout,
+                &data,
+                ConversionRequest::new(output_width as u32, output_height as u32).unwrap(),
+                &mut scaled,
+            )
+            .unwrap();
+        assert_eq!(
+            scaled,
+            nearest_rgb_reference(&full, width, height, output_width, output_height)
+        );
+    }
+    assert_eq!(
+        selected_conversion_path(&layout, ConversionRequest::new(8, 8).unwrap()),
+        "rgb-row-nearest-2x3"
+    );
+    assert_eq!(
+        selected_conversion_path(&layout, ConversionRequest::new(9, 9).unwrap()),
+        "rgb-row-nearest-3x4"
+    );
+}
+
+#[test]
 fn diagnostic_path_uses_the_same_exact_half_and_arbitrary_rules_as_conversion() {
     let layout = FrameLayout {
         width: 1920,
@@ -294,7 +480,11 @@ fn diagnostic_path_uses_the_same_exact_half_and_arbitrary_rules_as_conversion() 
     );
     assert_eq!(
         selected_conversion_path(&layout, ConversionRequest::new(1280, 720).unwrap()),
-        "yuv-row-convert-nearest"
+        "yuv-row-convert-nearest-2x3"
+    );
+    assert_eq!(
+        selected_conversion_path(&layout, ConversionRequest::new(1440, 810).unwrap()),
+        "yuv-row-convert-nearest-3x4"
     );
     assert_eq!(
         selected_conversion_path(&layout, ConversionRequest::new(320, 180).unwrap()),
@@ -361,8 +551,8 @@ fn conversion_request_validates_dimensions_and_exact_destination_size() {
 #[cfg(feature = "decode-mjpeg")]
 #[test]
 fn mjpeg_conversion_scales_at_decode_time_and_resets_between_requests() {
-    let width = 16;
-    let height = 16;
+    let width = 12;
+    let height = 12;
     let pixels: Vec<u8> = (0..height)
         .flat_map(|y| (0..width).flat_map(move |x| [x as u8 * 12, y as u8 * 12, (x + y) as u8 * 6]))
         .collect();
@@ -393,23 +583,23 @@ fn mjpeg_conversion_scales_at_decode_time_and_resets_between_requests() {
         bottom_up: false,
     };
     let mut converter = RgbConverter::new();
-    let mut half = vec![0; 8 * 8 * 3];
+    let mut half = vec![0; 6 * 6 * 3];
     converter
         .convert_layout_into(
             &layout,
             &jpeg,
-            ConversionRequest::new(8, 8).unwrap(),
+            ConversionRequest::new(6, 6).unwrap(),
             &mut half,
         )
         .unwrap();
     assert!(half.iter().any(|&channel| channel > 100));
 
-    let mut arbitrary = vec![0; 3 * 3 * 3];
+    let mut arbitrary = vec![0; 8 * 8 * 3];
     converter
         .convert_layout_into(
             &layout,
             &jpeg,
-            ConversionRequest::new(3, 3).unwrap(),
+            ConversionRequest::new(8, 8).unwrap(),
             &mut arbitrary,
         )
         .unwrap();
@@ -424,7 +614,28 @@ fn mjpeg_conversion_scales_at_decode_time_and_resets_between_requests() {
             &mut full,
         )
         .unwrap();
-    assert!(full.iter().any(|&channel| channel > 150));
+    assert!(full.iter().any(|&channel| channel > 100));
+    assert_eq!(arbitrary, nearest_rgb_reference(&full, width, height, 8, 8));
+
+    let mut damaged_layout = layout.clone();
+    damaged_layout.planes[0].length = jpeg.len() / 4;
+    let mut damaged_out = vec![0; width * height * 3];
+    assert!(converter
+        .convert_layout_into(
+            &damaged_layout,
+            &jpeg[..jpeg.len() / 4],
+            ConversionRequest::for_layout(&damaged_layout),
+            &mut damaged_out,
+        )
+        .is_err());
+    converter
+        .convert_layout_into(
+            &layout,
+            &jpeg,
+            ConversionRequest::for_layout(&layout),
+            &mut full,
+        )
+        .expect("the next complete MJPEG frame must recover the decoder");
 }
 #[test]
 fn rational_order_compares_values_not_storage() {

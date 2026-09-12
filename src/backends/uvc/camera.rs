@@ -253,13 +253,7 @@ impl UvcCamera {
         let worker = std::thread::Builder::new()
             .name("camera-uvc-mjpeg".into())
             .spawn(move || {
-                let mut decoder = match Decompressor::new() {
-                    Ok(decoder) => decoder,
-                    Err(error) => {
-                        log::error!("Cannot create UVC MJPEG decoder: {error}");
-                        return;
-                    }
-                };
+                let mut decoder = None;
                 while let Ok(mut job) = receiver.recv() {
                     let result = state.hub.publish_rgb_metadata(
                         session,
@@ -268,32 +262,34 @@ impl UvcCamera {
                         None,
                         Some(job.sequence),
                         |rgb| {
-                            let header = decoder
-                                .read_header(&job.data)
-                                .map_err(|error| CameraError::InvalidFormat(error.to_string()))?;
-                            if header.width != job.width as usize
-                                || header.height != job.height as usize
-                            {
-                                return Err(CameraError::InvalidFormat(
-                                    "MJPEG dimensions differ from negotiated frame".into(),
-                                ));
-                            }
-                            decoder
-                                .decompress(
-                                    &job.data,
-                                    Image {
-                                        pixels: rgb,
-                                        width: header.width,
-                                        height: header.height,
-                                        pitch: header.width * 3,
-                                        format: PixelFormat::RGB,
-                                    },
-                                )
-                                .map_err(|error| CameraError::InvalidFormat(error.to_string()))
+                            crate::mjpeg::decode_with(&mut decoder, &job.data, |decoder, data| {
+                                let header = decoder.read_header(data).map_err(|error| {
+                                    CameraError::InvalidFormat(error.to_string())
+                                })?;
+                                if header.width != job.width as usize
+                                    || header.height != job.height as usize
+                                {
+                                    return Err(CameraError::InvalidFormat(
+                                        "MJPEG dimensions differ from negotiated frame".into(),
+                                    ));
+                                }
+                                decoder
+                                    .decompress(
+                                        data,
+                                        Image {
+                                            pixels: rgb,
+                                            width: header.width,
+                                            height: header.height,
+                                            pitch: header.width * 3,
+                                            format: PixelFormat::RGB,
+                                        },
+                                    )
+                                    .map_err(|error| CameraError::InvalidFormat(error.to_string()))
+                            })
                         },
                     );
                     if let Err(error) = result {
-                        log::debug!("Skipping deferred UVC MJPEG frame: {error}");
+                        state.hub.log_frame_error("UVC MJPEG", &error);
                     }
                     job.data.clear();
                     worker_buffers.lock().push(job.data);
@@ -307,6 +303,9 @@ impl UvcCamera {
         if frame.is_null() || user_ptr.is_null() {
             return;
         }
+        // SAFETY: libuvc retains the callback context until streaming is
+        // synchronously stopped and this callback has returned.
+        let hub = unsafe { (&*(user_ptr as *const CallbackContext)).state.hub.clone() };
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
             let context = &*(user_ptr as *const CallbackContext);
             let frame = &*frame;
@@ -314,6 +313,14 @@ impl UvcCamera {
                 return Ok(false);
             }
             let data = std::slice::from_raw_parts(frame.data as *const u8, frame.data_bytes);
+            #[cfg(feature = "decode-mjpeg")]
+            if frame.frame_format == ffi::UvcFrameFormat::Mjpeg {
+                if let Err(error) = crate::mjpeg::validate(data) {
+                    context.state.hub.record_input_error(context.session);
+                    context.state.hub.log_frame_error("UVC MJPEG", &error);
+                    return Ok(false);
+                }
+            }
             if context.state.hub.wants_native() {
                 let format = match frame.frame_format {
                     ffi::UvcFrameFormat::Mjpeg => crate::PixelFormat::Mjpeg,
@@ -404,35 +411,30 @@ impl UvcCamera {
                             #[cfg(feature = "decode-mjpeg")]
                             {
                                 let mut guard = context.state.decoder.lock();
-                                if guard.is_none() {
-                                    *guard = Some(
-                                        Decompressor::new()
-                                            .map_err(|e| CameraError::Other(e.to_string()))?,
-                                    );
-                                }
-                                let decoder = guard.as_mut().unwrap();
-                                let header = decoder
-                                    .read_header(data)
-                                    .map_err(|e| CameraError::InvalidFormat(e.to_string()))?;
-                                if header.width != frame.width as usize
-                                    || header.height != frame.height as usize
-                                {
-                                    return Err(CameraError::InvalidFormat(
-                                        "MJPEG dimensions differ from negotiated frame".into(),
-                                    ));
-                                }
-                                decoder
-                                    .decompress(
-                                        data,
-                                        Image {
-                                            pixels: rgb,
-                                            width: header.width,
-                                            height: header.height,
-                                            pitch: header.width * 3,
-                                            format: PixelFormat::RGB,
-                                        },
-                                    )
-                                    .map_err(|e| CameraError::InvalidFormat(e.to_string()))
+                                crate::mjpeg::decode_with(&mut guard, data, |decoder, data| {
+                                    let header = decoder
+                                        .read_header(data)
+                                        .map_err(|e| CameraError::InvalidFormat(e.to_string()))?;
+                                    if header.width != frame.width as usize
+                                        || header.height != frame.height as usize
+                                    {
+                                        return Err(CameraError::InvalidFormat(
+                                            "MJPEG dimensions differ from negotiated frame".into(),
+                                        ));
+                                    }
+                                    decoder
+                                        .decompress(
+                                            data,
+                                            Image {
+                                                pixels: rgb,
+                                                width: header.width,
+                                                height: header.height,
+                                                pitch: header.width * 3,
+                                                format: PixelFormat::RGB,
+                                            },
+                                        )
+                                        .map_err(|e| CameraError::InvalidFormat(e.to_string()))
+                                })
                             }
                         }
                         ffi::UvcFrameFormat::Yuyv | ffi::UvcFrameFormat::Uyvy => {
@@ -544,7 +546,7 @@ impl UvcCamera {
             }
         }));
         match result {
-            Ok(Err(error)) => log::warn!("UVC frame rejected: {}", error),
+            Ok(Err(error)) => hub.log_frame_error("UVC", &error),
             Err(_) => log::error!("UVC callback panicked; frame discarded"),
             _ => {}
         }
@@ -1630,6 +1632,55 @@ mod capture_contract_tests {
         assert_eq!(frame.key.session, session);
         assert_eq!(frame.source_sequence, Some(7));
         assert_eq!(frame.bytes().len(), 16 * 16 * 3);
+    }
+
+    #[test]
+    fn mjpeg_worker_skips_a_truncated_frame_and_decodes_the_next_complete_frame() {
+        let camera = UvcCamera::new(0).unwrap();
+        let session = camera.capture.hub.start();
+        let pixels = vec![64u8; 16 * 16 * 3];
+        let jpeg = turbojpeg::compress(
+            turbojpeg::Image {
+                pixels: pixels.as_slice(),
+                width: 16,
+                height: 16,
+                pitch: 16 * 3,
+                format: turbojpeg::PixelFormat::RGB,
+            },
+            90,
+            turbojpeg::Subsamp::None,
+        )
+        .unwrap();
+        let (dispatch, worker) =
+            UvcCamera::start_mjpeg_worker(camera.capture.clone(), session).unwrap();
+        dispatch
+            .sender
+            .send(MjpegJob {
+                data: jpeg[..jpeg.len() / 4].to_vec(),
+                width: 16,
+                height: 16,
+                sequence: 7,
+            })
+            .unwrap();
+        dispatch
+            .sender
+            .send(MjpegJob {
+                data: jpeg.to_vec(),
+                width: 16,
+                height: 16,
+                sequence: 8,
+            })
+            .unwrap();
+        drop(dispatch);
+        worker.join().unwrap();
+
+        let frame = camera.capture.hub.latest().unwrap();
+        assert_eq!(frame.source_sequence, Some(8));
+        let metrics = camera.capture.hub.metrics();
+        assert_eq!(metrics.received, 2);
+        assert_eq!(metrics.published, 1);
+        assert_eq!(metrics.conversion_errors, 1);
+        assert_eq!(metrics.consecutive_conversion_errors, 0);
     }
 
     #[test]

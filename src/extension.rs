@@ -65,6 +65,12 @@ impl FrameSink {
             inner: Some(self.hub.writable_native(self.session, layout)?),
         })
     }
+
+    /// Signal that the physical stream ended unexpectedly. This wakes automatic
+    /// recovery immediately instead of waiting for the no-frame timeout.
+    pub fn disconnect(&self) {
+        self.hub.stop();
+    }
 }
 
 /// Writable storage borrowed directly from the framework's bounded frame pool.
@@ -174,5 +180,16 @@ mod tests {
         assert!(third_lease.commit().unwrap());
         assert_eq!(second.bytes(), &[2; 6]);
         assert_eq!(hub.latest().unwrap().bytes(), &[3; 6]);
+    }
+
+    #[test]
+    fn custom_backend_can_signal_a_physical_disconnect_immediately() {
+        let hub = FrameHub::new(2);
+        let sink = FrameSink::begin(hub.clone());
+        assert!(hub.is_streaming());
+
+        sink.disconnect();
+
+        assert!(!hub.is_streaming());
     }
 }

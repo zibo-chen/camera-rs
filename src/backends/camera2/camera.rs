@@ -324,7 +324,7 @@ unsafe extern "C" fn frame_callback(context: *mut c_void, frame: *const ffi::Ndk
         )
     }));
     match result {
-        Ok(Err(error)) => log::warn!("Camera2 frame rejected: {}", error),
+        Ok(Err(error)) => shared.hub.log_frame_error("Camera2", &error),
         Err(_) => log::error!("Camera2 callback panicked; frame discarded"),
         _ => {}
     }

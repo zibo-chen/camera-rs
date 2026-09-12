@@ -108,6 +108,132 @@ impl V4l2Camera {
             log::debug!("V4L2 cleanup: {error}");
         }
     }
+
+    pub(crate) fn device_capabilities(
+        device_index: u32,
+    ) -> CameraResult<crate::DeviceCapabilities> {
+        let configurations = <Self as CameraManager>::get_supported_configs(device_index)?;
+        let file = open(Path::new(&device_path(device_index)))?;
+        let fd = file.as_raw_fd();
+        let mut ranges = Vec::new();
+        for format_index in 0..1024 {
+            let Some(code) = native::formats(fd, format_index)? else {
+                break;
+            };
+            let Some(format) = from_fourcc(code) else {
+                continue;
+            };
+            for size_index in 0..4096 {
+                let Some(size) = native::sizes(fd, code, size_index)? else {
+                    break;
+                };
+                let mut frame_intervals = Vec::new();
+                for (width, height) in dimensions(&size) {
+                    for interval_index in 0..4096 {
+                        let Some(interval) =
+                            native::intervals(fd, code, width, height, interval_index)?
+                        else {
+                            break;
+                        };
+                        if interval.kind != 1
+                            && interval.min_n > 0
+                            && interval.min_d > 0
+                            && interval.max_n > 0
+                            && interval.max_d > 0
+                        {
+                            frame_intervals.push(crate::FrameIntervalRange {
+                                kind: range_kind(interval.kind),
+                                minimum: crate::FrameInterval {
+                                    numerator: interval.min_n,
+                                    denominator: interval.min_d,
+                                },
+                                maximum: crate::FrameInterval {
+                                    numerator: interval.max_n,
+                                    denominator: interval.max_d,
+                                },
+                                step: (interval.kind == 3
+                                    && interval.step_n > 0
+                                    && interval.step_d > 0)
+                                    .then_some(crate::FrameInterval {
+                                        numerator: interval.step_n,
+                                        denominator: interval.step_d,
+                                    }),
+                                at_resolution: (width, height),
+                            });
+                        }
+                        if interval.kind != 1 {
+                            break;
+                        }
+                    }
+                }
+                if size.kind != 1 || !frame_intervals.is_empty() {
+                    ranges.push(crate::CaptureModeRange {
+                        format: format.into(),
+                        kind: range_kind(size.kind),
+                        width: crate::DimensionRange {
+                            minimum: size.min_w,
+                            maximum: size.max_w,
+                            step: size.step_w.max(1),
+                        },
+                        height: crate::DimensionRange {
+                            minimum: size.min_h,
+                            maximum: size.max_h,
+                            step: size.step_h.max(1),
+                        },
+                        frame_intervals,
+                    });
+                }
+                if size.kind != 1 {
+                    break;
+                }
+            }
+        }
+        Ok(crate::DeviceCapabilities::from_configurations(configurations).with_ranges(ranges))
+    }
+
+    pub(crate) fn requested_configs(
+        device_index: u32,
+        request: &crate::CaptureRequest,
+        advertised: &[CameraConfig],
+    ) -> CameraResult<Vec<CameraConfig>> {
+        let mut formats = if request.preferred_formats.is_empty() {
+            advertised
+                .iter()
+                .map(|config| config.format)
+                .collect::<Vec<_>>()
+        } else {
+            request
+                .preferred_formats
+                .iter()
+                .copied()
+                .map(Into::into)
+                .collect::<Vec<_>>()
+        };
+        formats.sort_by_key(|format| *format as u8);
+        formats.dedup();
+        let mut requested = Vec::new();
+        for format in formats {
+            let config = CameraConfig::new(
+                format,
+                request.width,
+                request.height,
+                request.preferred_fps.numerator(),
+            )
+            .with_frame_rate(request.preferred_fps);
+            if <Self as CameraManager>::is_config_supported(device_index, &config)? {
+                requested.push(config);
+            }
+        }
+        Ok(requested)
+    }
+}
+
+fn range_kind(kind: u32) -> crate::CapabilityRangeKind {
+    match kind {
+        1 => crate::CapabilityRangeKind::Discrete,
+        2 => crate::CapabilityRangeKind::Continuous,
+        _ => crate::CapabilityRangeKind::Stepwise,
+    }
 }
 impl Drop for V4l2Camera {
     fn drop(&mut self) {
@@ -197,11 +323,19 @@ impl Inner {
                         cancel.as_raw_fd(),
                         format.strides,
                         |planes, timestamp, clock, source_sequence, damaged| {
+                            if damaged {
+                                let error = CameraError::InvalidFormat(
+                                    "V4L2 driver marked frame damaged".into(),
+                                );
+                                hub.record_input_error(session);
+                                hub.log_frame_error("V4L2", &error);
+                                return Ok(());
+                            }
                             let timestamp = Some(crate::SourceTimestamp {
                                 nanoseconds: timestamp,
                                 clock,
                             });
-                            if !native_output && actual.format == VideoFormat::MJPEG && !damaged {
+                            if !native_output && actual.format == VideoFormat::MJPEG {
                                 let Some(plane) = planes.first() else {
                                     return Err(CameraError::BufferEmpty);
                                 };
@@ -210,7 +344,7 @@ impl Inner {
                                 deferred_mjpeg = Some((timestamp, source_sequence, plane.stride));
                                 return Ok(());
                             }
-                            let converted = if native_output && !damaged {
+                            let converted = if native_output {
                                 native_layout(&actual, &format, planes).and_then(|layout| {
                                     let parts = [
                                         planes[0].data,
@@ -231,18 +365,11 @@ impl Inner {
                                     actual.height,
                                     timestamp,
                                     Some(source_sequence),
-                                    |rgb| {
-                                        if damaged {
-                                            return Err(CameraError::InvalidFormat(
-                                                "V4L2 driver marked frame damaged".into(),
-                                            ));
-                                        }
-                                        decoder.convert(&actual, planes, rgb)
-                                    },
+                                    |rgb| decoder.convert(&actual, planes, rgb),
                                 )
                             };
                             if let Err(error) = converted {
-                                log::debug!("Skipping V4L2 frame: {error}");
+                                hub.log_frame_error("V4L2", &error);
                             }
                             Ok(())
                         },
@@ -261,7 +388,7 @@ impl Inner {
                                 Some(source_sequence),
                                 |rgb| decoder.convert(&actual, &plane, rgb),
                             ) {
-                                log::debug!("Skipping deferred V4L2 MJPEG frame: {error}");
+                                hub.log_frame_error("V4L2 MJPEG", &error);
                             }
                         }
                     }
@@ -519,6 +646,10 @@ impl CameraManager for V4l2Camera {
         }
         let file = open(Path::new(&device_path(device_index)))?;
         let fd = file.as_raw_fd();
+        let code = to_fourcc(config.format)?;
+        if !size_supported(fd, code, config.width, config.height)? {
+            return Ok(false);
+        }
         let mut format = match requested_format(fd, config) {
             Ok(f) => f,
             Err(CameraError::UnsupportedFormat(_)) => return Ok(false),
@@ -534,8 +665,13 @@ impl CameraManager for V4l2Camera {
         Ok(format.width == config.width
             && format.height == config.height
             && from_fourcc(format.fourcc) == Some(config.format)
-            && frame_rates(fd, format.fourcc, config.width, config.height)?
-                .contains(&config.frame_rate()?))
+            && frame_rate_supported(
+                fd,
+                format.fourcc,
+                config.width,
+                config.height,
+                config.frame_rate()?,
+            )?)
     }
 }
 
@@ -568,6 +704,81 @@ fn dimensions(size: &native::Size) -> Vec<(u32, u32)> {
         }
     }
     result
+}
+
+fn size_supports(size: &native::Size, width: u32, height: u32) -> bool {
+    width >= size.min_w
+        && width <= size.max_w
+        && height >= size.min_h
+        && height <= size.max_h
+        && (size.kind == 2
+            || ((width - size.min_w).is_multiple_of(size.step_w.max(1))
+                && (height - size.min_h).is_multiple_of(size.step_h.max(1))))
+}
+
+fn size_supported(fd: i32, code: u32, width: u32, height: u32) -> CameraResult<bool> {
+    for index in 0..4096 {
+        let Some(size) = native::sizes(fd, code, index)? else {
+            break;
+        };
+        if size_supports(&size, width, height) {
+            return Ok(true);
+        }
+        if size.kind != 1 {
+            break;
+        }
+    }
+    Ok(false)
+}
+
+fn interval_supports(interval: &native::Interval, rate: crate::FrameRate) -> bool {
+    if interval.min_n == 0 || interval.min_d == 0 || interval.max_n == 0 || interval.max_d == 0 {
+        return false;
+    }
+    let target_n = i128::from(rate.denominator());
+    let target_d = i128::from(rate.numerator());
+    let min_n = i128::from(interval.min_n);
+    let min_d = i128::from(interval.min_d);
+    let max_n = i128::from(interval.max_n);
+    let max_d = i128::from(interval.max_d);
+    if target_n * min_d < min_n * target_d || target_n * max_d > max_n * target_d {
+        return false;
+    }
+    if interval.kind == 1 {
+        return target_n * min_d == min_n * target_d;
+    }
+    if interval.kind == 2 {
+        return true;
+    }
+    if interval.step_n == 0 || interval.step_d == 0 {
+        return false;
+    }
+    let delta_n = target_n * min_d - min_n * target_d;
+    let delta_d = target_d * min_d;
+    let scaled_delta = delta_n * i128::from(interval.step_d);
+    let scaled_step = delta_d * i128::from(interval.step_n);
+    scaled_step != 0 && scaled_delta % scaled_step == 0
+}
+
+fn frame_rate_supported(
+    fd: i32,
+    code: u32,
+    width: u32,
+    height: u32,
+    rate: crate::FrameRate,
+) -> CameraResult<bool> {
+    for index in 0..4096 {
+        let Some(interval) = native::intervals(fd, code, width, height, index)? else {
+            break;
+        };
+        if interval_supports(&interval, rate) {
+            return Ok(true);
+        }
+        if interval.kind != 1 {
+            break;
+        }
+    }
+    Ok(false)
 }
 fn interval_rates(interval: &native::Interval) -> Vec<crate::FrameRate> {
     let Ok(fastest) = crate::FrameRate::new(interval.min_d, interval.min_n) else {
@@ -933,6 +1144,9 @@ mod tests {
         assert!(dims.contains(&(640, 480)));
         assert!(!dims.contains(&(1920, 1080)));
         assert!(!dims.contains(&(3840, 2160)));
+        assert!(size_supports(&size, 1600, 880));
+        assert!(!size_supports(&size, 1600, 900));
+        assert!(!size_supports(&size, 1936, 1080));
     }
     #[test]
     fn interval_enumeration_handles_fractional_and_ranged_rates() {
@@ -964,5 +1178,26 @@ mod tests {
                 .map(|r| crate::FrameRate::new(r, 1).unwrap())
                 .collect::<Vec<_>>()
         );
+        let range = native::Interval {
+            kind: 3,
+            min_n: 1001,
+            min_d: 60000,
+            max_n: 1001,
+            max_d: 15000,
+            step_n: 1001,
+            step_d: 60000,
+        };
+        assert!(interval_supports(
+            &range,
+            crate::FrameRate::new(30000, 1001).unwrap()
+        ));
+        assert!(!interval_supports(
+            &range,
+            crate::FrameRate::new(24, 1).unwrap()
+        ));
+        assert!(!interval_supports(
+            &range,
+            crate::FrameRate::new(120, 1).unwrap()
+        ));
     }
 }

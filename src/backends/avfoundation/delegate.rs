@@ -144,7 +144,7 @@ unsafe fn handle_sample_buffer_unsafe(sample_buffer: &CMSampleBuffer, state: &De
                             }
                         })
                     {
-                        log::warn!("Encoded AVFoundation frame rejected: {error}");
+                        frame_buffer.log_frame_error("AVFoundation encoded", &error);
                     }
                 }
             }
@@ -311,7 +311,7 @@ unsafe fn handle_sample_buffer_unsafe(sample_buffer: &CMSampleBuffer, state: &De
             )
         };
         if let Err(error) = result {
-            log::warn!("AVFoundation NV12 frame rejected: {error}");
+            frame_buffer.log_frame_error("AVFoundation NV12", &error);
         }
         return;
     }
@@ -340,7 +340,7 @@ unsafe fn handle_sample_buffer_unsafe(sample_buffer: &CMSampleBuffer, state: &De
         let layout = crate::FrameLayout::packed(width, height, format, bytes_per_row, length);
         if let Err(e) = frame_buffer.publish_native(state.session, layout, timestamp, None, &[data])
         {
-            log::warn!("AVFoundation native frame: {e}");
+            frame_buffer.log_frame_error("AVFoundation native", &e);
         }
         return;
     }
@@ -403,7 +403,7 @@ unsafe fn handle_sample_buffer_unsafe(sample_buffer: &CMSampleBuffer, state: &De
             Ok(())
         });
     if let Err(error) = result {
-        log::warn!("AVFoundation frame rejected: {}", error);
+        frame_buffer.log_frame_error("AVFoundation", &error);
     }
 }
 

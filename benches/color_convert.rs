@@ -227,6 +227,32 @@ fn run(label: &str, layout: &FrameLayout, data: &[u8], request: ConversionReques
     p50_ms
 }
 
+#[cfg(feature = "decode-mjpeg")]
+fn benchmark_rejected_mjpeg(label: &str, layout: &FrameLayout, data: &[u8]) {
+    let mut converter = RgbConverter::new();
+    let request = ConversionRequest::for_layout(layout);
+    let mut output = vec![0; request.output_len().unwrap()];
+    let mut samples = Vec::with_capacity(240);
+    for _ in 0..240 {
+        let begin = Instant::now();
+        assert!(converter
+            .convert_layout_into(
+                black_box(layout),
+                black_box(data),
+                request,
+                black_box(&mut output),
+            )
+            .is_err());
+        samples.push(begin.elapsed().as_nanos() as u64);
+    }
+    samples.sort_unstable();
+    println!(
+        "{label:<28} p50={:.3} p95={:.3} us (rejected, no output published)",
+        samples[samples.len() / 2] as f64 / 1_000.0,
+        samples[samples.len() * 95 / 100] as f64 / 1_000.0,
+    );
+}
+
 fn benchmark_resolution(width: usize, height: usize) {
     let full_601 = color(ColorMatrix::Bt601, ColorRange::Full);
     let limited_709 = color(ColorMatrix::Bt709, ColorRange::Limited);
@@ -297,6 +323,37 @@ fn benchmark_resolution(width: usize, height: usize) {
             ConversionRequest::new((width * 2 / 3) as u32, (height * 2 / 3) as u32).unwrap(),
         );
     }
+    let (layout, data) = packed(width, height, PixelFormat::Rgb8, 3, ColorInfo::default());
+    run(
+        &format!("RGB8 arbitrary 2:3 {width}x{height}"),
+        &layout,
+        &data,
+        ConversionRequest::new((width * 2 / 3) as u32, (height * 2 / 3) as u32).unwrap(),
+    );
+    run(
+        &format!("RGB8 arbitrary 3:4 {width}x{height}"),
+        &layout,
+        &data,
+        ConversionRequest::new((width * 3 / 4) as u32, (height * 3 / 4) as u32).unwrap(),
+    );
+    for (label, (layout, data)) in [
+        (
+            "NV12 arbitrary 3:4",
+            nv12(width, height, PixelFormat::Nv12, full_601),
+        ),
+        (
+            "YUYV arbitrary 3:4",
+            packed(width, height, PixelFormat::Yuyv, 2, full_601),
+        ),
+        ("I420 arbitrary 3:4", i420(width, height, full_601)),
+    ] {
+        run(
+            &format!("{label} {width}x{height}"),
+            &layout,
+            &data,
+            ConversionRequest::new((width * 3 / 4) as u32, (height * 3 / 4) as u32).unwrap(),
+        );
+    }
     for (label, (layout, data)) in [
         (
             "YUYV half",
@@ -354,15 +411,25 @@ fn assert_scaling_regression() {
         &data,
         ConversionRequest::for_layout(&layout),
     );
-    let arbitrary = run(
-        "NV12 regression arbitrary",
+    let two_thirds = run(
+        "NV12 regression exact 2:3",
         &layout,
         &data,
         ConversionRequest::new(1280, 720).unwrap(),
     );
     assert!(
-        arbitrary <= direct * 2.75,
-        "arbitrary NV12 scaling regressed: {arbitrary:.3}ms vs direct {direct:.3}ms"
+        two_thirds <= direct * 1.25,
+        "exact 2:3 NV12 scaling regressed: {two_thirds:.3}ms vs direct {direct:.3}ms"
+    );
+    let three_quarters = run(
+        "NV12 regression exact 3:4",
+        &layout,
+        &data,
+        ConversionRequest::new(1440, 810).unwrap(),
+    );
+    assert!(
+        three_quarters <= direct * 1.25,
+        "exact 3:4 NV12 scaling regressed: {three_quarters:.3}ms vs direct {direct:.3}ms"
     );
 }
 
@@ -421,6 +488,13 @@ fn main() {
             &data,
             ConversionRequest::new(640, 360).unwrap(),
         );
+        let mut rejected_layout = layout.clone();
+        let rejected = vec![0; data.len() / 4];
+        rejected_layout.planes[0].length = rejected.len();
+        benchmark_rejected_mjpeg("MJPEG missing SOI", &rejected_layout, &rejected);
+        let truncated = &data[..data.len() / 4];
+        rejected_layout.planes[0].length = truncated.len();
+        benchmark_rejected_mjpeg("MJPEG truncated", &rejected_layout, truncated);
     }
     if std::env::var_os("CAMERA_BENCH_ASSERT").is_some() {
         assert_scaling_regression();

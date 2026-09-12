@@ -13,6 +13,14 @@ use std::{
 use tokio::sync::watch;
 static NEXT_SESSION: AtomicU64 = AtomicU64::new(1);
 const MAX_FRAME_BYTES: usize = 128 * 1024 * 1024;
+pub(crate) const FRAME_ERROR_RECOVERY_THRESHOLD: u64 = 8;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RecoveryTrigger {
+    SourceStopped,
+    SourceStalled,
+    FrameErrors { consecutive: u64 },
+}
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct FrameKey {
     pub session: u64,
@@ -219,6 +227,10 @@ pub struct FrameMetrics {
     pub published: u64,
     pub pool_drops: u64,
     pub conversion_errors: u64,
+    /// Failed conversions since the latest successfully published frame.
+    pub consecutive_conversion_errors: u64,
+    /// Largest failed-conversion burst observed in the current session.
+    pub max_consecutive_conversion_errors: u64,
     pub allocated_buffers: usize,
     pub allocated_bytes: usize,
     pub retained_buffers: usize,
@@ -233,6 +245,7 @@ struct Snapshot {
     session: u64,
     active: bool,
     recovering: bool,
+    reconnect_enabled: bool,
     latest: Option<Frame>,
 }
 struct Publication {
@@ -253,8 +266,11 @@ struct Pool {
     metrics: FrameMetrics,
     started: Option<Instant>,
     stopped: Option<Instant>,
+    last_source_activity: Option<Instant>,
     recent: VecDeque<Instant>,
     conversion_samples: VecDeque<u64>,
+    last_error_report: Option<Instant>,
+    suppressed_error_reports: u64,
 }
 struct Subscriber {
     queue: Mutex<VecDeque<Frame>>,
@@ -272,6 +288,7 @@ pub struct FrameHub {
     subscribers: Arc<Mutex<Vec<Weak<Subscriber>>>>,
     native_output: Arc<AtomicBool>,
     events: Arc<Mutex<Option<tokio::sync::broadcast::Sender<crate::SessionEvent>>>>,
+    recovery_wake: watch::Sender<u64>,
 }
 impl Default for FrameHub {
     fn default() -> Self {
@@ -281,6 +298,7 @@ impl Default for FrameHub {
 impl FrameHub {
     pub fn new(capacity: usize) -> Self {
         let (state, _) = watch::channel(Snapshot::default());
+        let (recovery_wake, _) = watch::channel(0);
         Self {
             state,
             pool: Arc::new(Mutex::new(Pool {
@@ -292,12 +310,16 @@ impl FrameHub {
                 metrics: FrameMetrics::default(),
                 started: None,
                 stopped: None,
+                last_source_activity: None,
                 recent: VecDeque::new(),
                 conversion_samples: VecDeque::with_capacity(256),
+                last_error_report: None,
+                suppressed_error_reports: 0,
             })),
             subscribers: Arc::new(Mutex::new(vec![])),
             native_output: Arc::new(AtomicBool::new(false)),
             events: Arc::new(Mutex::new(None)),
+            recovery_wake,
         }
     }
     pub(crate) fn configure(&self, r: &StreamRequest) -> CameraResult<()> {
@@ -331,15 +353,22 @@ impl FrameHub {
         pool.metrics = FrameMetrics::default();
         pool.started = Some(Instant::now());
         pool.stopped = None;
+        pool.last_source_activity = Some(Instant::now());
         pool.recent.clear();
         pool.conversion_samples.clear();
+        pool.last_error_report = None;
+        pool.suppressed_error_reports = 0;
         let session = NEXT_SESSION.fetch_add(1, Ordering::Relaxed);
         self.clear_queues();
-        let recovering = self.state.borrow().recovering;
+        let current = self.state.borrow();
+        let recovering = current.recovering;
+        let reconnect_enabled = current.reconnect_enabled;
+        drop(current);
         self.state.send_replace(Snapshot {
             session,
             active: true,
             recovering,
+            reconnect_enabled,
             latest: None,
         });
         session
@@ -372,6 +401,15 @@ impl FrameHub {
     pub(crate) fn end_recovery(&self) {
         self.state.send_modify(|s| s.recovering = false);
     }
+    pub(crate) fn enable_recovery(&self) {
+        self.state.send_modify(|s| s.reconnect_enabled = true);
+    }
+    pub(crate) fn disable_recovery(&self) {
+        self.state.send_modify(|s| {
+            s.reconnect_enabled = false;
+            s.recovering = false;
+        });
+    }
     pub fn stop(&self) {
         self.pool.lock().stopped = Some(Instant::now());
         self.clear_queues();
@@ -379,6 +417,7 @@ impl FrameHub {
             s.active = false;
             s.latest = None;
         });
+        self.wake_recovery();
     }
     pub fn session(&self) -> u64 {
         self.state.borrow().session
@@ -389,6 +428,114 @@ impl FrameHub {
     pub fn latest(&self) -> Option<Frame> {
         self.state.borrow().latest.clone()
     }
+    #[cfg(test)]
+    pub(crate) fn source_activity_is_stale(&self, timeout: Duration) -> bool {
+        self.pool
+            .lock()
+            .last_source_activity
+            .is_none_or(|activity| activity.elapsed() > timeout)
+    }
+    fn wake_recovery(&self) {
+        self.recovery_wake
+            .send_modify(|generation| *generation = generation.wrapping_add(1));
+    }
+    pub(crate) fn recovery_trigger(&self, stall_timeout: Duration) -> Option<RecoveryTrigger> {
+        if !self.state.borrow().active {
+            return Some(RecoveryTrigger::SourceStopped);
+        }
+        let pool = self.pool.lock();
+        if pool.metrics.consecutive_conversion_errors >= FRAME_ERROR_RECOVERY_THRESHOLD {
+            return Some(RecoveryTrigger::FrameErrors {
+                consecutive: pool.metrics.consecutive_conversion_errors,
+            });
+        }
+        pool.last_source_activity
+            .is_none_or(|activity| activity.elapsed() >= stall_timeout)
+            .then_some(RecoveryTrigger::SourceStalled)
+    }
+    fn source_stall_remaining(&self, timeout: Duration) -> Duration {
+        self.pool
+            .lock()
+            .last_source_activity
+            .map_or(Duration::ZERO, |activity| {
+                timeout.saturating_sub(activity.elapsed())
+            })
+    }
+    pub(crate) async fn wait_for_recovery_trigger(
+        &self,
+        stall_timeout: Duration,
+    ) -> RecoveryTrigger {
+        let mut wake = self.recovery_wake.subscribe();
+        loop {
+            if let Some(trigger) = self.recovery_trigger(stall_timeout) {
+                return trigger;
+            }
+            let remaining = self.source_stall_remaining(stall_timeout);
+            tokio::select! {
+                result = wake.changed() => {
+                    if result.is_err() {
+                        return RecoveryTrigger::SourceStopped;
+                    }
+                }
+                _ = tokio::time::sleep(remaining) => {}
+            }
+        }
+    }
+    fn record_conversion_error(&self, session: u64, source_activity: bool) {
+        {
+            let state = self.state.borrow();
+            if !state.active || state.session != session {
+                return;
+            }
+        }
+        let notify = {
+            let mut pool = self.pool.lock();
+            if source_activity {
+                pool.metrics.received += 1;
+                pool.last_source_activity = Some(Instant::now());
+            }
+            pool.metrics.conversion_errors += 1;
+            pool.metrics.consecutive_conversion_errors += 1;
+            pool.metrics.max_consecutive_conversion_errors = pool
+                .metrics
+                .max_consecutive_conversion_errors
+                .max(pool.metrics.consecutive_conversion_errors);
+            pool.metrics.consecutive_conversion_errors == FRAME_ERROR_RECOVERY_THRESHOLD
+        };
+        if notify {
+            self.wake_recovery();
+        }
+    }
+    #[allow(dead_code)]
+    pub(crate) fn record_input_error(&self, session: u64) {
+        self.record_conversion_error(session, true);
+    }
+    #[allow(dead_code)]
+    pub(crate) fn log_frame_error(&self, backend: &str, error: &CameraError) {
+        let now = Instant::now();
+        let report = {
+            let mut pool = self.pool.lock();
+            if pool.last_error_report.is_some_and(|previous| {
+                now.saturating_duration_since(previous) < Duration::from_secs(1)
+            }) {
+                pool.suppressed_error_reports += 1;
+                None
+            } else {
+                let suppressed = std::mem::take(&mut pool.suppressed_error_reports);
+                pool.last_error_report = Some(now);
+                Some(suppressed)
+            }
+        };
+        if let Some(suppressed) = report {
+            if suppressed == 0 {
+                log::warn!("{backend} frame rejected: {error}");
+            } else {
+                log::warn!(
+                    "{backend} frame rejected: {error} ({suppressed} similar errors suppressed)"
+                );
+            }
+        }
+    }
     pub(crate) fn wants_native(&self) -> bool {
         self.native_output.load(Ordering::Acquire)
     }
@@ -396,6 +543,7 @@ impl FrameHub {
     pub(crate) fn record_input_drop(&self, session: u64) {
         if self.session() == session {
             let mut pool = self.pool.lock();
+            pool.last_source_activity = Some(Instant::now());
             pool.metrics.received += 1;
             pool.metrics.pool_drops += 1;
             let dropped = pool.metrics.pool_drops;
@@ -439,6 +587,22 @@ impl FrameHub {
         let mut rx = self.subscribe_with(SubscriptionOptions::latest())?;
         rx.last = after.or_else(|| rx.state.borrow().latest.as_ref().map(|frame| frame.key));
         rx.next_timeout(timeout).await
+    }
+
+    pub(crate) async fn wait_first_in(
+        &self,
+        session: u64,
+        timeout: Duration,
+    ) -> CameraResult<Frame> {
+        if self.session() != session {
+            return Err(CameraError::StreamStopped);
+        }
+        let mut rx = self.subscribe_with(SubscriptionOptions::latest())?;
+        let frame = rx.next_timeout(timeout).await?;
+        if frame.key.session != session {
+            return Err(CameraError::StreamStopped);
+        }
+        Ok(frame)
     }
     pub fn publish_rgb(
         &self,
@@ -587,6 +751,7 @@ impl FrameHub {
             }
         }
         pool.metrics.received += 1;
+        pool.last_source_activity = Some(Instant::now());
         let index = pool
             .slots
             .iter_mut()
@@ -624,6 +789,10 @@ impl FrameHub {
             self.report_resource_pressure(dropped);
             return Ok(None);
         }
+        let available = pool
+            .budget
+            .bytes
+            .saturating_sub(used - pool.slots[index].bytes);
         let existing = pool.slots[index].data.take();
         let storage = match existing {
             Some(Storage::Rgb(pixels))
@@ -634,9 +803,10 @@ impl FrameHub {
             Some(Storage::Bytes(mut bytes)) if !rgb => {
                 let buffer = Arc::get_mut(&mut bytes).expect("exclusive native slot");
                 if length > buffer.capacity() {
-                    buffer.reserve(length - buffer.len());
+                    bytes = Arc::new(vec![0; length]);
+                } else {
+                    buffer.resize(length, 0);
                 }
-                buffer.resize(length, 0);
                 Storage::Bytes(bytes)
             }
             _ if rgb => Storage::Rgb(Arc::new(Pixels::zeros((
@@ -646,10 +816,20 @@ impl FrameHub {
             )))),
             _ => Storage::Bytes(Arc::new(vec![0; length])),
         };
-        pool.slots[index].bytes = match &storage {
+        let allocated = match &storage {
             Storage::Bytes(bytes) => bytes.capacity(),
             Storage::Rgb(_) => length,
         };
+        if allocated > available {
+            pool.slots[index].data = Some(Storage::Bytes(Arc::new(Vec::new())));
+            pool.slots[index].bytes = 0;
+            pool.metrics.pool_drops += 1;
+            let dropped = pool.metrics.pool_drops;
+            drop(pool);
+            self.report_resource_pressure(dropped);
+            return Ok(None);
+        }
+        pool.slots[index].bytes = allocated;
         drop(pool);
         Ok(Some(Lease {
             hub: self.clone(),
@@ -675,9 +855,7 @@ impl FrameHub {
         let result = convert(lease.data.as_mut().unwrap().bytes_mut());
         let elapsed = begin.elapsed().as_nanos().min(u64::MAX as u128) as u64;
         if let Err(error) = result {
-            if self.session() == session {
-                self.pool.lock().metrics.conversion_errors += 1;
-            }
+            self.record_conversion_error(session, false);
             return Err(error);
         }
         self.finish_publish(
@@ -777,6 +955,7 @@ impl FrameHub {
                 return Ok(true);
             }
             pool.metrics.published += 1;
+            pool.metrics.consecutive_conversion_errors = 0;
             pool.metrics.conversion_total_ns =
                 pool.metrics.conversion_total_ns.saturating_add(elapsed);
             pool.metrics.conversion_max_ns = pool.metrics.conversion_max_ns.max(elapsed);
@@ -940,7 +1119,7 @@ impl FrameReceiver {
                     .owner
                     .get()
                     .is_some_and(|f| f.load(Ordering::Acquire))
-                    || (!state.active && !state.recovering)
+                    || (!state.active && !state.recovering && !state.reconnect_enabled)
                 {
                     return Err(CameraError::StreamStopped);
                 }

@@ -1338,6 +1338,33 @@ pub fn get_supported_configs(
     }
 }
 
+pub(crate) fn get_device_capabilities(
+    backend: BackendType,
+    device_index: u32,
+) -> CameraResult<crate::DeviceCapabilities> {
+    #[cfg(camera_v4l2)]
+    if backend == BackendType::V4l2 {
+        return v4l2::V4l2Camera::device_capabilities(device_index);
+    }
+    Ok(crate::DeviceCapabilities::from_configurations(
+        get_supported_configs(backend, device_index)?,
+    ))
+}
+
+pub(crate) fn requested_configs(
+    backend: BackendType,
+    device_index: u32,
+    request: &crate::CaptureRequest,
+    advertised: &[crate::CameraConfig],
+) -> CameraResult<Vec<crate::CameraConfig>> {
+    #[cfg(camera_v4l2)]
+    if backend == BackendType::V4l2 {
+        return v4l2::V4l2Camera::requested_configs(device_index, request, advertised);
+    }
+    let _ = (backend, device_index, request, advertised);
+    Ok(Vec::new())
+}
+
 // ==================== 测试 ====================
 
 #[cfg(test)]

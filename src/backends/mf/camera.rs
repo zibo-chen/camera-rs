@@ -574,7 +574,7 @@ impl Worker {
                     }
                     if let Some(sample) = sample {
                         if let Err(error) = self.process_sample(&sample.0, timestamp) {
-                            log::warn!("MF frame rejected: {}", error);
+                            self.hub.log_frame_error("Media Foundation", &error);
                         }
                     }
                     if let Err(error) = self.request_sample() {
@@ -620,31 +620,28 @@ fn decode_into(
         ));
         #[cfg(feature = "decode-mjpeg")]
         {
-            if _decoder.is_none() {
-                *_decoder =
-                    Some(Decompressor::new().map_err(|e| CameraError::Other(e.to_string()))?);
-            }
-            let decoder = _decoder.as_mut().unwrap();
-            let header = decoder
-                .read_header(data)
-                .map_err(|e| CameraError::InvalidFormat(e.to_string()))?;
-            if header.width != width || header.height != height {
-                return Err(CameraError::InvalidFormat(
-                    "MF MJPEG dimension mismatch".into(),
-                ));
-            }
-            return decoder
-                .decompress(
-                    data,
-                    Image {
-                        pixels: rgb,
-                        width,
-                        height,
-                        pitch: width * 3,
-                        format: PixelFormat::RGB,
-                    },
-                )
-                .map_err(|e| CameraError::InvalidFormat(e.to_string()));
+            return crate::mjpeg::decode_with(_decoder, data, |decoder, data| {
+                let header = decoder
+                    .read_header(data)
+                    .map_err(|e| CameraError::InvalidFormat(e.to_string()))?;
+                if header.width != width || header.height != height {
+                    return Err(CameraError::InvalidFormat(
+                        "MF MJPEG dimension mismatch".into(),
+                    ));
+                }
+                decoder
+                    .decompress(
+                        data,
+                        Image {
+                            pixels: rgb,
+                            width,
+                            height,
+                            pitch: width * 3,
+                            format: PixelFormat::RGB,
+                        },
+                    )
+                    .map_err(|e| CameraError::InvalidFormat(e.to_string()))
+            });
         }
     }
     if config.format == VideoFormat::NV12 {

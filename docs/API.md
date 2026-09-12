@@ -22,11 +22,13 @@
 
 ## Request, plan and negotiated result
 
-`CaptureRequest` expresses preferred or exact resolution, preferred and minimum rational frame rate, accepted formats in preference order, optional required aspect ratio, an optimization priority, memory budget, startup deadline and recovery policy. `CaptureProfile` supplies useful starting points without creating a second capture path.
+`CaptureRequest` expresses preferred or exact resolution, preferred and minimum rational frame rate, accepted formats in preference order, optional required aspect ratio, an optimization priority, memory budget, startup deadline and recovery policy. Hard constraints are checked independently against the negotiated result: exact resolution applies only to width and height, minimum frame rate is a lower bound, and any listed capture format is accepted. `CaptureProfile` supplies useful starting points without creating a second capture path.
 
 `plan()` ranks advertised modes and reports alternatives and estimated pool memory. It is advisory. `start()` performs the same ranking, asks the native backend to start, reads the actual mode and validates the first frame. Driver changes that violate hard constraints fail. The final `NegotiatedCapture` is authoritative for the started session.
 
-Capabilities are conditional. `DeviceCapabilities` distinguishes known modes from unknown discovery, lists native formats, and reports whether each RGB conversion is available or which feature/external decoder is required. Unknown YUV color information remains unknown; conversion requires an explicit override instead of silently choosing a matrix or range.
+Capabilities are conditional. `DeviceCapabilities` distinguishes complete known modes, representative samples backed by continuous/stepwise ranges, and unknown discovery. It lists native formats and reports whether each RGB conversion is available or which feature/external decoder is required. V4L2 exposes its ranged size and frame-interval metadata separately and probes an explicitly requested in-range mode instead of rejecting it merely because it was not one of the representative samples. Custom backends construct validated multi-mode capabilities with `DeviceCapabilities::from_modes`; those public modes are the same data used by `plan()` and `start()`. Unknown YUV color information remains unknown; conversion requires an explicit override instead of silently choosing a matrix or range.
+
+Application-provided backend enumeration, open, capability, start and stop calls run away from async executor threads. `open_timeout` and `capabilities_timeout` provide explicit control-operation deadlines. A capture builder uses one absolute startup deadline across device selection/open, capability discovery, backend options, ordered backend/configuration fallback, and first-frame validation.
 
 ## Native frames and conversion
 
@@ -62,6 +64,10 @@ let inference = SubscriptionOptions::latest()
 
 Frame metadata includes plane offsets/lengths/strides, color metadata, orientation, host capture time, optional source timestamp with clock domain, and source/publication sequence distinction. Nominal FPS is not measured throughput. Compare CPU, allocations, copies and frame age/P95/P99 under the same hardware, input and build flags.
 
+When a reconnect policy is enabled, an explicit backend disconnect wakes recovery immediately; a silent source still uses `stall_timeout`. The first soft recovery restarts the existing stream, then failed attempts reopen the native device. Retry delays use 100/200/400 ms fast probes before returning to the configured `delay`. Existing receivers remain attached across the inactive/recovering window and only become terminal when the session is closed or recovery exhausts `max_attempts`. A recovery is not reported as `Streaming` until the new epoch publishes and validates its first frame.
+
+Malformed frames are isolated from session lifecycle. One bad frame is discarded without restarting a healthy camera; eight consecutive conversion failures request recovery, while a successful frame clears the burst. `FrameMetrics::{consecutive_conversion_errors,max_consecutive_conversion_errors}` expose the current and largest burst. MJPEG validates SOI/EOI before TurboJPEG, accepts and trims transport padding after EOI, and recreates the decoder only after an actual decoder failure. Repeated frame-error logs are summarized at most once per second.
+
 ## Backend options and controls
 
 Backend options are typed and rejected when used with a different selected backend. 0.4 exposes implemented settings only: `V4l2Options::mmap_buffers`, `Camera2Options::{max_images, request_template}`, and `AvFoundationOptions::late_frames`. Camera2 validates its reader depth before streaming and passes the selected NDK request template into native request creation; AVFoundation passes its late-frame policy to `AVCaptureVideoDataOutput`. UVC’s authorized-descriptor open path remains an explicit system method. Media Foundation does not publish placeholder fields.
@@ -70,7 +76,7 @@ Controls retain the generic descriptor/value API and add `Exposure`, `WhiteBalan
 
 ## External backends
 
-Register a `BackendProvider` on `CameraSystem::builder()`. `BackendDevice` handles capabilities/start/stop, while `FrameSink` publishes through the same bounded epoch-protected frame pool. `WritableFrameLease` borrows writable storage directly from that pool, becomes immutable on `commit`, and returns its slot without publication when dropped. Control calls may use dynamic dispatch; frame callbacks should request a writable lease or publish directly rather than spawning one async task per frame. Unknown formats may be transported under a namespaced backend, but generic conversion is never implied.
+Register a `BackendProvider` on `CameraSystem::builder()`. `BackendDevice` handles capabilities/start/stop, while `FrameSink` publishes through the same bounded epoch-protected frame pool. A backend that detects physical removal or a terminal transport error calls `FrameSink::disconnect()` so automatic recovery does not wait for `stall_timeout`. `WritableFrameLease` borrows writable storage directly from that pool, becomes immutable on `commit`, and returns its slot without publication when dropped. Control calls may use dynamic dispatch; frame callbacks should request a writable lease or publish directly rather than spawning one async task per frame. Unknown formats may be transported under a namespaced backend, but generic conversion is never implied.
 
 ## Runtime boundaries
 

@@ -59,7 +59,7 @@ fn check_rows(plane: &Plane<'_>, row_bytes: usize, height: usize) -> CameraResul
 
 pub(super) struct Converter {
     #[cfg(feature = "decode-mjpeg")]
-    jpeg: Decompressor,
+    jpeg: Option<Decompressor>,
     coefficients: [i32; 6],
 }
 
@@ -72,7 +72,7 @@ impl Converter {
                 ..Default::default()
             })?,
             #[cfg(feature = "decode-mjpeg")]
-            jpeg: Decompressor::new().map_err(|e| invalid(&e.to_string()))?,
+            jpeg: None,
         })
     }
 
@@ -131,27 +131,28 @@ impl Converter {
                 ));
                 #[cfg(feature = "decode-mjpeg")]
                 {
-                    let header = self
-                        .jpeg
-                        .read_header(first.data)
-                        .map_err(|e| invalid(&e.to_string()))?;
-                    if header.width != w || header.height != h {
-                        return Err(invalid(
-                            "MJPEG dimensions differ from negotiated V4L2 format",
-                        ));
-                    }
-                    self.jpeg
-                        .decompress(
-                            first.data,
-                            Image {
-                                pixels: rgb,
-                                width: w,
-                                pitch: w * 3,
-                                height: h,
-                                format: PixelFormat::RGB,
-                            },
-                        )
-                        .map_err(|e| invalid(&e.to_string()))?;
+                    crate::mjpeg::decode_with(&mut self.jpeg, first.data, |decoder, data| {
+                        let header = decoder
+                            .read_header(data)
+                            .map_err(|e| invalid(&e.to_string()))?;
+                        if header.width != w || header.height != h {
+                            return Err(invalid(
+                                "MJPEG dimensions differ from negotiated V4L2 format",
+                            ));
+                        }
+                        decoder
+                            .decompress(
+                                data,
+                                Image {
+                                    pixels: rgb,
+                                    width: w,
+                                    pitch: w * 3,
+                                    height: h,
+                                    format: PixelFormat::RGB,
+                                },
+                            )
+                            .map_err(|e| invalid(&e.to_string()))
+                    })?;
                 }
             }
             VideoFormat::NV12 => {

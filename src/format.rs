@@ -2,11 +2,28 @@
 use crate::{CameraError, CameraResult, VideoFormat};
 use std::time::Duration;
 
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serde", derive(serde::Serialize))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct FrameRate {
     numerator: u32,
     denominator: u32,
+}
+
+#[cfg(feature = "serde")]
+impl<'de> serde::Deserialize<'de> for FrameRate {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(serde::Deserialize)]
+        struct RawFrameRate {
+            numerator: u32,
+            denominator: u32,
+        }
+
+        let raw = RawFrameRate::deserialize(deserializer)?;
+        Self::new(raw.numerator, raw.denominator).map_err(serde::de::Error::custom)
+    }
 }
 impl FrameRate {
     pub fn new(numerator: u32, denominator: u32) -> CameraResult<Self> {
@@ -67,6 +84,7 @@ pub enum OutputFormat {
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SelectionPolicy {
+    #[allow(dead_code)]
     Exact,
     Closest,
 }

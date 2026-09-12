@@ -161,4 +161,28 @@ fn jpeg_decodes_into_rgb_and_rejects_mismatched_dimensions() {
     let rgb = convert(VideoFormat::MJPEG, 2, 2, &jpeg, 0).unwrap();
     assert!(rgb.iter().all(|&v| v.abs_diff(100) <= 1));
     assert!(convert(VideoFormat::MJPEG, 4, 2, &jpeg, 0).is_err());
+
+    let config = CameraConfig::new(VideoFormat::MJPEG, 2, 2, 30);
+    let mut converter = Converter::new().unwrap();
+    let mut output = [0; 12];
+    assert!(converter
+        .convert(
+            &config,
+            &[Plane {
+                data: &jpeg[..jpeg.len() / 4],
+                stride: 0,
+            }],
+            &mut output,
+        )
+        .is_err());
+    converter
+        .convert(
+            &config,
+            &[Plane {
+                data: &jpeg,
+                stride: 0,
+            }],
+            &mut output,
+        )
+        .expect("a complete frame after corruption must decode normally");
 }

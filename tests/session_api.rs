@@ -13,6 +13,20 @@ fn rational_rates_preserve_precision_and_reject_zero() {
     assert!(FrameRate::new(0, 1).is_err());
     assert!(FrameRate::new(1, 0).is_err());
 }
+
+#[cfg(feature = "serde")]
+#[test]
+fn frame_rate_deserialization_validates_and_normalizes() {
+    assert!(serde_json::from_str::<FrameRate>(r#"{"numerator":0,"denominator":1}"#).is_err());
+    assert!(serde_json::from_str::<FrameRate>(r#"{"numerator":1,"denominator":0}"#).is_err());
+    let normalized: FrameRate =
+        serde_json::from_str(r#"{"numerator":60,"denominator":2}"#).unwrap();
+    assert_eq!(normalized, FrameRate::new(30, 1).unwrap());
+    assert_eq!(
+        serde_json::to_string(&normalized).unwrap(),
+        r#"{"numerator":30,"denominator":1}"#
+    );
+}
 #[tokio::test]
 async fn synthetic_session_has_independent_receivers_and_stop_wakes_waiters() {
     let system = CameraSystem::synthetic();
@@ -185,6 +199,21 @@ async fn exact_fractional_rate_is_preserved_and_wrong_format_is_rejected() {
         .unwrap();
     assert_eq!(s.negotiated().capture.frame_rate, fps);
     s.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn required_aspect_ratio_is_enforced_for_synthetic_capture() {
+    let system = CameraSystem::synthetic();
+    let mut camera = system.open(DeviceSelector::Default).await.unwrap();
+    let request = CaptureRequest::builder()
+        .preferred_resolution(640, 480)
+        .require_aspect_ratio(16, 9)
+        .build()
+        .unwrap();
+    assert!(matches!(
+        camera.start(request).await,
+        Err(CameraError::UnsupportedFormat(_))
+    ));
 }
 
 #[tokio::test]

@@ -17,6 +17,30 @@ use std::sync::{
 use std::time::Duration;
 use tokio::sync::{broadcast, watch, Mutex};
 
+#[derive(Clone, Copy)]
+struct StartupDeadline(tokio::time::Instant);
+
+impl StartupDeadline {
+    fn new(timeout: Duration) -> Self {
+        Self(tokio::time::Instant::now() + timeout)
+    }
+
+    async fn run<T>(
+        self,
+        stage: crate::OperationStage,
+        future: impl std::future::Future<Output = CameraResult<T>>,
+    ) -> CameraResult<T> {
+        tokio::time::timeout_at(self.0, future)
+            .await
+            .map_err(|_| CameraError::Timeout { stage })?
+    }
+
+    fn remaining(self) -> Duration {
+        self.0
+            .saturating_duration_since(tokio::time::Instant::now())
+    }
+}
+
 /// Enumeration is isolated from the async executor. Explicit backend requests
 /// never fall back to another device namespace.
 #[derive(Clone, Debug)]
@@ -310,8 +334,7 @@ impl CameraSystem {
             backends::backend_type(&id.backend).ok_or_else(|| CameraError::BackendNotCompiled {
                 backend: id.backend.clone(),
             })?;
-        let configurations = backends::get_supported_configs(backend, device.index)?;
-        Ok(DeviceCapabilities::from_configurations(configurations))
+        backends::get_device_capabilities(backend, device.index)
     }
 
     pub async fn devices(&self) -> CameraResult<Vec<DeviceInfo>> {
@@ -327,6 +350,23 @@ impl CameraSystem {
         tokio::task::spawn_blocking(move || system.capabilities_blocking(&id))
             .await
             .map_err(join_error)?
+    }
+
+    pub async fn capabilities_timeout(
+        &self,
+        id: &DeviceId,
+        timeout: Duration,
+    ) -> CameraResult<DeviceCapabilities> {
+        if timeout.is_zero() {
+            return Err(CameraError::InvalidConfig(
+                "Capability query timeout must be positive".into(),
+            ));
+        }
+        tokio::time::timeout(timeout, self.capabilities(id))
+            .await
+            .map_err(|_| CameraError::Timeout {
+                stage: crate::OperationStage::Capabilities,
+            })?
     }
 
     async fn resolve_selector(&self, selector: DeviceSelector) -> CameraResult<DeviceInfo> {
@@ -358,11 +398,43 @@ impl CameraSystem {
     }
 
     pub async fn open(&self, selector: DeviceSelector) -> CameraResult<Device> {
+        self.open_inner(selector).await
+    }
+
+    pub async fn open_timeout(
+        &self,
+        selector: DeviceSelector,
+        timeout: Duration,
+    ) -> CameraResult<Device> {
+        if timeout.is_zero() {
+            return Err(CameraError::InvalidConfig(
+                "Device open timeout must be positive".into(),
+            ));
+        }
+        self.open_until(selector, StartupDeadline::new(timeout))
+            .await
+    }
+
+    async fn open_until(
+        &self,
+        selector: DeviceSelector,
+        deadline: StartupDeadline,
+    ) -> CameraResult<Device> {
+        deadline
+            .run(crate::OperationStage::Open, self.open_inner(selector))
+            .await
+    }
+
+    async fn open_inner(&self, selector: DeviceSelector) -> CameraResult<Device> {
         let device = self.resolve_selector(selector).await?;
         let source = if device.id.backend == BackendId::SYNTHETIC {
             Source::Synthetic(FrameHub::default())
         } else if let Some(registered) = self.registered.get(&device.id.backend) {
-            let handle = registered.provider.open(device.id.native_id())?;
+            let provider = registered.provider.clone();
+            let native_id = device.id.native.clone();
+            let handle = tokio::task::spawn_blocking(move || provider.open(&native_id))
+                .await
+                .map_err(join_error)??;
             Source::custom(handle)
         } else {
             let backend = backends::backend_type(&device.id.backend).ok_or_else(|| {
@@ -457,7 +529,21 @@ impl CameraSystem {
             )
             .with_frame_rate(request.preferred_fps)]
         } else {
-            self.capabilities(&device.id).await?.configurations
+            let capabilities = self.capabilities(&device.id).await?;
+            let mut configurations = capabilities.configurations()?;
+            if let Some(backend) = backends::backend_type(&device.id.backend) {
+                let index = device.index;
+                let requested = request.clone();
+                let advertised = configurations.clone();
+                configurations.extend(
+                    tokio::task::spawn_blocking(move || {
+                        backends::requested_configs(backend, index, &requested, &advertised)
+                    })
+                    .await
+                    .map_err(join_error)??,
+                );
+            }
+            configurations
         };
         rank_capture_configurations(&request, &mut configurations)?;
         let selected = configurations[0].clone();
@@ -619,7 +705,7 @@ impl NativeSource {
         })?;
         let this = self.clone();
         tokio::task::spawn_blocking(move || {
-            drop(this.camera.lock().take());
+            let _ = this.camera.lock().take();
             let backend = backends::backend_type(&id.backend).ok_or_else(|| {
                 CameraError::BackendNotCompiled {
                     backend: id.backend.clone(),
@@ -769,12 +855,57 @@ impl Source {
         }
     }
 
-    fn external_capabilities(&self) -> Option<CameraResult<DeviceCapabilities>> {
+    async fn external_capabilities(&self) -> CameraResult<Option<DeviceCapabilities>> {
         match self {
-            Self::Custom(c) => Some(c.device.lock().capabilities()),
-            _ => None,
+            Self::Custom(c) => {
+                let c = c.clone();
+                tokio::task::spawn_blocking(move || c.device.lock().capabilities())
+                    .await
+                    .map_err(join_error)?
+                    .map(Some)
+            }
+            _ => Ok(None),
         }
     }
+}
+
+async fn apply_backend_options(
+    source: &Source,
+    selected_backend: &BackendId,
+    options: &[BackendOptions],
+) -> CameraResult<()> {
+    for option in options {
+        if &option.backend() != selected_backend {
+            return Err(CameraError::BackendOptionMismatch {
+                option_backend: option.backend(),
+                selected_backend: selected_backend.clone(),
+            });
+        }
+        let Source::Native(native) = source else {
+            continue;
+        };
+        match option {
+            BackendOptions::V4l2(options) => {
+                if native.backend_type() != BackendType::V4l2 {
+                    return Err(CameraError::InvalidConfig(
+                        "Driver queue configuration is only supported by V4L2".into(),
+                    ));
+                }
+                if let Some(count) = options.mmap_buffers {
+                    native.set_buffer_size(count).await?;
+                }
+            }
+            BackendOptions::Camera2(options) => {
+                native.current()?.set_camera2_options(options.clone())?;
+            }
+            BackendOptions::AvFoundation(options) => {
+                native
+                    .current()?
+                    .set_avfoundation_options(options.clone())?;
+            }
+        }
+    }
+    Ok(())
 }
 /// Open device handle. Starting returns the sole owner of capture lifetime.
 pub struct Camera {
@@ -798,28 +929,24 @@ impl Camera {
         &self.device
     }
     pub async fn start(&mut self, request: CaptureRequest) -> CameraResult<Session> {
+        let deadline = StartupDeadline::new(request.startup_timeout);
+        self.start_until(request, deadline).await
+    }
+
+    async fn start_until(
+        &mut self,
+        request: CaptureRequest,
+        deadline: StartupDeadline,
+    ) -> CameraResult<Session> {
         let mut raw = request.to_stream_request()?;
         for options in self.backend_options.iter() {
             match options {
                 BackendOptions::V4l2(options) if self.device.id.backend == BackendId::V4L2 => {
                     raw.driver_buffers = options.mmap_buffers;
                 }
-                BackendOptions::Camera2(options)
-                    if self.device.id.backend == BackendId::CAMERA2 =>
-                {
-                    if let Source::Native(source) = &self.source {
-                        source.current()?.set_camera2_options(options.clone())?;
-                    }
-                }
-                BackendOptions::AvFoundation(options)
-                    if self.device.id.backend == BackendId::AV_FOUNDATION =>
-                {
-                    if let Source::Native(source) = &self.source {
-                        source
-                            .current()?
-                            .set_avfoundation_options(options.clone())?;
-                    }
-                }
+                BackendOptions::Camera2(_) if self.device.id.backend == BackendId::CAMERA2 => {}
+                BackendOptions::AvFoundation(_)
+                    if self.device.id.backend == BackendId::AV_FOUNDATION => {}
                 options if options.backend() != self.device.id.backend => {
                     return Err(CameraError::BackendOptionMismatch {
                         option_backend: options.backend(),
@@ -838,22 +965,16 @@ impl Camera {
             )
             .with_frame_rate(request.preferred_fps)]
         } else if matches!(&self.source, Source::Native(native) if native.id.is_none()) {
-            vec![CameraConfig::new(
-                request
-                    .preferred_formats
-                    .first()
-                    .copied()
-                    .map(Into::into)
-                    .unwrap_or(VideoFormat::MJPEG),
-                request.width,
-                request.height,
-                request.preferred_fps.numerator(),
-            )
-            .with_frame_rate(request.preferred_fps)]
+            direct_capture_candidates(&request)
         } else {
-            let mut configurations = if let Some(capabilities) = self.source.external_capabilities()
-            {
-                capabilities?.configurations
+            let external = deadline
+                .run(
+                    crate::OperationStage::Startup,
+                    self.source.external_capabilities(),
+                )
+                .await?;
+            let mut configurations = if let Some(capabilities) = external {
+                capabilities.configurations()?
             } else {
                 let backend = backends::backend_type(&self.device.id.backend).ok_or_else(|| {
                     CameraError::BackendNotCompiled {
@@ -861,14 +982,30 @@ impl Camera {
                     }
                 })?;
                 let index = self.device.index;
-                tokio::task::spawn_blocking(move || backends::get_supported_configs(backend, index))
-                    .await
-                    .map_err(join_error)??
+                let requested = request.clone();
+                deadline
+                    .run(crate::OperationStage::Startup, async move {
+                        tokio::task::spawn_blocking(move || {
+                            let capabilities = backends::get_device_capabilities(backend, index)?;
+                            let mut configurations = capabilities.configurations()?;
+                            let requested_configurations = backends::requested_configs(
+                                backend,
+                                index,
+                                &requested,
+                                &configurations,
+                            )?;
+                            configurations.extend(requested_configurations);
+                            Ok(configurations)
+                        })
+                        .await
+                        .map_err(join_error)?
+                    })
+                    .await?
             };
             rank_capture_configurations(&request, &mut configurations)?;
             configurations
         };
-        self.start_raw(raw, candidates, request).await
+        self.start_raw(raw, candidates, request, deadline).await
     }
 
     async fn start_raw(
@@ -876,21 +1013,17 @@ impl Camera {
         request: StreamRequest,
         candidates: Vec<CameraConfig>,
         intent: CaptureRequest,
+        deadline: StartupDeadline,
     ) -> CameraResult<CaptureSession> {
-        tokio::time::timeout(
-            request.startup_timeout,
-            self.start_inner(request, candidates, intent),
-        )
-        .await
-        .map_err(|_| CameraError::Timeout {
-            stage: crate::OperationStage::Startup,
-        })?
+        self.start_inner(request, candidates, intent, deadline)
+            .await
     }
     async fn start_inner(
         &mut self,
         request: StreamRequest,
         mut candidates: Vec<CameraConfig>,
         intent: CaptureRequest,
+        deadline: StartupDeadline,
     ) -> CameraResult<CaptureSession> {
         let startup_started = std::time::Instant::now();
         if request.output == OutputFormat::Rgb8 && request.format == Some(VideoFormat::H264) {
@@ -936,21 +1069,23 @@ impl Camera {
             terminal_metrics: parking_lot::Mutex::new(None),
             requested_controls: std::sync::Mutex::new(std::collections::HashMap::new()),
             lifecycle: Mutex::new(()),
+            intent: intent.clone(),
+            backend_options: self.backend_options.clone(),
         });
         let guard = StartGuard(Some(inner.clone()));
-        if let Some(count) = request.driver_buffers {
-            if let Source::Native(c) = &inner.source {
-                if c.backend_type() != BackendType::V4l2 {
-                    return Err(CameraError::InvalidConfig(
-                        "Driver queue configuration is only supported by V4L2".into(),
-                    ));
-                }
-                c.set_buffer_size(count).await?;
-            }
-        }
+        deadline
+            .run(
+                crate::OperationStage::Startup,
+                apply_backend_options(
+                    &inner.source,
+                    &inner.device.id.backend,
+                    inner.backend_options.as_ref(),
+                ),
+            )
+            .await?;
         let (tx, rx) = tokio::sync::oneshot::channel();
         let task_inner = inner.clone();
-        let startup = request.startup_timeout;
+        let task_intent = intent.clone();
         tokio::spawn(async move {
             let _lock = task_inner.lifecycle.lock().await;
             let mut result = Err(CameraError::UnsupportedFormat(
@@ -961,9 +1096,21 @@ impl Camera {
                     break;
                 }
                 let attempt = async {
+                    let previous_session = task_inner.hub.session();
                     task_inner.source.start(config.clone()).await?;
-                    let frame = task_inner.hub.wait_after(None, startup).await?;
-                    Ok::<_, CameraError>((task_inner.source.actual(&config)?, frame))
+                    let session = task_inner.hub.session();
+                    if session == previous_session {
+                        return Err(CameraError::InvalidState(
+                            "Backend did not begin a new frame session".into(),
+                        ));
+                    }
+                    let frame = task_inner
+                        .hub
+                        .wait_first_in(session, deadline.remaining())
+                        .await?;
+                    let actual = task_inner.source.actual(&config)?;
+                    validate_requested_capture(&task_intent, &actual, frame.layout())?;
+                    Ok::<_, CameraError>((actual, frame))
                 }
                 .await;
                 match attempt {
@@ -986,34 +1133,13 @@ impl Camera {
             }
             let _ = tx.send(result);
         });
-        let (actual, first) = tokio::time::timeout(request.startup_timeout, rx)
+        let (actual, _first) = tokio::time::timeout_at(deadline.0, rx)
             .await
             .map_err(|_| CameraError::Timeout {
                 stage: crate::OperationStage::FirstFrame,
             })?
             .map_err(|_| CameraError::StreamStopped)??;
         let frame_rate = actual.frame_rate()?;
-        if intent
-            .minimum_fps
-            .is_some_and(|minimum| frame_rate < minimum)
-        {
-            return Err(CameraError::UnsupportedFormat(format!(
-                "Driver negotiated {} fps below required {} fps",
-                frame_rate.as_f64(),
-                intent.minimum_fps.unwrap().as_f64()
-            )));
-        }
-        if !intent.preferred_formats.is_empty()
-            && !intent
-                .preferred_formats
-                .iter()
-                .any(|format| VideoFormat::from(*format) == actual.format)
-        {
-            return Err(CameraError::UnsupportedFormat(format!(
-                "Driver negotiated unaccepted format {:?}",
-                actual.format
-            )));
-        }
         let mut adjustments = Vec::new();
         if (actual.width, actual.height) != (request.width, request.height) {
             adjustments.push(format!(
@@ -1028,22 +1154,8 @@ impl Camera {
                 frame_rate.as_f64()
             ));
         }
-        if request.selection == SelectionPolicy::Exact
-            && ((actual.width, actual.height) != (request.width, request.height)
-                || frame_rate != request.fps
-                || request.format.is_some_and(|f| f != actual.format))
-        {
-            return Err(CameraError::UnsupportedFormat(
-                "Native driver changed an exact request".into(),
-            ));
-        }
         if request.format.is_some_and(|f| f != actual.format) {
             adjustments.push(format!("Capture format {:?} selected", actual.format));
-        }
-        if first.layout().width != actual.width || first.layout().height != actual.height {
-            return Err(CameraError::InvalidFormat(
-                "First frame differs from negotiated dimensions".into(),
-            ));
         }
         inner.set_state(SessionState::Streaming);
         for adjustment in &adjustments {
@@ -1061,6 +1173,7 @@ impl Camera {
             actual,
         };
         if let Some(policy) = request.reconnect {
+            session.inner.hub.enable_recovery();
             session.spawn_recovery(policy);
         }
         guard.disarm();
@@ -1126,14 +1239,16 @@ impl CaptureBuilder {
 
     pub async fn start(self) -> CameraResult<Capture> {
         self.request.to_stream_request()?;
+        let deadline = StartupDeadline::new(self.request.startup_timeout);
         if matches!(self.selector, DeviceSelector::Default) {
             if let BackendPolicy::Prefer(backends) = self.system.backend_policy() {
                 let mut attempts = Vec::new();
                 for backend in backends.clone() {
                     let system = self.system.requiring(backend.clone());
                     let attempt = async {
-                        let mut device = system.open(DeviceSelector::Default).await?;
-                        let session = device.start(self.request.clone()).await?;
+                        let mut device =
+                            system.open_until(DeviceSelector::Default, deadline).await?;
+                        let session = device.start_until(self.request.clone(), deadline).await?;
                         let receiver = session.subscribe(SubscriptionOptions::latest())?;
                         Ok(Capture { session, receiver })
                     }
@@ -1151,8 +1266,8 @@ impl CaptureBuilder {
                 return Err(CameraError::BackendAttemptsFailed(attempts));
             }
         }
-        let mut device = self.system.open(self.selector).await?;
-        let session = device.start(self.request).await?;
+        let mut device = self.system.open_until(self.selector, deadline).await?;
+        let session = device.start_until(self.request, deadline).await?;
         let receiver = session.subscribe(SubscriptionOptions::latest())?;
         Ok(Capture { session, receiver })
     }
@@ -1180,6 +1295,61 @@ impl Capture {
     pub async fn close(&self) -> CameraResult<()> {
         self.session.close().await
     }
+}
+
+fn validate_requested_capture(
+    request: &CaptureRequest,
+    actual: &CameraConfig,
+    first_layout: &crate::FrameLayout,
+) -> CameraResult<()> {
+    actual.validate()?;
+    let frame_rate = actual.frame_rate()?;
+    if request
+        .minimum_fps
+        .is_some_and(|minimum| frame_rate < minimum)
+    {
+        return Err(CameraError::UnsupportedFormat(format!(
+            "Driver negotiated {} fps below required {} fps",
+            frame_rate.as_f64(),
+            request.minimum_fps.unwrap().as_f64()
+        )));
+    }
+    if !request.preferred_formats.is_empty()
+        && !request
+            .preferred_formats
+            .iter()
+            .any(|format| VideoFormat::from(*format) == actual.format)
+    {
+        return Err(CameraError::UnsupportedFormat(format!(
+            "Driver negotiated unaccepted format {:?}",
+            actual.format
+        )));
+    }
+    if request.exact_resolution && (actual.width, actual.height) != (request.width, request.height)
+    {
+        return Err(CameraError::UnsupportedFormat(format!(
+            "Driver negotiated {}x{} instead of the required {}x{} resolution",
+            actual.width, actual.height, request.width, request.height
+        )));
+    }
+    if request
+        .required_aspect_ratio
+        .is_some_and(|(width, height)| {
+            u64::from(actual.width) * u64::from(height)
+                != u64::from(actual.height) * u64::from(width)
+        })
+    {
+        return Err(CameraError::UnsupportedFormat(format!(
+            "Driver negotiated {}x{} outside the required aspect ratio",
+            actual.width, actual.height
+        )));
+    }
+    if first_layout.width != actual.width || first_layout.height != actual.height {
+        return Err(CameraError::InvalidFormat(
+            "First frame differs from negotiated dimensions".into(),
+        ));
+    }
+    Ok(())
 }
 
 fn rank_capture_configurations(
@@ -1250,6 +1420,26 @@ fn rank_capture_configurations(
         ));
     }
     Ok(())
+}
+
+fn direct_capture_candidates(request: &CaptureRequest) -> Vec<CameraConfig> {
+    let formats = if request.preferred_formats.is_empty() {
+        vec![CaptureFormat::Mjpeg]
+    } else {
+        request.preferred_formats.clone()
+    };
+    formats
+        .into_iter()
+        .map(|format| {
+            CameraConfig::new(
+                format.into(),
+                request.width,
+                request.height,
+                request.preferred_fps.numerator(),
+            )
+            .with_frame_rate(request.preferred_fps)
+        })
+        .collect()
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1331,6 +1521,8 @@ struct SessionInner {
     requested_controls:
         std::sync::Mutex<std::collections::HashMap<crate::ControlId, crate::ControlValue>>,
     lifecycle: Mutex<()>,
+    intent: CaptureRequest,
+    backend_options: Arc<Vec<BackendOptions>>,
 }
 impl SessionInner {
     fn set_state(&self, state: SessionState) {
@@ -1343,6 +1535,7 @@ impl SessionInner {
             return;
         }
         self.set_state(SessionState::Stopping);
+        self.hub.disable_recovery();
         self.hub.end_recovery();
         self.hub.stop();
         let inner = self.clone();
@@ -1370,6 +1563,7 @@ impl SessionInner {
             };
         }
         self.stopping.store(true, Ordering::Release);
+        self.hub.disable_recovery();
         self.hub.end_recovery();
         self.hub.stop();
         let result = self.source.stop().await;
@@ -1474,45 +1668,73 @@ impl CaptureSession {
         let config = self.actual.clone();
         tokio::spawn(async move {
             let mut attempt = 0;
+            let mut pending_trigger = None;
             loop {
-                tokio::time::sleep(policy.delay).await;
                 let Some(inner) = weak.upgrade() else {
                     break;
                 };
+                let retrying = pending_trigger.is_some();
+                let trigger = if let Some(trigger) = pending_trigger {
+                    tokio::time::sleep(recovery_retry_delay(policy.delay, attempt)).await;
+                    trigger
+                } else {
+                    inner
+                        .hub
+                        .wait_for_recovery_trigger(policy.stall_timeout)
+                        .await
+                };
                 if inner.stopping.load(Ordering::Acquire) {
                     break;
-                }
-                let stale = inner
-                    .hub
-                    .latest()
-                    .is_none_or(|f| f.age() > policy.stall_timeout);
-                if !stale {
-                    attempt = 0;
-                    continue;
                 }
                 let _guard = inner.lifecycle.lock().await;
                 if inner.stopping.load(Ordering::Acquire) {
                     break;
                 }
+                if !retrying && inner.hub.recovery_trigger(policy.stall_timeout).is_none() {
+                    continue;
+                }
                 attempt += 1;
                 inner.set_state(SessionState::Recovering { attempt });
                 inner.hub.begin_recovery();
+                let force_reopen =
+                    attempt > 1 || matches!(trigger, crate::frame::RecoveryTrigger::SourceStopped);
                 let result = async {
-                    inner.source.stop().await?;
+                    let stop_result = inner.source.stop().await;
+                    let reopen = force_reopen
+                        || matches!((&inner.source, &stop_result), (Source::Native(_), Err(_)));
                     if let Source::Native(native) = &inner.source {
-                        native.reopen().await?;
-                        inner.requested_controls.lock().unwrap().clear();
+                        if reopen {
+                            native.reopen().await?;
+                            apply_backend_options(
+                                &inner.source,
+                                &inner.device.id.backend,
+                                inner.backend_options.as_ref(),
+                            )
+                            .await?;
+                            inner.requested_controls.lock().unwrap().clear();
+                        } else {
+                            stop_result?;
+                        }
+                    } else {
+                        stop_result?;
                     }
                     if inner.stopping.load(Ordering::Acquire) {
                         return Err(CameraError::StreamStopped);
                     }
                     inner.source.start(config.clone()).await?;
-                    let first = inner.hub.wait_after(None, policy.stall_timeout).await?;
-                    validate_recovered_capture(
-                        &config,
-                        &inner.source.actual(&config)?,
-                        first.layout(),
-                    )?;
+                    let session = inner.hub.session();
+                    let first_frame_timeout = if reopen {
+                        policy.stall_timeout
+                    } else {
+                        fast_restart_first_frame_timeout(&config, policy.stall_timeout)?
+                    };
+                    let first = inner
+                        .hub
+                        .wait_first_in(session, first_frame_timeout)
+                        .await?;
+                    let actual = inner.source.actual(&config)?;
+                    validate_recovered_capture(&config, &actual, first.layout())?;
+                    validate_requested_capture(&inner.intent, &actual, first.layout())?;
                     Ok::<_, CameraError>(())
                 }
                 .await;
@@ -1525,15 +1747,18 @@ impl CaptureSession {
                         inner.hub.end_recovery();
                         inner.set_state(SessionState::Streaming);
                         attempt = 0;
+                        pending_trigger = None;
                     }
                     Err(e) => {
                         // A failed first-frame/configuration check must not leave
                         // a live source preventing the next recovery attempt.
                         let _ = inner.source.stop().await;
                         inner.hub.stop();
+                        pending_trigger = Some(trigger);
                         if policy.max_attempts.is_some_and(|n| attempt >= n) {
                             inner.set_state(SessionState::Failed(e.to_string()));
                             inner.stopping.store(true, Ordering::Release);
+                            inner.hub.disable_recovery();
                             inner.hub.end_recovery();
                             inner.hub.stop();
                             let _ = inner.source.stop().await;
@@ -1587,6 +1812,25 @@ impl CaptureSession {
             .insert(id, value);
     }
 }
+
+fn recovery_retry_delay(configured: Duration, failed_attempts: u32) -> Duration {
+    let fast = match failed_attempts {
+        0 | 1 => Duration::from_millis(100),
+        2 => Duration::from_millis(200),
+        3 => Duration::from_millis(400),
+        _ => configured,
+    };
+    configured.min(fast)
+}
+
+fn fast_restart_first_frame_timeout(
+    config: &CameraConfig,
+    recovery_timeout: Duration,
+) -> CameraResult<Duration> {
+    let three_frames = config.frame_rate()?.interval().saturating_mul(3);
+    Ok(recovery_timeout.min(Duration::from_millis(750).max(three_frames)))
+}
+
 fn validate_recovered_capture(
     expected: &CameraConfig,
     actual: &CameraConfig,
@@ -1659,5 +1903,66 @@ mod recovery_tests {
             validate_recovered_capture(&config, &config, &layout),
             Err(CameraError::InvalidFormat(_))
         ));
+    }
+
+    #[test]
+    fn descriptor_candidates_preserve_all_format_preferences() {
+        let request = CaptureRequest::builder()
+            .exact_resolution(800, 600)
+            .preferred_frame_rate(FrameRate::new(30000, 1001).unwrap())
+            .preferred_formats([CaptureFormat::Mjpeg, CaptureFormat::Yuyv])
+            .build()
+            .unwrap();
+        let candidates = direct_capture_candidates(&request);
+        assert_eq!(candidates.len(), 2);
+        assert_eq!(candidates[0].format, VideoFormat::MJPEG);
+        assert_eq!(candidates[1].format, VideoFormat::YUYV);
+        assert!(candidates.iter().all(|candidate| {
+            candidate.width == 800
+                && candidate.height == 600
+                && candidate.frame_rate().unwrap() == FrameRate::new(30000, 1001).unwrap()
+        }));
+    }
+
+    #[test]
+    fn reconnect_retries_are_fast_first_and_then_respect_the_policy_delay() {
+        let configured = Duration::from_secs(1);
+        assert_eq!(
+            recovery_retry_delay(configured, 1),
+            Duration::from_millis(100)
+        );
+        assert_eq!(
+            recovery_retry_delay(configured, 2),
+            Duration::from_millis(200)
+        );
+        assert_eq!(
+            recovery_retry_delay(configured, 3),
+            Duration::from_millis(400)
+        );
+        assert_eq!(recovery_retry_delay(configured, 4), configured);
+        assert_eq!(
+            recovery_retry_delay(Duration::from_millis(3), 3),
+            Duration::from_millis(3)
+        );
+    }
+
+    #[test]
+    fn soft_restart_first_frame_deadline_tracks_slow_frame_rates() {
+        assert_eq!(
+            fast_restart_first_frame_timeout(
+                &CameraConfig::new(VideoFormat::RGB, 8, 8, 30),
+                Duration::from_secs(5),
+            )
+            .unwrap(),
+            Duration::from_millis(750)
+        );
+        assert_eq!(
+            fast_restart_first_frame_timeout(
+                &CameraConfig::new(VideoFormat::RGB, 8, 8, 2),
+                Duration::from_secs(5),
+            )
+            .unwrap(),
+            Duration::from_millis(1500)
+        );
     }
 }

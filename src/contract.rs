@@ -115,6 +115,7 @@ pub enum BackendAvailability {
 pub enum OperationStage {
     Enumeration,
     Open,
+    Capabilities,
     Startup,
     FirstFrame,
     FrameWait,
@@ -180,16 +181,29 @@ impl DeviceId {
         let (backend, encoded) = value
             .split_once('|')
             .ok_or_else(|| CameraError::InvalidConfig("Invalid persisted device ID".into()))?;
-        if encoded.len() % 2 != 0 {
+        if encoded.len() > 4096 * 2
+            || encoded.len() % 2 != 0
+            || !encoded.as_bytes().iter().all(u8::is_ascii_hexdigit)
+        {
             return Err(CameraError::InvalidConfig(
                 "Invalid persisted device ID payload".into(),
             ));
         }
-        let bytes = (0..encoded.len())
-            .step_by(2)
-            .map(|index| u8::from_str_radix(&encoded[index..index + 2], 16))
+        #[allow(clippy::chunks_exact_to_as_chunks)]
+        let bytes = encoded
+            .as_bytes()
+            .chunks_exact(2)
+            .map(|pair| {
+                let digit = |byte: u8| match byte {
+                    b'0'..=b'9' => byte - b'0',
+                    b'a'..=b'f' => byte - b'a' + 10,
+                    b'A'..=b'F' => byte - b'A' + 10,
+                    _ => unreachable!("ASCII hexadecimal was validated above"),
+                };
+                Ok((digit(pair[0]) << 4) | digit(pair[1]))
+            })
             .collect::<std::result::Result<Vec<_>, _>>()
-            .map_err(|_| {
+            .map_err(|_: std::convert::Infallible| {
                 CameraError::InvalidConfig("Invalid persisted device ID payload".into())
             })?;
         let native = String::from_utf8(bytes)
@@ -423,11 +437,7 @@ impl CaptureRequest {
             .resolution(self.width, self.height)
             .frame_rate(self.preferred_fps)
             .output(crate::OutputFormat::Native)
-            .selection(if self.exact_resolution {
-                crate::SelectionPolicy::Exact
-            } else {
-                crate::SelectionPolicy::Closest
-            })
+            .selection(crate::SelectionPolicy::Closest)
             .memory_budget(self.memory)
             .startup_timeout(self.startup_timeout);
         if let Some(format) = self.preferred_formats.first().copied() {
@@ -550,12 +560,71 @@ impl CaptureMode {
             frame_rate: config.frame_rate()?,
         })
     }
+
+    pub(crate) fn to_config(&self) -> CameraResult<CameraConfig> {
+        let config = CameraConfig::new(
+            self.format.into(),
+            self.width,
+            self.height,
+            self.frame_rate.numerator(),
+        )
+        .with_frame_rate(self.frame_rate);
+        config.validate()?;
+        Ok(config)
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum CapabilityKnowledge<T> {
     Known(T),
-    Unknown { reason: String },
+    /// A bounded sample of a backend capability space that also contains
+    /// continuous or stepwise ranges.
+    Representative {
+        values: T,
+        reason: String,
+    },
+    Unknown {
+        reason: String,
+    },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CapabilityRangeKind {
+    Discrete,
+    Continuous,
+    Stepwise,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DimensionRange {
+    pub minimum: u32,
+    pub maximum: u32,
+    pub step: u32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FrameInterval {
+    pub numerator: u32,
+    pub denominator: u32,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FrameIntervalRange {
+    pub kind: CapabilityRangeKind,
+    pub minimum: FrameInterval,
+    pub maximum: FrameInterval,
+    pub step: Option<FrameInterval>,
+    /// Resolution at which the backend reported this interval range.
+    pub at_resolution: (u32, u32),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CaptureModeRange {
+    pub format: CaptureFormat,
+    pub kind: CapabilityRangeKind,
+    pub width: DimensionRange,
+    pub height: DimensionRange,
+    pub frame_intervals: Vec<FrameIntervalRange>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -569,11 +638,12 @@ pub struct ConversionCapability {
 #[derive(Clone, Debug)]
 pub struct DeviceCapabilities {
     pub capture_modes: CapabilityKnowledge<Vec<CaptureMode>>,
+    /// Native size and/or frame-interval range descriptors. `capture_modes` is
+    /// representative when this list is non-empty.
+    pub capture_mode_ranges: Vec<CaptureModeRange>,
     pub native_formats: Vec<CaptureFormat>,
     pub conversions: Vec<ConversionCapability>,
     pub limitations: Vec<String>,
-    #[allow(dead_code)]
-    pub(crate) configurations: Vec<CameraConfig>,
 }
 
 impl DeviceCapabilities {
@@ -583,15 +653,46 @@ impl DeviceCapabilities {
         height: u32,
         frame_rate: FrameRate,
     ) -> Self {
-        Self::from_configurations(vec![CameraConfig::new(
-            format.into(),
+        Self::from_modes_unchecked(vec![CaptureMode {
+            format,
             width,
             height,
-            frame_rate.numerator(),
-        )
-        .with_frame_rate(frame_rate)])
+            frame_rate,
+        }])
     }
 
+    /// Build a capability description whose public capture modes are also the
+    /// single source used by planning and capture negotiation.
+    pub fn from_modes(modes: impl IntoIterator<Item = CaptureMode>) -> CameraResult<Self> {
+        let modes = modes.into_iter().collect::<Vec<_>>();
+        if modes.is_empty() {
+            return Err(CameraError::InvalidConfig(
+                "Device capabilities require at least one capture mode".into(),
+            ));
+        }
+        let mut configurations = modes
+            .iter()
+            .map(CaptureMode::to_config)
+            .collect::<CameraResult<Vec<_>>>()?;
+        configurations.sort_by_key(|config| {
+            (
+                config.format as u8,
+                config.width,
+                config.height,
+                config.fps,
+                config.fps_denominator,
+            )
+        });
+        configurations.dedup();
+        if configurations.len() != modes.len() {
+            return Err(CameraError::InvalidConfig(
+                "Device capabilities contain duplicate capture modes".into(),
+            ));
+        }
+        Ok(Self::from_modes_unchecked(modes))
+    }
+
+    #[allow(dead_code)]
     pub(crate) fn from_configurations(configurations: Vec<CameraConfig>) -> Self {
         let modes = configurations
             .iter()
@@ -604,6 +705,10 @@ impl DeviceCapabilities {
                 })
             })
             .collect::<Vec<_>>();
+        Self::from_modes_unchecked(modes)
+    }
+
+    fn from_modes_unchecked(modes: Vec<CaptureMode>) -> Self {
         let mut native_formats = modes.iter().map(|mode| mode.format).collect::<Vec<_>>();
         native_formats.sort_by_key(|format| *format as u8);
         native_formats.dedup();
@@ -634,11 +739,40 @@ impl DeviceCapabilities {
             .collect();
         Self {
             capture_modes: CapabilityKnowledge::Known(modes),
+            capture_mode_ranges: Vec::new(),
             native_formats,
             conversions,
             limitations: Vec::new(),
-            configurations,
         }
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn configurations(&self) -> CameraResult<Vec<CameraConfig>> {
+        match &self.capture_modes {
+            CapabilityKnowledge::Known(modes)
+            | CapabilityKnowledge::Representative { values: modes, .. } => {
+                modes.iter().map(CaptureMode::to_config).collect()
+            }
+            CapabilityKnowledge::Unknown { reason } => Err(CameraError::UnsupportedFormat(
+                format!("Capture modes are unknown: {reason}"),
+            )),
+        }
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn with_ranges(mut self, ranges: Vec<CaptureModeRange>) -> Self {
+        if !ranges.is_empty() {
+            if let CapabilityKnowledge::Known(modes) = self.capture_modes {
+                self.capture_modes = CapabilityKnowledge::Representative {
+                    values: modes,
+                    reason:
+                        "backend advertises ranged modes; listed modes are representative samples"
+                            .into(),
+                };
+            }
+            self.capture_mode_ranges = ranges;
+        }
+        self
     }
 }
 
@@ -837,5 +971,54 @@ impl From<Camera2Options> for BackendOptions {
 impl From<AvFoundationOptions> for BackendOptions {
     fn from(value: AvFoundationOptions) -> Self {
         Self::AvFoundation(value)
+    }
+}
+
+#[cfg(test)]
+mod capability_tests {
+    use super::*;
+
+    #[test]
+    fn ranged_capabilities_mark_discrete_modes_as_representative() {
+        let capabilities = DeviceCapabilities::single_native(
+            CaptureFormat::Yuyv,
+            640,
+            480,
+            FrameRate::new(30, 1).unwrap(),
+        )
+        .with_ranges(vec![CaptureModeRange {
+            format: CaptureFormat::Yuyv,
+            kind: CapabilityRangeKind::Stepwise,
+            width: DimensionRange {
+                minimum: 320,
+                maximum: 1920,
+                step: 16,
+            },
+            height: DimensionRange {
+                minimum: 240,
+                maximum: 1080,
+                step: 16,
+            },
+            frame_intervals: vec![FrameIntervalRange {
+                kind: CapabilityRangeKind::Continuous,
+                minimum: FrameInterval {
+                    numerator: 1,
+                    denominator: 60,
+                },
+                maximum: FrameInterval {
+                    numerator: 1,
+                    denominator: 15,
+                },
+                step: None,
+                at_resolution: (640, 480),
+            }],
+        }]);
+
+        assert!(matches!(
+            capabilities.capture_modes,
+            CapabilityKnowledge::Representative { .. }
+        ));
+        assert_eq!(capabilities.capture_mode_ranges.len(), 1);
+        assert_eq!(capabilities.configurations().unwrap().len(), 1);
     }
 }
