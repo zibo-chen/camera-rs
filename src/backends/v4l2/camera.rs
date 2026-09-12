@@ -816,6 +816,7 @@ fn interval_rates(interval: &native::Interval) -> Vec<crate::FrameRate> {
             }
         }
     }
+    rates.sort_unstable();
     rates
 }
 fn frame_rates(fd: i32, code: u32, w: u32, h: u32) -> CameraResult<Vec<crate::FrameRate>> {
