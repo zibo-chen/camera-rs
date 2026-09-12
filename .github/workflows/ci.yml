@@ -52,7 +52,9 @@ jobs:
         if: runner.os != 'Windows'
         run: cargo test --features backend-uvc,ndarray,convert-rgb,decode-mjpeg,custom-backend --lib
       - name: Public documentation
-        run: RUSTDOCFLAGS="-D warnings -D rustdoc::broken-intra-doc-links" cargo doc --no-deps --no-default-features --features runtime-tokio,blocking,convert-rgb,decode-mjpeg,serde,ndarray,custom-backend
+        env:
+          RUSTDOCFLAGS: -D warnings -D rustdoc::broken-intra-doc-links
+        run: cargo doc --no-deps --no-default-features --features runtime-tokio,blocking,convert-rgb,decode-mjpeg,serde,ndarray,custom-backend
       - name: Package and archive verification
         run: |
           cargo package --locked
