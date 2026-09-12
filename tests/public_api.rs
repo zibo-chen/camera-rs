@@ -638,7 +638,7 @@ async fn external_open_and_capability_queries_have_explicit_timeouts() {
         .unwrap_err();
     assert_eq!(error.kind(), camera::CameraErrorKind::Timeout);
     assert_eq!(error.stage(), Some(camera::OperationStage::Open));
-    tokio::time::timeout(Duration::from_millis(200), async {
+    tokio::time::timeout(Duration::from_secs(1), async {
         while dropped_devices.load(Ordering::Acquire) == 0 {
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
@@ -752,6 +752,7 @@ impl BackendDevice for ActivityDevice {
 
 #[tokio::test]
 async fn pool_pressure_is_activity_but_a_true_source_stall_recovers() {
+    let stall_timeout = Duration::from_millis(100);
     let emitting = Arc::new(AtomicBool::new(true));
     let disconnecting = Arc::new(AtomicBool::new(false));
     let starts = Arc::new(AtomicUsize::new(0));
@@ -778,7 +779,7 @@ async fn pool_pressure_is_activity_but_a_true_source_stall_recovers() {
                 .reconnect(camera::ReconnectPolicy {
                     max_attempts: Some(3),
                     delay: Duration::from_millis(3),
-                    stall_timeout: Duration::from_millis(12),
+                    stall_timeout,
                 })
                 .build()
                 .unwrap(),
@@ -796,7 +797,14 @@ async fn pool_pressure_is_activity_but_a_true_source_stall_recovers() {
         .unwrap();
     let capture_session = first.key.session;
 
-    tokio::time::sleep(Duration::from_millis(35)).await;
+    tokio::time::timeout(Duration::from_millis(500), async {
+        while session.metrics().pool_drops == 0 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap();
+    tokio::time::sleep(stall_timeout.saturating_mul(2)).await;
     assert!(session.metrics().pool_drops > 0);
     assert!(session.state().is_streaming());
     assert_eq!(starts.load(Ordering::Acquire), 1);
@@ -810,7 +818,7 @@ async fn pool_pressure_is_activity_but_a_true_source_stall_recovers() {
     drop((second, resumed));
 
     emitting.store(false, Ordering::Release);
-    tokio::time::timeout(Duration::from_millis(100), async {
+    tokio::time::timeout(Duration::from_secs(1), async {
         while !matches!(session.state(), camera::SessionState::Recovering { .. })
             || starts.load(Ordering::Acquire) < 2
         {
