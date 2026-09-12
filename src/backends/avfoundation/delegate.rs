@@ -190,16 +190,21 @@ unsafe fn handle_sample_buffer_unsafe(sample_buffer: &CMSampleBuffer, state: &De
         nanoseconds,
         clock: crate::ClockDomain::MediaPresentation,
     });
-    if frame_buffer.wants_native()
-        && CVPixelBufferGetPlaneCount(pixel_buffer) == 2
+    if CVPixelBufferGetPlaneCount(pixel_buffer) == 2
         && matches!(pixel_format, 0x34323076 | 0x34323066)
     {
-        let mut layout = crate::FrameLayout::packed(width, height, crate::PixelFormat::Nv12, 0, 0);
-        layout.planes.clear();
-        layout.color.range = if pixel_format == 0x34323066 {
-            crate::ColorRange::Full
-        } else {
-            crate::ColorRange::Limited
+        let mut color = crate::ColorInfo {
+            matrix: if height >= 720 {
+                crate::ColorMatrix::Bt709
+            } else {
+                crate::ColorMatrix::Bt601
+            },
+            range: if pixel_format == 0x34323066 {
+                crate::ColorRange::Full
+            } else {
+                crate::ColorRange::Limited
+            },
+            ..Default::default()
         };
         if let Some(value) =
             pixel_buffer.attachment(kCVImageBufferYCbCrMatrixKey, std::ptr::null_mut())
@@ -223,37 +228,90 @@ unsafe fn handle_sample_buffer_unsafe(sample_buffer: &CMSampleBuffer, state: &De
                 ),
             ] {
                 if *value == **key {
-                    layout.color.matrix = matrix;
+                    color.matrix = matrix;
                     break;
                 }
             }
         }
-        let mut parts = Vec::new();
-        let mut offset = 0usize;
-        for plane in 0..2 {
-            let ptr = CVPixelBufferGetBaseAddressOfPlane(pixel_buffer, plane);
-            let stride = CVPixelBufferGetBytesPerRowOfPlane(pixel_buffer, plane);
-            let Some(length) = stride
-                .checked_mul(CVPixelBufferGetHeightOfPlane(pixel_buffer, plane))
-                .filter(|&n| n > 0 && n <= 128 * 1024 * 1024)
-            else {
-                return;
-            };
-            if ptr.is_null() {
-                return;
-            }
-            parts.push(std::slice::from_raw_parts(ptr as *const u8, length));
-            layout.planes.push(crate::PlaneLayout {
-                offset,
-                length,
-                row_stride: stride,
-                pixel_stride: if plane == 0 { 1 } else { 2 },
-            });
-            offset += length;
+        let y_ptr = CVPixelBufferGetBaseAddressOfPlane(pixel_buffer, 0);
+        let uv_ptr = CVPixelBufferGetBaseAddressOfPlane(pixel_buffer, 1);
+        if y_ptr.is_null() || uv_ptr.is_null() {
+            return;
         }
-        if let Err(e) = frame_buffer.publish_native(state.session, layout, timestamp, None, &parts)
-        {
-            log::warn!("AVFoundation native NV12: {e}");
+        let y_stride = CVPixelBufferGetBytesPerRowOfPlane(pixel_buffer, 0);
+        let uv_stride = CVPixelBufferGetBytesPerRowOfPlane(pixel_buffer, 1);
+        let Some(y_length) = y_stride
+            .checked_mul(CVPixelBufferGetHeightOfPlane(pixel_buffer, 0))
+            .filter(|&length| length > 0 && length <= 128 * 1024 * 1024)
+        else {
+            return;
+        };
+        let Some(uv_length) = uv_stride
+            .checked_mul(CVPixelBufferGetHeightOfPlane(pixel_buffer, 1))
+            .filter(|&length| length > 0 && length <= 128 * 1024 * 1024)
+        else {
+            return;
+        };
+        let y = std::slice::from_raw_parts(y_ptr as *const u8, y_length);
+        let uv = std::slice::from_raw_parts(uv_ptr as *const u8, uv_length);
+        let result = if frame_buffer.wants_native() {
+            let layout = crate::FrameLayout {
+                width,
+                height,
+                format: crate::PixelFormat::Nv12,
+                planes: vec![
+                    crate::PlaneLayout {
+                        offset: 0,
+                        length: y_length,
+                        row_stride: y_stride,
+                        pixel_stride: 1,
+                    },
+                    crate::PlaneLayout {
+                        offset: y_length,
+                        length: uv_length,
+                        row_stride: uv_stride,
+                        pixel_stride: 2,
+                    },
+                ],
+                color,
+                orientation: crate::Orientation::default(),
+                bottom_up: false,
+            };
+            let parts = [y, uv];
+            frame_buffer.publish_native(state.session, layout, timestamp, None, &parts)
+        } else {
+            let coefficients = match crate::utils::color_convert::color_coefficients(color) {
+                Ok(coefficients) => coefficients,
+                Err(error) => {
+                    log::warn!("AVFoundation NV12 color metadata: {error}");
+                    return;
+                }
+            };
+            frame_buffer.publish_rgb_metadata(
+                state.session,
+                width,
+                height,
+                timestamp,
+                None,
+                |rgb| {
+                    crate::utils::color_convert::yuv420sp_to_rgb_with_coefficients_into(
+                        crate::utils::color_convert::Yuv420Sp {
+                            y,
+                            uv,
+                            y_stride,
+                            uv_stride,
+                            vu_order: false,
+                        },
+                        width as usize,
+                        height as usize,
+                        coefficients,
+                        rgb,
+                    )
+                },
+            )
+        };
+        if let Err(error) = result {
+            log::warn!("AVFoundation NV12 frame rejected: {error}");
         }
         return;
     }

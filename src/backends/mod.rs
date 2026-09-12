@@ -61,7 +61,7 @@ pub mod v4l2;
 // AVFoundation 后端：macOS, iOS
 #[cfg(all(
     any(feature = "native", feature = "backend-avfoundation"),
-    target_vendor = "apple"
+    any(target_os = "macos", target_os = "ios")
 ))]
 pub mod avfoundation;
 
@@ -96,6 +96,32 @@ pub enum BackendType {
 }
 
 impl BackendType {
+    pub(crate) fn is_compiled(&self) -> bool {
+        match self {
+            Self::Auto => Self::default_for_platform().is_compiled(),
+            Self::Uvc => cfg!(feature = "backend-uvc"),
+            Self::V4l2 => cfg!(feature = "backend-v4l2"),
+            Self::AVFoundation => cfg!(feature = "backend-avfoundation"),
+            Self::Camera2 => cfg!(feature = "backend-camera2"),
+            Self::MediaFoundation => cfg!(feature = "backend-mf"),
+        }
+    }
+
+    pub(crate) fn supports_target(&self) -> bool {
+        match self {
+            Self::Auto => Self::default_for_platform().supports_target(),
+            Self::Uvc => cfg!(any(
+                target_os = "linux",
+                target_os = "macos",
+                target_os = "android"
+            )),
+            Self::V4l2 => cfg!(any(target_os = "linux", target_os = "android")),
+            Self::AVFoundation => cfg!(any(target_os = "macos", target_os = "ios")),
+            Self::Camera2 => cfg!(target_os = "android"),
+            Self::MediaFoundation => cfg!(target_os = "windows"),
+        }
+    }
+
     /// 获取当前平台默认的后端类型
     pub fn default_for_platform() -> Self {
         if cfg!(all(
@@ -104,7 +130,7 @@ impl BackendType {
         )) {
             Self::Camera2
         } else if cfg!(all(
-            target_vendor = "apple",
+            any(target_os = "macos", target_os = "ios"),
             any(feature = "native", feature = "backend-avfoundation")
         )) {
             Self::AVFoundation
@@ -136,7 +162,7 @@ impl BackendType {
             BackendType::AVFoundation => {
                 cfg!(all(
                     any(feature = "native", feature = "backend-avfoundation"),
-                    target_vendor = "apple"
+                    any(target_os = "macos", target_os = "ios")
                 ))
             }
             BackendType::Camera2 => {
@@ -173,6 +199,30 @@ impl std::fmt::Display for BackendType {
     }
 }
 
+impl From<BackendType> for crate::BackendId {
+    fn from(value: BackendType) -> Self {
+        match value {
+            BackendType::Auto => Self::from_builtin("platform-default"),
+            BackendType::Uvc => Self::UVC,
+            BackendType::V4l2 => Self::V4L2,
+            BackendType::AVFoundation => Self::AV_FOUNDATION,
+            BackendType::Camera2 => Self::CAMERA2,
+            BackendType::MediaFoundation => Self::MEDIA_FOUNDATION,
+        }
+    }
+}
+
+pub(crate) fn backend_type(id: &crate::BackendId) -> Option<BackendType> {
+    match id.as_str() {
+        "uvc" => Some(BackendType::Uvc),
+        "v4l2" => Some(BackendType::V4l2),
+        "avfoundation" => Some(BackendType::AVFoundation),
+        "camera2" => Some(BackendType::Camera2),
+        "media-foundation" => Some(BackendType::MediaFoundation),
+        _ => None,
+    }
+}
+
 // ==================== 后端工厂函数 ====================
 
 /// 获取所有在当前平台可用的后端类型
@@ -185,7 +235,7 @@ pub fn available_backends() -> Vec<BackendType> {
         BackendType::Uvc,
         #[cfg(all(
             any(feature = "native", feature = "backend-avfoundation"),
-            target_vendor = "apple"
+            any(target_os = "macos", target_os = "ios")
         ))]
         BackendType::AVFoundation,
         #[cfg(all(
@@ -225,7 +275,7 @@ pub enum BackendCamera {
     /// AVFoundation 摄像头 (macOS/iOS)
     #[cfg(all(
         any(feature = "native", feature = "backend-avfoundation"),
-        target_vendor = "apple"
+        any(target_os = "macos", target_os = "ios")
     ))]
     AVFoundation(Arc<avfoundation::AVFoundationCamera>),
 
@@ -257,7 +307,7 @@ impl BackendCamera {
             BackendCamera::Uvc(cam) => cam.frame_hub(),
             #[cfg(all(
                 any(feature = "native", feature = "backend-avfoundation"),
-                target_vendor = "apple"
+                any(target_os = "macos", target_os = "ios")
             ))]
             BackendCamera::AVFoundation(cam) => cam.frame_hub(),
             #[cfg(all(
@@ -303,7 +353,7 @@ impl BackendCamera {
 
             #[cfg(all(
                 any(feature = "native", feature = "backend-avfoundation"),
-                target_vendor = "apple"
+                any(target_os = "macos", target_os = "ios")
             ))]
             BackendCamera::AVFoundation(_) => BackendType::AVFoundation,
 
@@ -339,7 +389,7 @@ impl BackendCamera {
 
             #[cfg(all(
                 any(feature = "native", feature = "backend-avfoundation"),
-                target_vendor = "apple"
+                any(target_os = "macos", target_os = "ios")
             ))]
             BackendCamera::AVFoundation(cam) => cam.start_stream_arc(config).await,
 
@@ -376,7 +426,7 @@ impl BackendCamera {
 
             #[cfg(all(
                 any(feature = "native", feature = "backend-avfoundation"),
-                target_vendor = "apple"
+                any(target_os = "macos", target_os = "ios")
             ))]
             BackendCamera::AVFoundation(cam) => cam.stop_stream_arc().await,
 
@@ -410,7 +460,7 @@ impl BackendCamera {
 
             #[cfg(all(
                 any(feature = "native", feature = "backend-avfoundation"),
-                target_vendor = "apple"
+                any(target_os = "macos", target_os = "ios")
             ))]
             BackendCamera::AVFoundation(cam) => cam.get_latest_frame(),
 
@@ -447,7 +497,7 @@ impl BackendCamera {
 
             #[cfg(all(
                 any(feature = "native", feature = "backend-avfoundation"),
-                target_vendor = "apple"
+                any(target_os = "macos", target_os = "ios")
             ))]
             BackendCamera::AVFoundation(cam) => cam.wait_for_frame(timeout).await,
 
@@ -484,7 +534,7 @@ impl BackendCamera {
 
             #[cfg(all(
                 any(feature = "native", feature = "backend-avfoundation"),
-                target_vendor = "apple"
+                any(target_os = "macos", target_os = "ios")
             ))]
             BackendCamera::AVFoundation(cam) => cam.is_streaming(),
 
@@ -518,7 +568,7 @@ impl BackendCamera {
 
             #[cfg(all(
                 any(feature = "native", feature = "backend-avfoundation"),
-                target_vendor = "apple"
+                any(target_os = "macos", target_os = "ios")
             ))]
             BackendCamera::AVFoundation(cam) => cam.get_config(),
 
@@ -552,7 +602,7 @@ impl BackendCamera {
 
             #[cfg(all(
                 any(feature = "native", feature = "backend-avfoundation"),
-                target_vendor = "apple"
+                any(target_os = "macos", target_os = "ios")
             ))]
             BackendCamera::AVFoundation(cam) => cam.get_stats(),
 
@@ -586,7 +636,7 @@ impl BackendCamera {
 
             #[cfg(all(
                 any(feature = "native", feature = "backend-avfoundation"),
-                target_vendor = "apple"
+                any(target_os = "macos", target_os = "ios")
             ))]
             BackendCamera::AVFoundation(cam) => cam.set_buffer_size(size).await,
 
@@ -606,6 +656,42 @@ impl BackendCamera {
             _ => {
                 let _ = size;
                 Err(no_camera_backend_enabled())
+            }
+        }
+    }
+
+    pub fn set_camera2_options(&self, options: crate::Camera2Options) -> CameraResult<()> {
+        match self {
+            #[cfg(all(feature = "backend-camera2", target_os = "android"))]
+            BackendCamera::Camera2(camera) => camera.set_options(options),
+            #[allow(unreachable_patterns)]
+            _ => {
+                let _ = options;
+                Err(CameraError::UnsupportedTarget {
+                    backend: crate::BackendId::CAMERA2,
+                    target: std::env::consts::OS,
+                })
+            }
+        }
+    }
+
+    pub fn set_avfoundation_options(
+        &self,
+        options: crate::AvFoundationOptions,
+    ) -> CameraResult<()> {
+        match self {
+            #[cfg(all(
+                feature = "backend-avfoundation",
+                any(target_os = "macos", target_os = "ios")
+            ))]
+            BackendCamera::AVFoundation(camera) => camera.set_options(options),
+            #[allow(unreachable_patterns)]
+            _ => {
+                let _ = options;
+                Err(CameraError::UnsupportedTarget {
+                    backend: crate::BackendId::AV_FOUNDATION,
+                    target: std::env::consts::OS,
+                })
             }
         }
     }
@@ -655,7 +741,7 @@ impl BackendCamera {
 
             #[cfg(all(
                 any(feature = "native", feature = "backend-avfoundation"),
-                target_vendor = "apple"
+                any(target_os = "macos", target_os = "ios")
             ))]
             BackendCamera::AVFoundation(cam) => cam.get_control(control),
 
@@ -696,7 +782,7 @@ impl BackendCamera {
 
             #[cfg(all(
                 any(feature = "native", feature = "backend-avfoundation"),
-                target_vendor = "apple"
+                any(target_os = "macos", target_os = "ios")
             ))]
             BackendCamera::AVFoundation(cam) => cam.set_control(control, value),
 
@@ -736,7 +822,7 @@ impl BackendCamera {
 
             #[cfg(all(
                 any(feature = "native", feature = "backend-avfoundation"),
-                target_vendor = "apple"
+                any(target_os = "macos", target_os = "ios")
             ))]
             BackendCamera::AVFoundation(cam) => cam.get_control_range(control),
 
@@ -773,7 +859,7 @@ impl BackendCamera {
 
             #[cfg(all(
                 any(feature = "native", feature = "backend-avfoundation"),
-                target_vendor = "apple"
+                any(target_os = "macos", target_os = "ios")
             ))]
             BackendCamera::AVFoundation(cam) => cam.supports_control(control),
 
@@ -810,7 +896,7 @@ impl BackendCamera {
 
             #[cfg(all(
                 any(feature = "native", feature = "backend-avfoundation"),
-                target_vendor = "apple"
+                any(target_os = "macos", target_os = "ios")
             ))]
             BackendCamera::AVFoundation(cam) => cam.get_supported_controls(),
 
@@ -844,7 +930,7 @@ impl BackendCamera {
 
             #[cfg(all(
                 any(feature = "native", feature = "backend-avfoundation"),
-                target_vendor = "apple"
+                any(target_os = "macos", target_os = "ios")
             ))]
             BackendCamera::AVFoundation(cam) => cam.reset_control(control),
 
@@ -881,7 +967,7 @@ impl BackendCamera {
 
             #[cfg(all(
                 any(feature = "native", feature = "backend-avfoundation"),
-                target_vendor = "apple"
+                any(target_os = "macos", target_os = "ios")
             ))]
             BackendCamera::AVFoundation(cam) => cam.reset_all_controls(),
 
@@ -976,7 +1062,7 @@ pub(crate) fn create_selected_camera(
 
         #[cfg(all(
             any(feature = "native", feature = "backend-avfoundation"),
-            target_vendor = "apple"
+            any(target_os = "macos", target_os = "ios")
         ))]
         BackendType::AVFoundation => {
             let camera =
@@ -986,7 +1072,7 @@ pub(crate) fn create_selected_camera(
 
         #[cfg(not(all(
             any(feature = "native", feature = "backend-avfoundation"),
-            target_vendor = "apple"
+            any(target_os = "macos", target_os = "ios")
         )))]
         BackendType::AVFoundation => Err(CameraError::Other(
             "AVFoundation backend is not available on this platform".into(),
@@ -1113,7 +1199,7 @@ pub fn list_devices(backend: BackendType) -> CameraResult<Vec<crate::CameraDevic
 
         #[cfg(all(
             any(feature = "native", feature = "backend-avfoundation"),
-            target_vendor = "apple"
+            any(target_os = "macos", target_os = "ios")
         ))]
         BackendType::AVFoundation => {
             <avfoundation::AVFoundationCamera as CameraManager>::list_devices()
@@ -1121,7 +1207,7 @@ pub fn list_devices(backend: BackendType) -> CameraResult<Vec<crate::CameraDevic
 
         #[cfg(not(all(
             any(feature = "native", feature = "backend-avfoundation"),
-            target_vendor = "apple"
+            any(target_os = "macos", target_os = "ios")
         )))]
         BackendType::AVFoundation => Err(CameraError::Other(
             "AVFoundation backend is not available on this platform".into(),
@@ -1201,7 +1287,7 @@ pub fn get_supported_configs(
 
         #[cfg(all(
             any(feature = "native", feature = "backend-avfoundation"),
-            target_vendor = "apple"
+            any(target_os = "macos", target_os = "ios")
         ))]
         BackendType::AVFoundation => {
             <avfoundation::AVFoundationCamera as CameraManager>::get_supported_configs(
@@ -1211,7 +1297,7 @@ pub fn get_supported_configs(
 
         #[cfg(not(all(
             any(feature = "native", feature = "backend-avfoundation"),
-            target_vendor = "apple"
+            any(target_os = "macos", target_os = "ios")
         )))]
         BackendType::AVFoundation => Err(CameraError::Other(
             "AVFoundation backend is not available on this platform".into(),
@@ -1283,7 +1369,7 @@ mod tests {
             ),
             all(
                 any(feature = "native", feature = "backend-avfoundation"),
-                target_vendor = "apple"
+                any(target_os = "macos", target_os = "ios")
             ),
             all(
                 any(feature = "native", feature = "backend-camera2"),
@@ -1303,7 +1389,7 @@ mod tests {
 
     #[test]
     #[cfg(all(
-        target_vendor = "apple",
+        any(target_os = "macos", target_os = "ios"),
         not(any(feature = "native", feature = "backend-avfoundation"))
     ))]
     fn get_supported_configs_reports_missing_apple_default_backend() {
@@ -1318,7 +1404,7 @@ mod tests {
         ),
         all(
             any(feature = "native", feature = "backend-avfoundation"),
-            target_vendor = "apple"
+            any(target_os = "macos", target_os = "ios")
         ),
         all(
             any(feature = "native", feature = "backend-camera2"),

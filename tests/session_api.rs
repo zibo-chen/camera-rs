@@ -1,4 +1,9 @@
-use camera::{CameraError, CameraSystem, FrameRate, OutputFormat, SelectionPolicy, StreamRequest};
+#![cfg(feature = "runtime-tokio")]
+
+use camera::{
+    CameraError, CameraSystem, CaptureFormat, CaptureRequest, DeviceSelector, FrameRate,
+    SubscriptionOptions,
+};
 #[test]
 fn rational_rates_preserve_precision_and_reject_zero() {
     assert_eq!(
@@ -12,38 +17,43 @@ fn rational_rates_preserve_precision_and_reject_zero() {
 async fn synthetic_session_has_independent_receivers_and_stop_wakes_waiters() {
     let system = CameraSystem::synthetic();
     let devices = system.devices().await.unwrap();
-    let mut camera = system.open(&devices[0].id).await.unwrap();
+    let mut camera = system
+        .open(DeviceSelector::Id(devices[0].id.clone()))
+        .await
+        .unwrap();
     let session = camera
         .start(
-            StreamRequest::builder()
-                .resolution(16, 8)
-                .selection(SelectionPolicy::Exact)
+            CaptureRequest::builder()
+                .exact_resolution(16, 8)
                 .build()
                 .unwrap(),
         )
         .await
         .unwrap();
-    let mut a = session.subscribe();
-    let mut b = session.subscribe();
+    let mut a = session.subscribe(SubscriptionOptions::latest()).unwrap();
+    let mut b = session.subscribe(SubscriptionOptions::latest()).unwrap();
     let first = a.next().await.unwrap();
     let same = b.next().await.unwrap();
     assert_eq!(first.key, same.key);
     let second = a.next().await.unwrap();
     assert_ne!(first.key, second.key);
     assert_eq!(first.layout().width, 16);
-    session.stop().await.unwrap();
+    session.close().await.unwrap();
     assert!(matches!(a.next().await, Err(CameraError::StreamStopped)));
 }
 #[tokio::test]
 async fn dropping_session_stops_retained_receivers() {
     let system = CameraSystem::synthetic();
     let d = system.devices().await.unwrap();
-    let mut c = system.open(&d[0].id).await.unwrap();
-    let s = c
-        .start(StreamRequest::builder().build().unwrap())
+    let mut c = system
+        .open(DeviceSelector::Id(d[0].id.clone()))
         .await
         .unwrap();
-    let mut r = s.subscribe();
+    let s = c
+        .start(CaptureRequest::builder().build().unwrap())
+        .await
+        .unwrap();
+    let mut r = s.subscribe(SubscriptionOptions::latest()).unwrap();
     drop(s);
     let result = tokio::time::timeout(std::time::Duration::from_secs(1), r.next())
         .await
@@ -54,53 +64,75 @@ async fn dropping_session_stops_retained_receivers() {
 async fn requested_native_output_is_described_honestly() {
     let system = CameraSystem::synthetic();
     let d = system.devices().await.unwrap();
-    let mut c = system.open(&d[0].id).await.unwrap();
-    let s = c
-        .start(
-            StreamRequest::builder()
-                .output(OutputFormat::Native)
-                .build()
-                .unwrap(),
-        )
+    let mut c = system
+        .open(DeviceSelector::Id(d[0].id.clone()))
         .await
         .unwrap();
-    let f = s.subscribe().next().await.unwrap();
+    let s = c
+        .start(CaptureRequest::builder().build().unwrap())
+        .await
+        .unwrap();
+    let f = s
+        .subscribe(SubscriptionOptions::latest())
+        .unwrap()
+        .next()
+        .await
+        .unwrap();
     assert_eq!(f.bytes().len(), f.layout().planes[0].length);
-    s.stop().await.unwrap();
+    s.close().await.unwrap();
 }
 
 #[tokio::test]
 async fn stopping_an_old_session_cannot_stop_a_new_one() {
     let system = CameraSystem::synthetic();
     let devices = system.devices().await.unwrap();
-    let mut camera = system.open(&devices[0].id).await.unwrap();
+    let mut camera = system
+        .open(DeviceSelector::Id(devices[0].id.clone()))
+        .await
+        .unwrap();
     let old = camera
-        .start(StreamRequest::builder().build().unwrap())
+        .start(CaptureRequest::builder().build().unwrap())
         .await
         .unwrap();
-    old.stop().await.unwrap();
+    old.close().await.unwrap();
     let new = camera
-        .start(StreamRequest::builder().build().unwrap())
+        .start(CaptureRequest::builder().build().unwrap())
         .await
         .unwrap();
-    old.stop().await.unwrap();
-    assert!(new.subscribe().next().await.is_ok());
-    new.stop().await.unwrap();
+    old.close().await.unwrap();
+    assert!(new
+        .subscribe(SubscriptionOptions::latest())
+        .unwrap()
+        .next()
+        .await
+        .is_ok());
+    new.close().await.unwrap();
 }
 
 #[tokio::test]
 async fn old_receivers_and_session_views_do_not_attach_to_new_capture() {
     let sys = CameraSystem::synthetic();
-    let mut camera = sys.open(&sys.devices().await.unwrap()[0].id).await.unwrap();
+    let id = sys.devices().await.unwrap()[0].id.clone();
+    let mut camera = sys.open(DeviceSelector::Id(id)).await.unwrap();
     let old = camera
-        .start(StreamRequest::builder().resolution(8, 8).build().unwrap())
+        .start(
+            CaptureRequest::builder()
+                .preferred_resolution(8, 8)
+                .build()
+                .unwrap(),
+        )
         .await
         .unwrap();
-    let mut reader = old.subscribe();
-    old.stop().await.unwrap();
+    let mut reader = old.subscribe(SubscriptionOptions::latest()).unwrap();
+    old.close().await.unwrap();
     let stopped_bytes = old.metrics().allocated_bytes;
     let new = camera
-        .start(StreamRequest::builder().resolution(16, 16).build().unwrap())
+        .start(
+            CaptureRequest::builder()
+                .preferred_resolution(16, 16)
+                .build()
+                .unwrap(),
+        )
         .await
         .unwrap();
     assert!(matches!(
@@ -108,23 +140,32 @@ async fn old_receivers_and_session_views_do_not_attach_to_new_capture() {
         Err(CameraError::StreamStopped)
     ));
     assert!(matches!(
-        old.subscribe().next().await,
+        old.subscribe(SubscriptionOptions::latest())
+            .unwrap()
+            .next()
+            .await,
         Err(CameraError::StreamStopped)
     ));
     assert!(old.latest().is_none());
-    assert_eq!(old.subscribe().queued_frames(), 0);
+    assert_eq!(
+        old.subscribe(SubscriptionOptions::latest())
+            .unwrap()
+            .queued_frames(),
+        0
+    );
     assert_eq!(reader.queued_frames(), 0);
     assert_eq!(old.metrics().allocated_bytes, stopped_bytes);
     assert_eq!(new.latest().unwrap().layout().width, 16);
-    new.stop().await.unwrap();
+    new.close().await.unwrap();
 }
 
 #[tokio::test]
 async fn exact_fractional_rate_is_preserved_and_wrong_format_is_rejected() {
     let sys = CameraSystem::synthetic();
-    let mut camera = sys.open(&sys.devices().await.unwrap()[0].id).await.unwrap();
-    let invalid = StreamRequest::builder()
-        .capture_format(camera::VideoFormat::MJPEG)
+    let id = sys.devices().await.unwrap()[0].id.clone();
+    let mut camera = sys.open(DeviceSelector::Id(id)).await.unwrap();
+    let invalid = CaptureRequest::builder()
+        .preferred_formats([CaptureFormat::Mjpeg])
         .build()
         .unwrap();
     assert!(matches!(
@@ -134,17 +175,16 @@ async fn exact_fractional_rate_is_preserved_and_wrong_format_is_rejected() {
     let fps = FrameRate::new(30000, 1001).unwrap();
     let s = camera
         .start(
-            StreamRequest::builder()
-                .resolution(8, 8)
-                .frame_rate(fps)
-                .selection(SelectionPolicy::Exact)
+            CaptureRequest::builder()
+                .exact_resolution(8, 8)
+                .preferred_frame_rate(fps)
                 .build()
                 .unwrap(),
         )
         .await
         .unwrap();
-    assert_eq!(s.negotiated_config().frame_rate, fps);
-    s.stop().await.unwrap();
+    assert_eq!(s.negotiated().capture.frame_rate, fps);
+    s.close().await.unwrap();
 }
 
 #[tokio::test]

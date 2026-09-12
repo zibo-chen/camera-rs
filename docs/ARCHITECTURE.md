@@ -1,17 +1,24 @@
 # Architecture
 
-`CameraSystem` handles backend selection and device identity. `Camera` is an opened device. `CaptureSession` owns startup, capture, serialized controls, optional recovery and shutdown. `FrameReceiver` owns delivery state; `CapturedFrame` owns immutable shared storage. Public callers do not interact with backend factories, Arc wiring, native callback objects or recovery wrappers.
+The public design separates intent, lifecycle and extension concerns without duplicating capture logic.
 
-Native adapters retain platform threading rules: Media Foundation uses a COM worker, AVFoundation uses capture/delegate queues, UVC stops and joins callbacks before releasing callback state, Camera2 owns NDK images/requests, and V4L2 returns dequeued driver buffers with a scope guard. Async entry points offload native blocking work. Cancellation requests shutdown and preserves exclusive lifecycle ownership until outstanding native work settles.
+```text
+CameraSystem
+  + BackendPolicy + registered BackendProvider(s)
+  -> DeviceSelector -> Device
+  -> CaptureRequest -> CapturePlan -> native start + first-frame validation
+  -> Session (sole capture lifetime owner)
+       -> FrameHub (bounded immutable pool, capture epoch)
+            -> FrameReceiver [Latest / Buffered / max_rate]
+            -> FrameReceiver [independent policy]
+       -> current state watch
+       -> bounded event stream with missed-count reporting
+```
 
-All backends publish through one internal `FrameHub`. It reserves a bounded slot under the pool lock, releases that lock during conversion/copying, checks the capture epoch again, and then publishes one immutable snapshot to independent bounded subscriber queues. A lease returns storage even when conversion fails or panics. Strong frame/ndarray references keep slots occupied; weak references cannot cause mutation of shared storage or an `Arc::get_mut` panic.
+`Capture` is only a convenience owner of one `Session` and one latest receiver. It uses the same path as the complete API. Receivers and retained frames never control camera lifetime.
 
-The pool mutex is not held while subscriber queues are updated, and metrics percentile sorting operates on a copied sample snapshot. Explicit native delivery plus per-consumer `ConversionRequest` separates capture rate from RGB processing rate: Latest consumers convert only the frame they select, while buffered/every-frame RGB workloads retain the direct backend-to-pool path.
+Features compile backend, conversion and integration capabilities independently. Runtime policy cannot enable code absent from the build. Platform modules, FFI types, native locking and compatibility traits stay private; external implementations use `BackendProvider`, `BackendDevice`, `FrameSink` and `WritableFrameLease`.
 
-The core stores copied native frames in pooled memory. Camera2 recognizes strictly adjacent, overlapping U/V views and copies their shared NV12/NV21 chroma storage once; disjoint or ambiguous planes retain the three-plane representation. This deliberately avoids exposing native pointers whose lifetimes end with callbacks. Platform GPU buffers/textures and decoder plugins require separate ownership, synchronization and release-thread contracts; they are not represented by no-op preferences.
+Backends publish native layout and bytes into a bounded pool. Conversion occurs after an individual consumer receives a frame. Conversion and full-frame copies do not run while the pool lock is held. Epoch checks reject callbacks from an old or stopped capture. Driver-buffer leases, GPU frames and unbounded queues are deliberately outside this contract.
 
-CPU color conversion is selected per target at runtime where required. ARM64 uses NEON and processes pairs of I420/NV12/NV21 luma rows while reusing their shared chroma expansion and coefficient products. x86_64 checks AVX2 before entering packed YUYV/UYVY, planar I420 or full/half-size NV12/NV21 kernels; packed BGRA/RGBA/ARGB selects AVX2, then SSSE3, then scalar conversion. Capability checks happen outside row loops. Unsupported CPUs and unhandled tails fall back to the same integer conversion contract, so backend code does not branch on SIMD capabilities.
-
-The optional ndarray adapter is isolated from core frame storage. Android USB permission/context/JNI code lives in a separate `camera-android` package. JNI uses a per-handle lifecycle gate, catches Rust panics at the boundary, copies to caller-owned writable direct buffers, and reports actual operation failures. Core Camera2 capture does not require a Java context.
-
-See [API contracts](API.md) for cancellation, negotiated configuration, identity, backpressure, metadata and control semantics. Native format conversion, hardware capture throughput and end-to-end display latency are measured separately.
+Native thread-affine objects remain inside their backend worker. Public control/open/configuration calls may use dynamic dispatch because they are not pixel hot paths. The frame hot path does not create one async task per frame.

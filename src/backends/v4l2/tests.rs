@@ -142,6 +142,7 @@ fn limited_range_black_white_and_709_matrix_are_respected() {
     assert!(converter.set_colorimetry(7, false).is_err());
 }
 
+#[cfg(feature = "decode-mjpeg")]
 #[test]
 fn jpeg_decodes_into_rgb_and_rejects_mismatched_dimensions() {
     let pixels = [100u8; 12];

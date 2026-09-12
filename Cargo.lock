@@ -582,7 +582,7 @@ dependencies = [
 
 [[package]]
 name = "camera"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "block2 0.6.2",
  "cc",
@@ -599,6 +599,7 @@ dependencies = [
  "objc2-foundation 0.3.2",
  "once_cell",
  "parking_lot",
+ "serde",
  "thiserror 1.0.69",
  "tokio",
  "turbojpeg",

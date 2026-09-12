@@ -1,2 +1,5 @@
 # Android builds use scripts/check-android.sh or scripts/build-android-adapter.sh.
 # Keep machine-specific linker/NDK paths out of package configuration.
+
+[target.armv7-linux-androideabi]
+rustflags = ["-C", "target-feature=+neon"]

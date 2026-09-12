@@ -5,6 +5,7 @@ use crate::utils::color_convert::{
 use crate::{
     CameraConfig, CameraError, CameraResult, ColorInfo, ColorMatrix, ColorRange, VideoFormat,
 };
+#[cfg(feature = "decode-mjpeg")]
 use turbojpeg::{Decompressor, Image, PixelFormat};
 
 #[derive(Clone, Copy)]
@@ -57,6 +58,7 @@ fn check_rows(plane: &Plane<'_>, row_bytes: usize, height: usize) -> CameraResul
 }
 
 pub(super) struct Converter {
+    #[cfg(feature = "decode-mjpeg")]
     jpeg: Decompressor,
     coefficients: [i32; 6],
 }
@@ -69,6 +71,7 @@ impl Converter {
                 range: ColorRange::Full,
                 ..Default::default()
             })?,
+            #[cfg(feature = "decode-mjpeg")]
             jpeg: Decompressor::new().map_err(|e| invalid(&e.to_string()))?,
         })
     }
@@ -122,27 +125,34 @@ impl Converter {
         }
         match config.format {
             VideoFormat::MJPEG => {
-                let header = self
-                    .jpeg
-                    .read_header(first.data)
-                    .map_err(|e| invalid(&e.to_string()))?;
-                if header.width != w || header.height != h {
-                    return Err(invalid(
-                        "MJPEG dimensions differ from negotiated V4L2 format",
-                    ));
+                #[cfg(not(feature = "decode-mjpeg"))]
+                return Err(CameraError::UnsupportedFormat(
+                    "MJPEG decoding requires the decode-mjpeg feature".into(),
+                ));
+                #[cfg(feature = "decode-mjpeg")]
+                {
+                    let header = self
+                        .jpeg
+                        .read_header(first.data)
+                        .map_err(|e| invalid(&e.to_string()))?;
+                    if header.width != w || header.height != h {
+                        return Err(invalid(
+                            "MJPEG dimensions differ from negotiated V4L2 format",
+                        ));
+                    }
+                    self.jpeg
+                        .decompress(
+                            first.data,
+                            Image {
+                                pixels: rgb,
+                                width: w,
+                                pitch: w * 3,
+                                height: h,
+                                format: PixelFormat::RGB,
+                            },
+                        )
+                        .map_err(|e| invalid(&e.to_string()))?;
                 }
-                self.jpeg
-                    .decompress(
-                        first.data,
-                        Image {
-                            pixels: rgb,
-                            width: w,
-                            pitch: w * 3,
-                            height: h,
-                            format: PixelFormat::RGB,
-                        },
-                    )
-                    .map_err(|e| invalid(&e.to_string()))?;
             }
             VideoFormat::NV12 => {
                 let uv;

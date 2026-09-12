@@ -1,13 +1,15 @@
 # camera-android
 
-Android USB permission integration and JNI adapter for `camera` 0.2. Licensed MIT OR Apache-2.0. Requires Android API 24+, Rust 1.88+ and the Android NDK. The core Camera2 backend can be used without this package or JNI.
+Android JNI and USB-permission adapter for camera 0.4. Camera2 is the only default backend.
 
-Run `../scripts/build-android-adapter.sh aarch64-linux-android` with `ANDROID_NDK_HOME` set. Java examples are in `../android_example/src/main/java/com/medivh/camera`. Package both `libcamera_android.so` and the matching NDK `libc++_shared.so` (the build script copies both). Load `camera_android`, initialize with an application Context, obtain CAMERA/USB permission, enumerate devices, open by the returned native ID, and start. Close every handle explicitly with the Java AutoCloseable wrapper.
+```toml
+camera-android = { version = "0.4", default-features = false, features = ["camera2"] }
+```
 
-JNI calls are blocking. Run enumeration/start/nextFrame/stop/close on workers. Start returns the actual negotiated configuration in JSON. Each handle owns one frame reader. Supply a writable direct ByteBuffer exclusively owned for the duration of nextFrame; Rust copies the bytes and returns plane/format/timestamp metadata in JSON. A short buffer throws while retaining the pending frame, allowing resize/retry. The adapter never returns a dangling pointer into a driver callback.
+Optional adapter features are `uvc`, `v4l2`, `convert-rgb`, and `decode-mjpeg`. `uvc` is required for authorized USB descriptors; `v4l2` requires device-node access beyond the normal CAMERA permission. A Camera2-only build does not compile UVC/V4L2 and does not include TurboJPEG.
 
-Native errors throw IllegalStateException; callers must handle them. Concurrent stop wakes frame waits, start/stop/close are serialized, and a closed handle cannot start again. USB file descriptors are duplicated before Java connections close. Duplicate VID/PID devices are addressed by UsbManager device path, not the first matching product. Permission grant is asynchronous: retry opening after Android reports the grant.
+Capture always starts the core library in native-output mode. The existing direct `ByteBuffer` ownership rule remains: Java exclusively owns the writable direct buffer for the JNI call, Rust copies one delivered frame into it, and a too-small buffer leaves that frame pending for retry. If Java asks for RGB, `convert-rgb` must be enabled and conversion occurs after this adapter consumer receives its frame; the converter and output storage are reused.
 
-Control descriptors carry native units and actual/requested/unknown readback semantics inherited from the core. `control(id)` reports Actual/Requested/Unknown with its value; `metrics()` reports bounded-pool, conversion and receiver statistics. Batching can be used through Rust. It does not initialize a process-global logger.
+USB permission request, permission observation and device open are separate JNI operations. Camera2 open does not implicitly drive a USB prompt. UVC accepts an already-authorized descriptor and duplicates ownership before opening.
 
-Backends are `camera2`, `uvc`, and `v4l2`. V4L2 requires device-node access and is primarily for privileged integration; CAMERA permission alone is insufficient. See [physical-device tests](../docs/ANDROID_HARDWARE_20260910.md) and [the runner](../scripts/test-android-device.sh).
+JSON remains the compatibility surface for low-frequency device/configuration diagnostics. High-frequency pixel bytes stay in the direct buffer. Session close waits for native cleanup; dropping/cancelling a Rust future cannot force an OS call already executing to stop immediately.

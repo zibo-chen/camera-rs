@@ -8,15 +8,33 @@ pub enum CameraError {
     /// Native failure with its original status code and operation context.
     #[error("{backend} {operation} failed (code {code}): {message}")]
     Native {
-        backend: crate::BackendType,
+        backend: crate::BackendId,
         operation: String,
         code: i64,
         message: String,
     },
     #[error("Control operations failed: {0:?}")]
     ControlBatch(Vec<String>),
-    #[error("Backend {0} is not available")]
-    BackendUnavailable(String),
+    #[error("Backend {backend} was not compiled into this build")]
+    BackendNotCompiled { backend: crate::BackendId },
+    #[error("Backend {backend} is unsupported on target {target}")]
+    UnsupportedTarget {
+        backend: crate::BackendId,
+        target: &'static str,
+    },
+    #[error("Backend option for {option_backend} cannot be used with {selected_backend}")]
+    BackendOptionMismatch {
+        option_backend: crate::BackendId,
+        selected_backend: crate::BackendId,
+    },
+    #[error("All preferred backends failed: {0:?}")]
+    BackendAttemptsFailed(Vec<crate::BackendAttempt>),
+    #[error("Device is busy: {0}")]
+    DeviceBusy(String),
+    #[error("Permission is required before opening {0}")]
+    PermissionRequired(String),
+    #[error("Permission for backend {backend} is managed by the application or platform adapter")]
+    PermissionManagedExternally { backend: crate::BackendId },
     #[error("Stream stopped")]
     StreamStopped,
     #[error("Invalid state: {0}")]
@@ -56,8 +74,8 @@ pub enum CameraError {
     StreamError(String),
 
     /// 超时
-    #[error("Operation timeout")]
-    Timeout,
+    #[error("Operation timed out during {stage:?}")]
+    Timeout { stage: crate::OperationStage },
 
     /// 缓冲区为空
     #[error("Buffer empty")]

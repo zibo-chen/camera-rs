@@ -6,9 +6,8 @@ fn main() {
     let target_arch = env::var("CARGO_CFG_TARGET_ARCH").unwrap_or_default();
 
     println!("cargo:rustc-check-cfg=cfg(camera_v4l2)");
-    let v4l2_enabled = (target_os == "linux" && env::var_os("CARGO_FEATURE_NATIVE").is_some())
-        || (matches!(target_os.as_str(), "linux" | "android")
-            && env::var_os("CARGO_FEATURE_BACKEND_V4L2").is_some());
+    let v4l2_enabled = matches!(target_os.as_str(), "linux" | "android")
+        && env::var_os("CARGO_FEATURE_BACKEND_V4L2").is_some();
     if v4l2_enabled {
         println!("cargo:rustc-cfg=camera_v4l2");
     }
@@ -38,8 +37,7 @@ fn main() {
         println!("cargo:rustc-link-lib=framework=CoreFoundation");
         println!("cargo:rustc-link-lib=framework=Security");
     }
-    let apple_enabled = env::var_os("CARGO_FEATURE_NATIVE").is_some()
-        || env::var_os("CARGO_FEATURE_BACKEND_AVFOUNDATION").is_some();
+    let apple_enabled = env::var_os("CARGO_FEATURE_BACKEND_AVFOUNDATION").is_some();
     if apple_enabled && matches!(target_os.as_str(), "macos" | "ios") {
         for framework in ["AVFoundation", "CoreMedia", "CoreVideo", "CoreFoundation"] {
             println!("cargo:rustc-link-lib=framework={framework}");
@@ -65,8 +63,7 @@ fn main() {
     }
 
     // 仅在 Android 平台且启用 backend-camera2 feature 时编译 NDK Camera2 桥接层
-    let backend_camera2_enabled = env::var("CARGO_FEATURE_BACKEND_CAMERA2").is_ok()
-        || env::var_os("CARGO_FEATURE_NATIVE").is_some();
+    let backend_camera2_enabled = env::var("CARGO_FEATURE_BACKEND_CAMERA2").is_ok();
     if backend_camera2_enabled && target_os == "android" {
         compile_ndk_camera2_bridge(&manifest_dir);
         println!("cargo:warning=✓ NDK Camera2 桥接层编译完成");
@@ -336,9 +333,12 @@ fn compile_libuvc(thirdparty_dir: &Path, target_os: &str) {
         .file(src_dir.join("misc.c"))
         .file("cpp/uvc_abi_probe.c");
 
-    // MJPEG 支持 - 不需要编译 C 库，使用 Rust 的 turbojpeg crate
-    // frame-mjpeg.c 会提供原始 MJPEG 数据，我们在 Rust 层解码
-    println!("cargo:warning=✓ MJPEG 支持通过 turbojpeg Rust crate 提供");
+    // libuvc 始终可传输原生 MJPEG；是否能转换为 RGB 由独立解码 feature 决定。
+    if env::var_os("CARGO_FEATURE_DECODE_MJPEG").is_some() {
+        println!("cargo:warning=✓ MJPEG 原生传输及 TurboJPEG 解码已启用");
+    } else {
+        println!("cargo:warning=✓ MJPEG 原生传输已启用；RGB 解码未编译");
+    }
 
     // 包含目录
     build

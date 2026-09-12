@@ -38,7 +38,7 @@
 //! └─────────────────────────────────────────────────────────────┘
 //! ```
 
-mod camera;
+pub(crate) mod camera;
 mod capture;
 mod delegate;
 mod device;

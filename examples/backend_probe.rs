@@ -1,6 +1,7 @@
 //! Physical-device diagnostic. Android V4L2 requires access to /dev/videoN.
 use camera::{
-    BackendType, CameraError, CameraSystem, FrameRate, OutputFormat, StreamRequest, VideoFormat,
+    BackendId, BackendPolicy, CameraError, CameraSystem, CaptureFormat, CaptureRequest,
+    DeviceSelector, FrameRate, SubscriptionOptions, V4l2Options,
 };
 use std::time::{Duration, Instant};
 
@@ -23,13 +24,22 @@ fn fds() -> usize {
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let backend = match option("--backend").as_deref().unwrap_or("auto") {
-        "camera2" => BackendType::Camera2,
-        "uvc" => BackendType::Uvc,
-        "v4l2" => BackendType::V4l2,
-        "auto" => BackendType::Auto,
+        "camera2" => Some(BackendId::CAMERA2),
+        "uvc" => Some(BackendId::UVC),
+        "v4l2" => Some(BackendId::V4L2),
+        "auto" => None,
         _ => return Err("unknown backend".into()),
     };
-    let system = CameraSystem::with_backend(backend);
+    let mut system = CameraSystem::builder().backend_policy(match backend.clone() {
+        Some(backend) => BackendPolicy::Require(backend),
+        None => BackendPolicy::PlatformDefault,
+    });
+    if backend.as_ref() == Some(&BackendId::V4L2) {
+        system = system.backend_options(
+            V4l2Options::default().mmap_buffers(number("--driver-buffers", 4) as usize),
+        );
+    }
+    let system = system.build()?;
     let devices = system.devices().await?;
     for device in &devices {
         println!("DEVICE {device:?}");
@@ -45,7 +55,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .iter()
         .find(|d| selected.as_ref().is_none_or(|id| d.id.native_id() == id))
         .ok_or("requested camera missing; run --list")?;
-    let mut camera = system.open(&device.id).await?;
+    let mut camera = system.open(DeviceSelector::Id(device.id.clone())).await?;
     let (width, height, fps) = (
         number("--width", 640),
         number("--height", 480),
@@ -55,31 +65,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut last_epoch = None;
     let mut warm_fds = None;
     for round in 0..number("--rounds", 3) {
-        let mut request = StreamRequest::builder()
-            .resolution(width, height)
-            .frame_rate(FrameRate::new(fps, 1)?)
-            .output(if flag("--native") {
-                OutputFormat::Native
-            } else {
-                OutputFormat::Rgb8
-            })
+        let mut request = CaptureRequest::builder()
+            .preferred_resolution(width, height)
+            .preferred_frame_rate(FrameRate::new(fps, 1)?)
             .startup_timeout(Duration::from_secs(10));
         if let Some(format) = option("--format") {
-            request = request.capture_format(match format.as_str() {
-                "mjpeg" => VideoFormat::MJPEG,
-                "yuyv" => VideoFormat::YUYV,
-                "nv12" => VideoFormat::NV12,
-                "rgb" => VideoFormat::RGB,
+            request = request.preferred_formats([match format.as_str() {
+                "mjpeg" => CaptureFormat::Mjpeg,
+                "yuyv" => CaptureFormat::Yuyv,
+                "nv12" => CaptureFormat::Nv12,
+                "rgb" => CaptureFormat::Rgb8,
                 _ => return Err("unknown capture format".into()),
-            });
-        }
-        if backend == BackendType::V4l2 {
-            request = request.driver_buffers(number("--driver-buffers", 4) as usize);
+            }]);
         }
         let session = camera.start(request.build()?).await?;
-        println!("ROUND {round} NEGOTIATED {:?}", session.negotiated_config());
-        let mut receiver = session.subscribe();
-        let mut observer = session.subscribe();
+        println!("ROUND {round} NEGOTIATED {:?}", session.negotiated());
+        let mut receiver = session.subscribe(SubscriptionOptions::latest())?;
+        let mut observer = session.subscribe(SubscriptionOptions::latest())?;
         let mut previous = None;
         let begin = Instant::now();
         for index in 0..frames {
@@ -111,8 +113,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             );
         }
         let stop = Instant::now();
-        session.stop().await?;
-        session.stop().await?;
+        session.close().await?;
+        session.close().await?;
         assert!(matches!(
             receiver.next().await,
             Err(CameraError::StreamStopped)

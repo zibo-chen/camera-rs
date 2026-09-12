@@ -17,7 +17,9 @@ use objc2_av_foundation::{
     AVCaptureSessionPreset3840x2160, AVCaptureSessionPreset640x480,
 };
 use objc2_core_media::{CMTime, CMTimeFlags};
-use objc2_core_video::{kCVPixelBufferPixelFormatTypeKey, kCVPixelFormatType_32BGRA};
+use objc2_core_video::{
+    kCVPixelBufferPixelFormatTypeKey, kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange,
+};
 use objc2_foundation::{NSDictionary, NSNumber, NSString};
 
 use crate::error::CameraError;
@@ -30,9 +32,9 @@ fn cv_pixel_buffer_pixel_format_type_key() -> &'static NSString {
     unsafe { AsRef::<NSString>::as_ref(kCVPixelBufferPixelFormatTypeKey) }
 }
 
-fn bgra_video_settings() -> Retained<NSDictionary<NSString, AnyObject>> {
+fn nv12_video_settings() -> Retained<NSDictionary<NSString, AnyObject>> {
     let format_key = cv_pixel_buffer_pixel_format_type_key();
-    let format_value = NSNumber::new_u32(kCVPixelFormatType_32BGRA);
+    let format_value = NSNumber::new_u32(kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange);
     let keys: [&NSString; 1] = [format_key];
     let values: [&AnyObject; 1] = [(&*format_value) as &AnyObject];
 
@@ -113,9 +115,10 @@ impl CaptureSession {
         device_id: &str,
         config: CameraConfig,
         frame_buffer: Arc<FrameBuffer>,
+        discard_late_frames: bool,
     ) -> CameraResult<Self> {
         catch_objc_result("AVFoundation create capture session", || {
-            Self::new_uncaught(device_id, config, frame_buffer)
+            Self::new_uncaught(device_id, config, frame_buffer, discard_late_frames)
         })
     }
 
@@ -123,6 +126,7 @@ impl CaptureSession {
         device_id: &str,
         config: CameraConfig,
         frame_buffer: Arc<FrameBuffer>,
+        discard_late_frames: bool,
     ) -> CameraResult<Self> {
         log::info!(
             "Creating AVFoundation capture session for device {} with config {:?}",
@@ -175,7 +179,9 @@ impl CaptureSession {
         // 创建输出
         let output = unsafe { AVCaptureVideoDataOutput::new() };
 
-        // 设置输出格式 - 使用 BGRA 因为转换到 RGB 最简单。
+        // Keep native output untouched. RGB output asks Core Video for NV12 so
+        // camera-rs can use its direct two-row SIMD conversion instead of paying
+        // for AVFoundation YUV->BGRA followed by another BGRA->RGB pass.
         // 分辨率由 activeFormat 控制，避免向 setVideoSettings 传入容易触发
         // NSInvalidArgumentException 的 width/height 约束。
         unsafe {
@@ -183,14 +189,14 @@ impl CaptureSession {
             let dict = if frame_buffer.wants_native() {
                 NSDictionary::new()
             } else {
-                bgra_video_settings()
+                nv12_video_settings()
             };
             output.setVideoSettings(Some(&dict));
         }
 
         // 设置丢帧策略
         unsafe {
-            output.setAlwaysDiscardsLateVideoFrames(true);
+            output.setAlwaysDiscardsLateVideoFrames(discard_late_frames);
         }
 
         // 添加输出到会话
@@ -512,8 +518,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn bgra_video_settings_uses_core_video_pixel_format_key_only() {
-        let settings = bgra_video_settings();
+    fn nv12_video_settings_uses_core_video_pixel_format_key_only() {
+        let settings = nv12_video_settings();
         let format_key = cv_pixel_buffer_pixel_format_type_key();
         let width_key = NSString::from_str("Width");
         let height_key = NSString::from_str("Height");

@@ -9,16 +9,24 @@ use crate::types::{
     CameraConfig, CameraControlRange, CameraControlType, CameraControlValue, CameraDeviceInfo,
     CameraResult, VideoFormat,
 };
+#[cfg(feature = "convert-rgb")]
 use crate::utils::color_convert::ColorConverter;
 use parking_lot::Mutex;
 use std::ffi::c_void;
+#[cfg(feature = "decode-mjpeg")]
+use std::sync::mpsc;
 use std::sync::Arc;
+#[cfg(feature = "decode-mjpeg")]
+use std::thread::JoinHandle;
 use std::time::Duration;
+#[cfg(feature = "decode-mjpeg")]
 use turbojpeg::{Decompressor, Image, PixelFormat};
 
 struct CaptureState {
     hub: crate::FrameHub,
+    #[cfg(feature = "decode-mjpeg")]
     decoder: Mutex<Option<Decompressor>>,
+    #[cfg(feature = "convert-rgb")]
     converter: ColorConverter,
 }
 
@@ -27,6 +35,22 @@ struct CaptureState {
 struct CallbackContext {
     state: Arc<CaptureState>,
     session: u64,
+    #[cfg(feature = "decode-mjpeg")]
+    mjpeg: Option<MjpegDispatch>,
+}
+
+#[cfg(feature = "decode-mjpeg")]
+struct MjpegDispatch {
+    sender: mpsc::SyncSender<MjpegJob>,
+    buffers: Arc<Mutex<Vec<Vec<u8>>>>,
+}
+
+#[cfg(feature = "decode-mjpeg")]
+struct MjpegJob {
+    data: Vec<u8>,
+    width: u32,
+    height: u32,
+    sequence: u64,
 }
 
 pub struct UvcCamera {
@@ -38,6 +62,8 @@ pub struct UvcCamera {
     current_config: Mutex<Option<CameraConfig>>,
     capture: Arc<CaptureState>,
     callback: Mutex<Option<Box<CallbackContext>>>,
+    #[cfg(feature = "decode-mjpeg")]
+    mjpeg_worker: Mutex<Option<JoinHandle<()>>>,
     lifecycle: Mutex<()>,
 }
 
@@ -63,10 +89,14 @@ impl UvcCamera {
             current_config: Mutex::new(None),
             capture: Arc::new(CaptureState {
                 hub,
+                #[cfg(feature = "decode-mjpeg")]
                 decoder: Mutex::new(None),
+                #[cfg(feature = "convert-rgb")]
                 converter: ColorConverter::new(),
             }),
             callback: Mutex::new(None),
+            #[cfg(feature = "decode-mjpeg")]
+            mjpeg_worker: Mutex::new(None),
             lifecycle: Mutex::new(()),
         })
     }
@@ -199,8 +229,78 @@ impl UvcCamera {
         }
         // libuvc synchronously cancels transfers and joins its callback thread.
         self.callback.lock().take();
+        #[cfg(feature = "decode-mjpeg")]
+        if let Some(worker) = self.mjpeg_worker.lock().take() {
+            if worker.join().is_err() {
+                log::warn!("UVC MJPEG worker panicked while stopping");
+            }
+        }
         *self.stream_ctrl.lock() = None;
-        *self.capture.decoder.lock() = None;
+        #[cfg(feature = "decode-mjpeg")]
+        {
+            *self.capture.decoder.lock() = None;
+        }
+    }
+
+    #[cfg(feature = "decode-mjpeg")]
+    fn start_mjpeg_worker(
+        state: Arc<CaptureState>,
+        session: u64,
+    ) -> CameraResult<(MjpegDispatch, JoinHandle<()>)> {
+        let (sender, receiver) = mpsc::sync_channel::<MjpegJob>(1);
+        let buffers = Arc::new(Mutex::new(vec![Vec::new(), Vec::new()]));
+        let worker_buffers = buffers.clone();
+        let worker = std::thread::Builder::new()
+            .name("camera-uvc-mjpeg".into())
+            .spawn(move || {
+                let mut decoder = match Decompressor::new() {
+                    Ok(decoder) => decoder,
+                    Err(error) => {
+                        log::error!("Cannot create UVC MJPEG decoder: {error}");
+                        return;
+                    }
+                };
+                while let Ok(mut job) = receiver.recv() {
+                    let result = state.hub.publish_rgb_metadata(
+                        session,
+                        job.width,
+                        job.height,
+                        None,
+                        Some(job.sequence),
+                        |rgb| {
+                            let header = decoder
+                                .read_header(&job.data)
+                                .map_err(|error| CameraError::InvalidFormat(error.to_string()))?;
+                            if header.width != job.width as usize
+                                || header.height != job.height as usize
+                            {
+                                return Err(CameraError::InvalidFormat(
+                                    "MJPEG dimensions differ from negotiated frame".into(),
+                                ));
+                            }
+                            decoder
+                                .decompress(
+                                    &job.data,
+                                    Image {
+                                        pixels: rgb,
+                                        width: header.width,
+                                        height: header.height,
+                                        pitch: header.width * 3,
+                                        format: PixelFormat::RGB,
+                                    },
+                                )
+                                .map_err(|error| CameraError::InvalidFormat(error.to_string()))
+                        },
+                    );
+                    if let Err(error) = result {
+                        log::debug!("Skipping deferred UVC MJPEG frame: {error}");
+                    }
+                    job.data.clear();
+                    worker_buffers.lock().push(job.data);
+                }
+            })
+            .map_err(|error| CameraError::Other(format!("Start UVC MJPEG worker: {error}")))?;
+        Ok((MjpegDispatch { sender, buffers }, worker))
     }
 
     extern "C" fn frame_callback(frame: *mut ffi::UvcFrame, user_ptr: *mut c_void) {
@@ -254,126 +354,194 @@ impl UvcCamera {
                     &[data],
                 );
             }
-            context.state.hub.publish_rgb_metadata(
-                context.session,
-                frame.width,
-                frame.height,
-                None,
-                Some(frame.sequence as u64),
-                |rgb| match frame.frame_format {
-                    ffi::UvcFrameFormat::Mjpeg => {
-                        let mut guard = context.state.decoder.lock();
-                        if guard.is_none() {
-                            *guard = Some(
-                                Decompressor::new()
-                                    .map_err(|e| CameraError::Other(e.to_string()))?,
-                            );
-                        }
-                        let decoder = guard.as_mut().unwrap();
-                        let header = decoder
-                            .read_header(data)
-                            .map_err(|e| CameraError::InvalidFormat(e.to_string()))?;
-                        if header.width != frame.width as usize
-                            || header.height != frame.height as usize
-                        {
-                            return Err(CameraError::InvalidFormat(
-                                "MJPEG dimensions differ from negotiated frame".into(),
-                            ));
-                        }
-                        decoder
-                            .decompress(
-                                data,
-                                Image {
-                                    pixels: rgb,
-                                    width: header.width,
-                                    height: header.height,
-                                    pitch: header.width * 3,
-                                    format: PixelFormat::RGB,
-                                },
-                            )
-                            .map_err(|e| CameraError::InvalidFormat(e.to_string()))
-                    }
-                    ffi::UvcFrameFormat::Yuyv | ffi::UvcFrameFormat::Uyvy => {
-                        let width = frame.width as usize;
-                        let packed = width.checked_mul(2).ok_or_else(|| {
-                            CameraError::InvalidFormat("UVC row size overflow".into())
-                        })?;
-                        let stride = if frame.step == 0 { packed } else { frame.step };
-                        if stride < packed {
-                            return Err(CameraError::InvalidFormat(
-                                "UVC row stride is too short".into(),
-                            ));
-                        }
-                        for (y, row) in rgb.chunks_exact_mut(width * 3).enumerate() {
-                            let offset = y.checked_mul(stride).ok_or_else(|| {
-                                CameraError::InvalidFormat("UVC stride overflow".into())
-                            })?;
-                            let src = data.get(offset..offset.saturating_add(packed)).ok_or_else(
-                                || CameraError::InvalidFormat("Truncated UVC row".into()),
-                            )?;
-                            if frame.frame_format == ffi::UvcFrameFormat::Yuyv {
-                                context.state.converter.yuyv_to_rgb_into(
-                                    src,
-                                    frame.width,
-                                    1,
-                                    row,
-                                )?;
-                            } else {
-                                context.state.converter.uyvy_to_rgb_into(
-                                    src,
-                                    frame.width,
-                                    1,
-                                    row,
-                                )?;
-                            }
-                        }
-                        Ok(())
-                    }
-                    ffi::UvcFrameFormat::Rgb
-                    | ffi::UvcFrameFormat::Bgr
-                    | ffi::UvcFrameFormat::Gray8 => {
-                        let channels = if frame.frame_format == ffi::UvcFrameFormat::Gray8 {
-                            1
-                        } else {
-                            3
+            #[cfg(not(feature = "convert-rgb"))]
+            return Err(CameraError::UnsupportedFormat(
+                "RGB delivery requires the convert-rgb feature".into(),
+            ));
+            #[cfg(feature = "convert-rgb")]
+            {
+                #[cfg(feature = "decode-mjpeg")]
+                if frame.frame_format == ffi::UvcFrameFormat::Mjpeg {
+                    if let Some(dispatch) = &context.mjpeg {
+                        let Some(mut buffer) = dispatch.buffers.lock().pop() else {
+                            context.state.hub.record_input_drop(context.session);
+                            return Ok(false);
                         };
-                        let packed = frame.width as usize * channels;
-                        let stride = if frame.step == 0 { packed } else { frame.step };
-                        if stride < packed {
-                            return Err(CameraError::InvalidFormat("UVC stride too short".into()));
-                        }
-                        for (y, row) in rgb.chunks_exact_mut(frame.width as usize * 3).enumerate() {
-                            let offset = y.checked_mul(stride).ok_or_else(|| {
-                                CameraError::InvalidFormat("UVC row overflow".into())
-                            })?;
-                            let src = data.get(offset..offset.saturating_add(packed)).ok_or_else(
-                                || CameraError::InvalidFormat("Truncated UVC row".into()),
-                            )?;
-                            if channels == 1 {
-                                for (out, &gray) in row.as_chunks_mut::<3>().0.iter_mut().zip(src) {
-                                    out.fill(gray);
+                        buffer.clear();
+                        buffer.extend_from_slice(data);
+                        let job = MjpegJob {
+                            data: buffer,
+                            width: frame.width,
+                            height: frame.height,
+                            sequence: frame.sequence as u64,
+                        };
+                        return match dispatch.sender.try_send(job) {
+                            Ok(()) => Ok(true),
+                            Err(mpsc::TrySendError::Full(job)) => {
+                                dispatch.buffers.lock().push(job.data);
+                                context.state.hub.record_input_drop(context.session);
+                                Ok(false)
+                            }
+                            Err(mpsc::TrySendError::Disconnected(job)) => {
+                                dispatch.buffers.lock().push(job.data);
+                                Err(CameraError::StreamStopped)
+                            }
+                        };
+                    }
+                }
+                context.state.hub.publish_rgb_metadata(
+                    context.session,
+                    frame.width,
+                    frame.height,
+                    None,
+                    Some(frame.sequence as u64),
+                    |rgb| match frame.frame_format {
+                        ffi::UvcFrameFormat::Mjpeg => {
+                            #[cfg(not(feature = "decode-mjpeg"))]
+                            return Err(CameraError::UnsupportedFormat(
+                                "MJPEG decoding requires the decode-mjpeg feature".into(),
+                            ));
+                            #[cfg(feature = "decode-mjpeg")]
+                            {
+                                let mut guard = context.state.decoder.lock();
+                                if guard.is_none() {
+                                    *guard = Some(
+                                        Decompressor::new()
+                                            .map_err(|e| CameraError::Other(e.to_string()))?,
+                                    );
                                 }
-                            } else if frame.frame_format == ffi::UvcFrameFormat::Rgb {
-                                row.copy_from_slice(src);
-                            } else {
-                                for (out, input) in row
-                                    .as_chunks_mut::<3>()
-                                    .0
-                                    .iter_mut()
-                                    .zip(src.as_chunks::<3>().0.iter())
+                                let decoder = guard.as_mut().unwrap();
+                                let header = decoder
+                                    .read_header(data)
+                                    .map_err(|e| CameraError::InvalidFormat(e.to_string()))?;
+                                if header.width != frame.width as usize
+                                    || header.height != frame.height as usize
                                 {
-                                    out.copy_from_slice(&[input[2], input[1], input[0]]);
+                                    return Err(CameraError::InvalidFormat(
+                                        "MJPEG dimensions differ from negotiated frame".into(),
+                                    ));
                                 }
+                                decoder
+                                    .decompress(
+                                        data,
+                                        Image {
+                                            pixels: rgb,
+                                            width: header.width,
+                                            height: header.height,
+                                            pitch: header.width * 3,
+                                            format: PixelFormat::RGB,
+                                        },
+                                    )
+                                    .map_err(|e| CameraError::InvalidFormat(e.to_string()))
                             }
                         }
-                        Ok(())
-                    }
-                    _ => Err(CameraError::UnsupportedFormat(format!(
-                        "{:?}",
-                        frame.frame_format
-                    ))),
-                },
-            )
+                        ffi::UvcFrameFormat::Yuyv | ffi::UvcFrameFormat::Uyvy => {
+                            let width = frame.width as usize;
+                            let packed = width.checked_mul(2).ok_or_else(|| {
+                                CameraError::InvalidFormat("UVC row size overflow".into())
+                            })?;
+                            let stride = if frame.step == 0 { packed } else { frame.step };
+                            if stride < packed {
+                                return Err(CameraError::InvalidFormat(
+                                    "UVC row stride is too short".into(),
+                                ));
+                            }
+                            if stride == packed {
+                                return if frame.frame_format == ffi::UvcFrameFormat::Yuyv {
+                                    context.state.converter.yuyv_to_rgb_into(
+                                        data,
+                                        frame.width,
+                                        frame.height,
+                                        rgb,
+                                    )
+                                } else {
+                                    context.state.converter.uyvy_to_rgb_into(
+                                        data,
+                                        frame.width,
+                                        frame.height,
+                                        rgb,
+                                    )
+                                };
+                            }
+                            for (y, row) in rgb.chunks_exact_mut(width * 3).enumerate() {
+                                let offset = y.checked_mul(stride).ok_or_else(|| {
+                                    CameraError::InvalidFormat("UVC stride overflow".into())
+                                })?;
+                                let src =
+                                    data.get(offset..offset.saturating_add(packed)).ok_or_else(
+                                        || CameraError::InvalidFormat("Truncated UVC row".into()),
+                                    )?;
+                                if frame.frame_format == ffi::UvcFrameFormat::Yuyv {
+                                    context.state.converter.yuyv_to_rgb_into(
+                                        src,
+                                        frame.width,
+                                        1,
+                                        row,
+                                    )?;
+                                } else {
+                                    context.state.converter.uyvy_to_rgb_into(
+                                        src,
+                                        frame.width,
+                                        1,
+                                        row,
+                                    )?;
+                                }
+                            }
+                            Ok(())
+                        }
+                        ffi::UvcFrameFormat::Rgb
+                        | ffi::UvcFrameFormat::Bgr
+                        | ffi::UvcFrameFormat::Gray8 => {
+                            let channels = if frame.frame_format == ffi::UvcFrameFormat::Gray8 {
+                                1
+                            } else {
+                                3
+                            };
+                            let packed = frame.width as usize * channels;
+                            let stride = if frame.step == 0 { packed } else { frame.step };
+                            if stride < packed {
+                                return Err(CameraError::InvalidFormat(
+                                    "UVC stride too short".into(),
+                                ));
+                            }
+                            for (y, row) in
+                                rgb.chunks_exact_mut(frame.width as usize * 3).enumerate()
+                            {
+                                let offset = y.checked_mul(stride).ok_or_else(|| {
+                                    CameraError::InvalidFormat("UVC row overflow".into())
+                                })?;
+                                let src =
+                                    data.get(offset..offset.saturating_add(packed)).ok_or_else(
+                                        || CameraError::InvalidFormat("Truncated UVC row".into()),
+                                    )?;
+                                if channels == 1 {
+                                    for (out, &gray) in
+                                        row.as_chunks_mut::<3>().0.iter_mut().zip(src)
+                                    {
+                                        out.fill(gray);
+                                    }
+                                } else if frame.frame_format == ffi::UvcFrameFormat::Rgb {
+                                    row.copy_from_slice(src);
+                                } else {
+                                    for (out, input) in row
+                                        .as_chunks_mut::<3>()
+                                        .0
+                                        .iter_mut()
+                                        .zip(src.as_chunks::<3>().0.iter())
+                                    {
+                                        out.copy_from_slice(&[input[2], input[1], input[0]]);
+                                    }
+                                }
+                            }
+                            Ok(())
+                        }
+                        _ => Err(CameraError::UnsupportedFormat(format!(
+                            "{:?}",
+                            frame.frame_format
+                        ))),
+                    },
+                )
+            }
         }));
         match result {
             Ok(Err(error)) => log::warn!("UVC frame rejected: {}", error),
@@ -382,7 +550,8 @@ impl UvcCamera {
         }
     }
 
-    /// 使用 turbojpeg 解码 MJPEG（兼容旧 API）
+    /// Decode MJPEG for the optional legacy pixel adapter.
+    #[cfg(feature = "decode-mjpeg")]
     #[allow(dead_code)]
     fn decode_mjpeg(jpeg_data: &[u8], width: u32, height: u32) -> Result<Vec<u8>> {
         let mut decompressor = Decompressor::new().map_err(|e| {
@@ -423,6 +592,7 @@ impl UvcCamera {
     }
 
     /// YUYV 转 RGB（兼容旧 API）
+    #[cfg(feature = "convert-rgb")]
     #[allow(dead_code)]
     fn yuyv_to_rgb(yuyv_data: &[u8], width: u32, height: u32) -> Result<Vec<u8>> {
         // 使用优化的颜色转换器
@@ -430,6 +600,7 @@ impl UvcCamera {
     }
 
     /// UYVY 转 RGB（兼容旧 API）
+    #[cfg(feature = "convert-rgb")]
     #[allow(dead_code)]
     fn uyvy_to_rgb(uyvy_data: &[u8], width: u32, height: u32) -> Result<Vec<u8>> {
         // 使用优化的颜色转换器
@@ -818,9 +989,25 @@ impl UvcCamera {
         config = config.with_frame_rate(crate::FrameRate::new(10_000_000, ctrl.frame_interval())?);
 
         let session = self.capture.hub.start();
+        #[cfg(not(feature = "decode-mjpeg"))]
+        if config.format == VideoFormat::MJPEG && !self.capture.hub.wants_native() {
+            return Err(CameraError::UnsupportedFormat(
+                "MJPEG decoding requires the decode-mjpeg feature".into(),
+            ));
+        }
+        #[cfg(feature = "decode-mjpeg")]
+        let (mjpeg, mjpeg_worker) =
+            if config.format == VideoFormat::MJPEG && !self.capture.hub.wants_native() {
+                let (dispatch, worker) = Self::start_mjpeg_worker(self.capture.clone(), session)?;
+                (Some(dispatch), Some(worker))
+            } else {
+                (None, None)
+            };
         let mut context = Box::new(CallbackContext {
             state: self.capture.clone(),
             session,
+            #[cfg(feature = "decode-mjpeg")]
+            mjpeg,
         });
         let user_ptr = context.as_mut() as *mut CallbackContext as *mut c_void;
         if let Err(error) =
@@ -828,9 +1015,18 @@ impl UvcCamera {
         {
             self.capture.hub.stop();
             devh.stop_streaming();
+            drop(context);
+            #[cfg(feature = "decode-mjpeg")]
+            if let Some(worker) = mjpeg_worker {
+                let _ = worker.join();
+            }
             return Err(error);
         }
         *self.callback.lock() = Some(context);
+        #[cfg(feature = "decode-mjpeg")]
+        {
+            *self.mjpeg_worker.lock() = mjpeg_worker;
+        }
         *self.stream_ctrl.lock() = Some(ctrl);
 
         log::info!(
@@ -1395,9 +1591,47 @@ mod tests {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "decode-mjpeg"))]
 mod capture_contract_tests {
     use super::*;
+
+    #[test]
+    fn mjpeg_worker_publishes_after_the_callback_queue_releases_its_buffer() {
+        let camera = UvcCamera::new(0).unwrap();
+        let session = camera.capture.hub.start();
+        let pixels = vec![128u8; 16 * 16 * 3];
+        let jpeg = turbojpeg::compress(
+            turbojpeg::Image {
+                pixels: pixels.as_slice(),
+                width: 16,
+                height: 16,
+                pitch: 16 * 3,
+                format: turbojpeg::PixelFormat::RGB,
+            },
+            90,
+            turbojpeg::Subsamp::None,
+        )
+        .unwrap();
+        let (dispatch, worker) =
+            UvcCamera::start_mjpeg_worker(camera.capture.clone(), session).unwrap();
+        dispatch
+            .sender
+            .send(MjpegJob {
+                data: jpeg.to_vec(),
+                width: 16,
+                height: 16,
+                sequence: 7,
+            })
+            .unwrap();
+        drop(dispatch);
+        worker.join().unwrap();
+
+        let frame = camera.capture.hub.latest().unwrap();
+        assert_eq!(frame.key.session, session);
+        assert_eq!(frame.source_sequence, Some(7));
+        assert_eq!(frame.bytes().len(), 16 * 16 * 3);
+    }
+
     #[test]
     fn callback_owns_capture_state_without_retaining_the_camera() {
         let camera = Arc::new(UvcCamera::new(0).unwrap());
@@ -1407,6 +1641,7 @@ mod capture_contract_tests {
         *camera.callback.lock() = Some(Box::new(CallbackContext {
             state: camera.capture.clone(),
             session,
+            mjpeg: None,
         }));
         drop(camera);
         assert!(weak.upgrade().is_none());
@@ -1419,6 +1654,7 @@ mod capture_contract_tests {
         let mut context = Box::new(CallbackContext {
             state: camera.capture.clone(),
             session,
+            mjpeg: None,
         });
         let pointer = context.as_mut() as *mut CallbackContext as *mut c_void;
         let mut bytes = [10u8, 128, 20, 128, 255, 255, 255, 255, 30, 128, 40, 128];

@@ -1,5 +1,5 @@
 use super::{
-    convert::{from_fourcc, to_fourcc, Converter},
+    convert::{from_fourcc, to_fourcc, Converter, Plane},
     native,
 };
 use crate::pixels::Pixels as Array3;
@@ -189,7 +189,10 @@ impl Inner {
                     return Ok(());
                 }
                 let mut last_frame = Instant::now();
+                let native_output = hub.wants_native();
+                let mut compressed_scratch = Vec::new();
                 loop {
+                    let mut deferred_mjpeg = None;
                     let result = stream.next(
                         cancel.as_raw_fd(),
                         format.strides,
@@ -198,15 +201,27 @@ impl Inner {
                                 nanoseconds: timestamp,
                                 clock,
                             });
-                            let converted = if hub.wants_native() && !damaged {
+                            if !native_output && actual.format == VideoFormat::MJPEG && !damaged {
+                                let Some(plane) = planes.first() else {
+                                    return Err(CameraError::BufferEmpty);
+                                };
+                                compressed_scratch.clear();
+                                compressed_scratch.extend_from_slice(plane.data);
+                                deferred_mjpeg = Some((timestamp, source_sequence, plane.stride));
+                                return Ok(());
+                            }
+                            let converted = if native_output && !damaged {
                                 native_layout(&actual, &format, planes).and_then(|layout| {
-                                    let parts: Vec<_> = planes.iter().map(|p| p.data).collect();
+                                    let parts = [
+                                        planes[0].data,
+                                        planes.get(1).map_or(&[][..], |plane| plane.data),
+                                    ];
                                     hub.publish_native(
                                         session,
                                         layout,
                                         timestamp,
                                         Some(source_sequence),
-                                        &parts,
+                                        &parts[..planes.len()],
                                     )
                                 })
                             } else {
@@ -232,6 +247,24 @@ impl Inner {
                             Ok(())
                         },
                     );
+                    if result.is_ok() {
+                        if let Some((timestamp, source_sequence, stride)) = deferred_mjpeg.take() {
+                            let plane = [Plane {
+                                data: &compressed_scratch,
+                                stride,
+                            }];
+                            if let Err(error) = hub.publish_rgb_metadata(
+                                session,
+                                actual.width,
+                                actual.height,
+                                timestamp,
+                                Some(source_sequence),
+                                |rgb| decoder.convert(&actual, &plane, rgb),
+                            ) {
+                                log::debug!("Skipping deferred V4L2 MJPEG frame: {error}");
+                            }
+                        }
+                    }
                     match result {
                         Ok(()) => last_frame = Instant::now(),
                         Err(CameraError::Io(error))

@@ -1,8 +1,8 @@
 [package]
 name = "camera"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2021"
-description = "Cross-platform camera capture with owned sessions and shared native frames"
+description = "Intent-driven cross-platform camera capture with bounded native frames"
 rust-version = "1.88"
 license = "MIT OR Apache-2.0"
 readme = "README.md"
@@ -20,16 +20,14 @@ log = "0.4"
 parking_lot = "0.12"
 
 # 异步支持
-tokio = { version = "1.0", features = ["sync", "time", "rt", "macros"] }
+tokio = { version = "1.0", features = ["sync", "time", "rt", "macros"], optional = true }
 
 # 数据处理
 ndarray = { version = "0.16", optional = true }
+serde = { version = "1", optional = true, features = ["derive"] }
 
 # JPEG 解码，用于 UVC/Media Foundation/V4L2 的 MJPEG 路径。
-# SIMD is opportunistic: turbojpeg's default `require-simd` feature makes
-# Windows builds fail outright when NASM is unavailable instead of using its
-# supported scalar fallback.
-turbojpeg = { version = "1.3", optional = true, default-features = false, features = ["cmake"] }
+turbojpeg = { version = "1.3", optional = true }
 
 # Optional GUI example dependencies
 eframe = { version = "0.29", optional = true }
@@ -131,20 +129,25 @@ harness = false
 crate-type = ["lib"]
 
 [features]
-ndarray = ["dep:ndarray"]
-viewer = ["dep:eframe", "dep:egui"]
-# Platform-native capture by default; UVC is opt-in.
-default = ["native"]
-native = ["turbojpeg", "apple", "windows-native"]
-jpeg = ["turbojpeg"]
+ndarray = ["runtime-tokio", "dep:ndarray"]
+viewer = ["runtime-tokio", "convert-rgb", "dep:eframe", "dep:egui"]
+# Convenience bundle. Features decide what is compiled; BackendPolicy decides runtime behavior.
+default = ["native", "runtime-tokio", "convert-rgb", "decode-mjpeg"]
+native = ["backend-v4l2", "backend-avfoundation", "backend-camera2", "backend-mf"]
+runtime-tokio = ["dep:tokio"]
+blocking = ["runtime-tokio", "tokio/rt-multi-thread"]
+convert-rgb = []
+decode-mjpeg = ["dep:turbojpeg", "convert-rgb"]
+serde = ["dep:serde"]
 
 # 后端选择
-backend-uvc = ["turbojpeg"] # UVC (libuvc) - 跨平台 USB 摄像头
-backend-v4l2 = ["turbojpeg"] # Linux 内核 V4L2 (MMAP，无需 libuvc)
-backend-avfoundation = ["apple"] # AVFoundation - macOS/iOS
-backend-camera2 = []      # Camera2 - Android (NDK, no JNI required)
+backend-uvc = ["runtime-tokio"] # UVC (libuvc) - 跨平台 USB 摄像头
+backend-v4l2 = ["runtime-tokio"] # Linux 内核 V4L2 (MMAP，无需 libuvc)
+backend-avfoundation = ["runtime-tokio", "apple"] # AVFoundation - macOS/iOS
+backend-camera2 = ["runtime-tokio"]      # Camera2 - Android (NDK, no JNI required)
 native-debug-logs = []    # Verbose libusb diagnostics; keep disabled for capture benchmarks.
-backend-mf = ["turbojpeg", "windows-native"] # Media Foundation - Windows
+benchmark-internals = ["runtime-tokio", "convert-rgb"]  # Exposes the frame publisher only to the repository benchmark.
+backend-mf = ["runtime-tokio", "windows-native"] # Media Foundation - Windows
 
 apple = ["dep:objc2", "dep:objc2-foundation", "dep:objc2-av-foundation", "dep:objc2-core-media", "dep:objc2-core-video", "dep:block2", "dep:dispatch2"]
 windows-native = ["dep:windows", "dep:windows-core", "dep:once_cell"]

@@ -39,6 +39,26 @@ async fn metadata_and_pixels_are_one_snapshot_and_next_does_not_repeat() {
 }
 
 #[tokio::test]
+async fn wait_after_none_waits_for_a_frame_newer_than_the_current_snapshot() {
+    let hub = Arc::new(FrameHub::new(3));
+    let epoch = hub.start();
+    assert!(publish(&hub, epoch, 7));
+
+    assert!(matches!(
+        hub.wait_after(None, Duration::from_millis(2)).await,
+        Err(crate::CameraError::Timeout { .. })
+    ));
+
+    let waiter = {
+        let hub = hub.clone();
+        tokio::spawn(async move { hub.wait_after(None, Duration::from_secs(1)).await })
+    };
+    tokio::task::yield_now().await;
+    assert!(publish(&hub, epoch, 8));
+    assert_eq!(waiter.await.unwrap().unwrap().bytes()[0], 8);
+}
+
+#[tokio::test]
 async fn restart_rejects_late_callbacks_and_stop_wakes_waiters() {
     let hub = Arc::new(FrameHub::new(3));
     let old = hub.start();
@@ -127,16 +147,15 @@ async fn delivery_policies_bound_each_queue_and_report_drops() {
         ),
     ] {
         let hub = FrameHub::new(6);
-        hub.configure(
-            &StreamRequest::builder()
-                .resolution(2, 2)
-                .delivery(delivery)
-                .build()
-                .unwrap(),
-        )
-        .unwrap();
+        hub.configure(&StreamRequest::builder().resolution(2, 2).build().unwrap())
+            .unwrap();
         let epoch = hub.start();
-        let mut receiver = hub.subscribe();
+        let mut receiver = hub
+            .subscribe_with(crate::SubscriptionOptions {
+                delivery,
+                max_rate: None,
+            })
+            .unwrap();
         for value in 1..=4 {
             assert!(publish(&hub, epoch, value));
         }
@@ -146,7 +165,7 @@ async fn delivery_policies_bound_each_queue_and_report_drops() {
         }
         assert!(matches!(
             receiver.next_timeout(Duration::from_millis(1)).await,
-            Err(crate::CameraError::Timeout)
+            Err(crate::CameraError::Timeout { .. })
         ));
         assert!(publish(&hub, epoch, 5));
         assert_eq!(receiver.next().await.unwrap().bytes()[0], 5);

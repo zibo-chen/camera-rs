@@ -81,10 +81,14 @@ pub async fn request_authorization() -> bool {
 #[allow(deprecated)]
 fn get_device_types() -> Vec<&'static AVCaptureDeviceType> {
     unsafe {
-        let mut types = vec![AVCaptureDeviceTypeBuiltInWideAngleCamera];
-
         #[cfg(target_os = "macos")]
-        types.push(AVCaptureDeviceTypeExternalUnknown);
+        let types = vec![
+            AVCaptureDeviceTypeBuiltInWideAngleCamera,
+            AVCaptureDeviceTypeExternalUnknown,
+        ];
+
+        #[cfg(target_os = "ios")]
+        let types = vec![AVCaptureDeviceTypeBuiltInWideAngleCamera];
 
         types
     }
@@ -322,14 +326,13 @@ pub(crate) fn fourcc_to_format(fourcc: u32) -> Option<VideoFormat> {
 
 fn cross_format_fallback_priority(format: VideoFormat) -> i32 {
     match format {
-        // Keep formats implemented by CaptureDelegate ahead of NV12. NV12 is
-        // enumerated by many macOS cameras, but the current frame converter
-        // cannot decode it into RGB yet.
+        // NV12 is camera-rs' cheapest Apple RGB path: AVFoundation can deliver
+        // it directly and the delegate converts it with the two-row SIMD kernel.
+        VideoFormat::NV12 => 110,
         VideoFormat::RGB => 100,
         VideoFormat::YUYV => 90,
         VideoFormat::UYVY => 80,
         VideoFormat::MJPEG => 70,
-        VideoFormat::NV12 => 10,
         _ => 0,
     }
 }
@@ -620,22 +623,22 @@ mod tests {
     }
 
     #[test]
-    fn cross_format_fallback_prefers_decodeable_formats_before_nv12() {
+    fn cross_format_fallback_prefers_directly_convertible_nv12() {
         assert!(
-            cross_format_fallback_priority(VideoFormat::RGB)
-                > cross_format_fallback_priority(VideoFormat::NV12)
+            cross_format_fallback_priority(VideoFormat::NV12)
+                > cross_format_fallback_priority(VideoFormat::RGB)
         );
         assert!(
-            cross_format_fallback_priority(VideoFormat::YUYV)
-                > cross_format_fallback_priority(VideoFormat::NV12)
+            cross_format_fallback_priority(VideoFormat::NV12)
+                > cross_format_fallback_priority(VideoFormat::YUYV)
         );
         assert!(
-            cross_format_fallback_priority(VideoFormat::UYVY)
-                > cross_format_fallback_priority(VideoFormat::NV12)
+            cross_format_fallback_priority(VideoFormat::NV12)
+                > cross_format_fallback_priority(VideoFormat::UYVY)
         );
         assert!(
-            cross_format_fallback_priority(VideoFormat::MJPEG)
-                > cross_format_fallback_priority(VideoFormat::NV12)
+            cross_format_fallback_priority(VideoFormat::NV12)
+                > cross_format_fallback_priority(VideoFormat::MJPEG)
         );
     }
 

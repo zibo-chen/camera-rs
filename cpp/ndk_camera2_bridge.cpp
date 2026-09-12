@@ -23,9 +23,6 @@
 #define LOGW(...) __android_log_print(ANDROID_LOG_WARN,  LOG_TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
 
-// Maximum number of images in AImageReader queue
-static constexpr int MAX_IMAGE_BUFFER_COUNT = 4;
-
 // ============================================================================
 // Internal camera device info
 // ============================================================================
@@ -75,6 +72,8 @@ struct NdkCamera2 {
     NdkCameraConfig current_config = {};
     int32_t active_device_index = -1;
     int32_t output_image_format = AIMAGE_FORMAT_YUV_420_888;
+    int32_t max_image_count = 4;
+    ACameraDevice_request_template request_template = TEMPLATE_PREVIEW;
 
     // Cached configs per device
     std::vector<OutputConfig> cached_configs;
@@ -228,7 +227,7 @@ struct NdkCamera2 {
         media_status_t mstatus = AImageReader_new(
             config->width, config->height,
             requested_format,
-            MAX_IMAGE_BUFFER_COUNT,
+            max_image_count,
             &image_reader);
 
         if ((mstatus != AMEDIA_OK || !image_reader)
@@ -240,7 +239,7 @@ struct NdkCamera2 {
                 config->width,
                 config->height,
                 requested_format,
-                MAX_IMAGE_BUFFER_COUNT,
+                max_image_count,
                 &image_reader);
         }
 
@@ -293,8 +292,7 @@ struct NdkCamera2 {
         // Create output target
         ACameraOutputTarget_create(image_window, &output_target);
 
-        // Create capture request with TEMPLATE_PREVIEW for best frame rate
-        ACameraDevice_createCaptureRequest(camera_device, TEMPLATE_PREVIEW, &capture_request);
+        ACameraDevice_createCaptureRequest(camera_device, request_template, &capture_request);
         ACaptureRequest_addTarget(capture_request, output_target);
 
         // A target range must be one of the advertised pairs (many USB HALs
@@ -601,6 +599,19 @@ NdkCamera2* ndk_camera2_create(void) {
 
 void ndk_camera2_destroy(NdkCamera2 *cam) {
     delete cam;
+}
+
+NdkCameraStatus ndk_camera2_set_options(NdkCamera2 *cam, int32_t max_images,
+                                         int32_t request_template) {
+    const bool known_template = request_template == TEMPLATE_PREVIEW ||
+        request_template == TEMPLATE_STILL_CAPTURE || request_template == TEMPLATE_RECORD;
+    if (!cam || cam->streaming.load() || max_images < 2 || max_images > 16 ||
+        !known_template) {
+        return NDK_CAMERA_ERROR_INVALID_PARAM;
+    }
+    cam->max_image_count = max_images;
+    cam->request_template = static_cast<ACameraDevice_request_template>(request_template);
+    return NDK_CAMERA_OK;
 }
 
 NdkCameraStatus ndk_camera2_get_device_count(NdkCamera2 *cam, int32_t *out_count) {

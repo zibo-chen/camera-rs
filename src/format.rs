@@ -1,7 +1,8 @@
 //! Capture requests, negotiated formats, and frame memory contracts.
-use crate::{CameraConfig, CameraError, CameraResult, VideoFormat};
+use crate::{CameraError, CameraResult, VideoFormat};
 use std::time::Duration;
 
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct FrameRate {
     numerator: u32,
@@ -69,11 +70,13 @@ pub enum SelectionPolicy {
     Exact,
     Closest,
 }
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum OverflowPolicy {
     DropOldest,
     DropNewest,
 }
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DeliveryPolicy {
     Latest,
@@ -82,6 +85,7 @@ pub enum DeliveryPolicy {
         overflow: OverflowPolicy,
     },
 }
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct MemoryBudget {
     pub buffers: usize,
@@ -113,12 +117,12 @@ pub struct StreamRequest {
     pub(crate) format: Option<VideoFormat>,
     pub(crate) output: OutputFormat,
     pub(crate) selection: SelectionPolicy,
-    pub(crate) delivery: DeliveryPolicy,
     pub(crate) memory: MemoryBudget,
     pub(crate) startup_timeout: Duration,
     pub(crate) driver_buffers: Option<usize>,
     pub(crate) reconnect: Option<ReconnectPolicy>,
 }
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[derive(Clone, Debug)]
 pub struct ReconnectPolicy {
     pub max_attempts: Option<u32>,
@@ -143,23 +147,13 @@ impl StreamRequest {
             height: 480,
             fps: FrameRate::default(),
             format: None,
-            output: OutputFormat::Rgb8,
+            output: OutputFormat::Native,
             selection: SelectionPolicy::Closest,
-            delivery: DeliveryPolicy::Latest,
             memory: MemoryBudget::default(),
             startup_timeout: Duration::from_secs(3),
             driver_buffers: None,
             reconnect: None,
         })
-    }
-    pub fn output(&self) -> OutputFormat {
-        self.output
-    }
-    pub fn resolution(&self) -> (u32, u32) {
-        (self.width, self.height)
-    }
-    pub fn frame_rate(&self) -> FrameRate {
-        self.fps
     }
 }
 impl StreamRequestBuilder {
@@ -184,16 +178,8 @@ impl StreamRequestBuilder {
         self.0.selection = v;
         self
     }
-    pub fn delivery(mut self, v: DeliveryPolicy) -> Self {
-        self.0.delivery = v;
-        self
-    }
     pub fn memory_budget(mut self, v: MemoryBudget) -> Self {
         self.0.memory = v;
-        self
-    }
-    pub fn driver_buffers(mut self, v: usize) -> Self {
-        self.0.driver_buffers = Some(v);
         self
     }
     pub fn startup_timeout(mut self, v: Duration) -> Self {
@@ -220,13 +206,6 @@ impl StreamRequestBuilder {
                 "RGB buffers exceed memory budget".into(),
             ));
         }
-        if let DeliveryPolicy::Buffered { capacity, .. } = r.delivery {
-            if capacity == 0 || capacity >= r.memory.buffers {
-                return Err(CameraError::InvalidConfig(
-                    "Queue depth must be positive and less than pool capacity".into(),
-                ));
-            }
-        }
         if r.driver_buffers.is_some_and(|n| !(2..=32).contains(&n)) {
             return Err(CameraError::InvalidConfig(
                 "Driver buffer count must be 2..=32".into(),
@@ -242,15 +221,6 @@ impl StreamRequestBuilder {
         Ok(r)
     }
 }
-#[derive(Clone, Debug)]
-pub struct NegotiatedConfig {
-    pub capture: CameraConfig,
-    pub frame_rate: FrameRate,
-    pub output: OutputFormat,
-    pub adjustments: Vec<String>,
-    pub first_frame_latency: Duration,
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PixelFormat {
     Rgb8,
@@ -411,6 +381,7 @@ pub struct FrameLayout {
     pub bottom_up: bool,
 }
 impl FrameLayout {
+    #[allow(dead_code)]
     pub(crate) fn rgb(w: u32, h: u32) -> Self {
         Self {
             width: w,
@@ -431,6 +402,7 @@ impl FrameLayout {
         }
     }
     /// Build a single packed/encoded plane. Padding remains part of the payload.
+    #[allow(dead_code)]
     pub(crate) fn packed(
         w: u32,
         h: u32,

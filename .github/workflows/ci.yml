@@ -25,7 +25,24 @@ jobs:
       - name: Native metadata and lifecycle regressions
         if: runner.os != 'Windows'
         run: ./scripts/test-native.sh
-      - run: cargo test --no-default-features
+      - name: Lightweight contract without a runtime
+        run: cargo test --no-default-features --lib
+      - name: Public async and blocking contracts
+        run: |
+          cargo test --no-default-features --features runtime-tokio,convert-rgb --tests
+          cargo test --no-default-features --features blocking --test blocking_api
+          cargo check --manifest-path tests/consumer/Cargo.toml
+      - name: Minimal feature dependency boundaries
+        shell: bash
+        run: |
+          cargo check --no-default-features --features backend-v4l2 --lib
+          cargo check --no-default-features --features backend-camera2 --lib
+          cargo check --no-default-features --features backend-mf --lib
+          if cargo tree --no-default-features --features backend-v4l2 -e normal | grep -q turbojpeg; then exit 1; fi
+          if cargo tree --no-default-features --features backend-camera2 -e normal | grep -Eq 'turbojpeg|libusb|libuvc'; then exit 1; fi
+      - name: Conversion performance regression guard
+        if: runner.os == 'Linux'
+        run: CAMERA_BENCH_QUICK=1 CAMERA_BENCH_ASSERT=1 cargo bench --bench color_convert --no-default-features --features benchmark-internals
       - run: cargo test --features ndarray
       - run: cargo check --all-targets --all-features
       - run: cargo clippy --all-targets --features ndarray -- -D warnings

@@ -32,6 +32,7 @@ pub struct AVFoundationCamera {
     current_config: Mutex<Option<CameraConfig>>,
     /// 启动时间
     start_time: Mutex<Option<Instant>>,
+    discard_late_frames: AtomicBool,
 }
 
 impl AVFoundationCamera {
@@ -71,7 +72,21 @@ impl AVFoundationCamera {
             is_streaming: Arc::new(AtomicBool::new(false)),
             current_config: Mutex::new(None),
             start_time: Mutex::new(None),
+            discard_late_frames: AtomicBool::new(true),
         })
+    }
+
+    pub(crate) fn set_options(&self, options: crate::AvFoundationOptions) -> CameraResult<()> {
+        if self.is_streaming.load(Ordering::Acquire) {
+            return Err(CameraError::InvalidState(
+                "AVFoundation options must be set before streaming".into(),
+            ));
+        }
+        self.discard_late_frames.store(
+            options.late_frames == crate::LateFramePolicy::Drop,
+            Ordering::Release,
+        );
+        Ok(())
     }
 
     pub(crate) fn supported_modes(&self, control: CameraControlType) -> CameraResult<Vec<i32>> {
@@ -101,6 +116,17 @@ impl AVFoundationCamera {
     /// 检查权限状态
     pub fn authorization_status() -> super::device::AVAuthorizationStatus {
         super::device::authorization_status()
+    }
+
+    pub(crate) fn permission_status() -> crate::PermissionStatus {
+        match Self::authorization_status() {
+            super::device::AVAuthorizationStatus::NotDetermined => {
+                crate::PermissionStatus::NotDetermined
+            }
+            super::device::AVAuthorizationStatus::Restricted => crate::PermissionStatus::Restricted,
+            super::device::AVAuthorizationStatus::Denied => crate::PermissionStatus::Denied,
+            super::device::AVAuthorizationStatus::Authorized => crate::PermissionStatus::Authorized,
+        }
     }
 
     /// 清理资源
@@ -407,14 +433,18 @@ impl AVFoundationCamera {
 
         // 创建捕获会话
         self.hub.start();
-        let mut session =
-            match CaptureSession::new(&self.device_id, config.clone(), self.hub.clone()) {
-                Ok(session) => session,
-                Err(error) => {
-                    self.hub.stop();
-                    return Err(error);
-                }
-            };
+        let mut session = match CaptureSession::new(
+            &self.device_id,
+            config.clone(),
+            self.hub.clone(),
+            self.discard_late_frames.load(Ordering::Acquire),
+        ) {
+            Ok(session) => session,
+            Err(error) => {
+                self.hub.stop();
+                return Err(error);
+            }
+        };
 
         // 启动会话
         if let Err(error) = session.start() {

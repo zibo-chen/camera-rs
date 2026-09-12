@@ -95,6 +95,10 @@ NdkCamera2* ndk_camera2_create(void);
 /// Destroy and release all resources.
 void ndk_camera2_destroy(NdkCamera2 *cam);
 
+/// Configure the AImageReader queue and NDK request template before streaming.
+NdkCameraStatus ndk_camera2_set_options(NdkCamera2 *cam, int32_t max_images,
+                                         int32_t request_template);
+
 // ============================================================================
 // Device enumeration
 // ============================================================================

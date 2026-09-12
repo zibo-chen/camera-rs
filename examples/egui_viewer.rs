@@ -1,23 +1,21 @@
-use camera::{CameraSystem, Frame, StreamRequest};
+use camera::{
+    CameraSystem, CaptureRequest, ConversionRequest, DeviceSelector, RgbConverter,
+    SubscriptionOptions,
+};
 use eframe::egui;
+struct RgbImage {
+    width: usize,
+    height: usize,
+    pixels: Vec<u8>,
+}
 struct Viewer {
-    latest: std::sync::mpsc::Receiver<Frame>,
+    latest: std::sync::Arc<std::sync::Mutex<Option<RgbImage>>>,
     texture: Option<egui::TextureHandle>,
 }
 impl eframe::App for Viewer {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        let mut latest = None;
-        while let Ok(frame) = self.latest.try_recv() {
-            latest = Some(frame);
-        }
-        if let Some(frame) = latest {
-            let image = egui::ColorImage::from_rgb(
-                [
-                    frame.layout().width as usize,
-                    frame.layout().height as usize,
-                ],
-                frame.bytes(),
-            );
+        if let Some(frame) = self.latest.lock().unwrap().take() {
+            let image = egui::ColorImage::from_rgb([frame.width, frame.height], &frame.pixels);
             if let Some(texture) = &mut self.texture {
                 texture.set(image, egui::TextureOptions::LINEAR);
             } else {
@@ -36,27 +34,34 @@ impl eframe::App for Viewer {
     }
 }
 fn main() -> eframe::Result<()> {
-    let (tx, rx) = std::sync::mpsc::sync_channel(1);
+    let latest = std::sync::Arc::new(std::sync::Mutex::new(None));
+    let publisher = latest.clone();
     std::thread::spawn(move || {
         let rt = tokio::runtime::Runtime::new().unwrap();
         let result: camera::CameraResult<()> = rt.block_on(async {
             let system = CameraSystem::new();
-            let device = system
-                .devices()
-                .await?
-                .into_iter()
-                .next()
-                .ok_or_else(|| camera::CameraError::DeviceNotFound("No camera".into()))?;
-            let mut camera = system.open(&device.id).await?;
-            let session = camera.start(StreamRequest::builder().build()?).await?;
-            let mut frames = session.subscribe();
+            let mut device = system.open(DeviceSelector::Default).await?;
+            let session = device.start(CaptureRequest::builder().build()?).await?;
+            let mut frames = session.subscribe(SubscriptionOptions::latest())?;
+            let mut converter = RgbConverter::new();
+            let mut pixels = Vec::new();
             while let Ok(frame) = frames.next().await {
-                match tx.try_send(frame) {
-                    Ok(()) | Err(std::sync::mpsc::TrySendError::Full(_)) => {}
-                    Err(std::sync::mpsc::TrySendError::Disconnected(_)) => break,
-                }
+                let request = ConversionRequest::new(frame.layout().width, frame.layout().height)?;
+                pixels.resize(request.output_len()?, 0);
+                converter.convert_into(&frame, request, &mut pixels)?;
+                let image = RgbImage {
+                    width: frame.layout().width as usize,
+                    height: frame.layout().height as usize,
+                    pixels,
+                };
+                pixels = publisher
+                    .lock()
+                    .unwrap()
+                    .replace(image)
+                    .map(|old| old.pixels)
+                    .unwrap_or_default();
             }
-            session.stop().await
+            session.close().await
         });
         if let Err(e) = result {
             eprintln!("Camera: {e}");
@@ -67,7 +72,7 @@ fn main() -> eframe::Result<()> {
         eframe::NativeOptions::default(),
         Box::new(|_| {
             Ok(Box::new(Viewer {
-                latest: rx,
+                latest,
                 texture: None,
             }))
         }),

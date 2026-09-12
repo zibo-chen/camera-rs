@@ -4,9 +4,11 @@ pub mod android;
 pub mod error;
 mod owned_fd;
 use camera::{
-    BackendType, Camera, CameraSystem, CaptureSession, ControlId, ControlMode, ControlValue, Frame,
-    FrameRate, FrameReceiver, OutputFormat, StreamRequest,
+    BackendId, BackendPolicy, CameraSystem, CaptureRequest, ControlId, ControlMode, ControlValue,
+    Device, DeviceSelector, Frame, FrameRate, FrameReceiver, Session, SubscriptionOptions,
 };
+#[cfg(feature = "convert-rgb")]
+use camera::{ConversionRequest, RgbConverter};
 use error::{CameraError, Result};
 use jni::{
     objects::{JByteBuffer, JClass, JObject, JString},
@@ -14,9 +16,10 @@ use jni::{
     JNIEnv,
 };
 use serde_json::{json, Value};
+#[cfg(feature = "uvc")]
+use std::os::fd::AsFd;
 use std::{
     collections::HashMap,
-    os::fd::AsFd,
     sync::{
         atomic::{AtomicBool, AtomicI64, Ordering},
         Arc, Mutex, OnceLock,
@@ -35,16 +38,21 @@ pub struct UsbDeviceInfo {
     pub device_path: Option<String>,
 }
 struct Reader {
-    session: Arc<CaptureSession>,
+    session: Arc<Session>,
     frames: FrameReceiver,
     pending: Option<Frame>,
+    #[cfg(feature = "convert-rgb")]
+    converter: RgbConverter,
+    #[cfg(feature = "convert-rgb")]
+    rgb: Vec<u8>,
 }
 struct Handle {
     closed: AtomicBool,
     lifecycle: Mutex<()>,
-    camera: tokio::sync::Mutex<Camera>,
-    session: Mutex<Option<Arc<CaptureSession>>>,
+    camera: tokio::sync::Mutex<Device>,
+    session: Mutex<Option<Arc<Session>>>,
     reader: tokio::sync::Mutex<Option<Reader>>,
+    native_output: AtomicBool,
 }
 static HANDLES: OnceLock<Mutex<HashMap<i64, Arc<Handle>>>> = OnceLock::new();
 static NEXT: AtomicI64 = AtomicI64::new(1);
@@ -71,7 +79,7 @@ fn handle(id: i64) -> Result<Arc<Handle>> {
         .cloned()
         .ok_or_else(|| invalid("Unknown camera handle"))
 }
-fn session(handle: &Handle) -> Result<Arc<CaptureSession>> {
+fn session(handle: &Handle) -> Result<Arc<Session>> {
     handle
         .session
         .lock()
@@ -79,7 +87,7 @@ fn session(handle: &Handle) -> Result<Arc<CaptureSession>> {
         .clone()
         .ok_or_else(|| invalid("Camera is not streaming"))
 }
-fn store(camera: Camera) -> Result<i64> {
+fn store(camera: Device) -> Result<i64> {
     let id = NEXT.fetch_add(1, Ordering::Relaxed);
     if id <= 0 {
         return Err(invalid("Handle space exhausted"));
@@ -95,18 +103,66 @@ fn store(camera: Camera) -> Result<i64> {
                 camera: tokio::sync::Mutex::new(camera),
                 session: Mutex::new(None),
                 reader: tokio::sync::Mutex::new(None),
+                native_output: AtomicBool::new(true),
             }),
         );
     Ok(id)
 }
-fn backend(name: &str) -> Result<BackendType> {
+fn backend(name: &str) -> Result<Option<BackendId>> {
     Ok(match name.to_ascii_lowercase().as_str() {
-        "camera2" => BackendType::Camera2,
-        "uvc" => BackendType::Uvc,
-        "v4l2" => BackendType::V4l2,
-        "auto" => BackendType::Auto,
+        "camera2" => Some(BackendId::CAMERA2),
+        "uvc" => Some(BackendId::UVC),
+        "v4l2" => Some(BackendId::V4L2),
+        "auto" => None,
         _ => return Err(invalid("Backend must be auto, camera2, uvc, or v4l2")),
     })
+}
+fn system_for(backend: Option<BackendId>) -> Result<CameraSystem> {
+    let policy = backend
+        .map(BackendPolicy::Require)
+        .unwrap_or(BackendPolicy::PlatformDefault);
+    Ok(CameraSystem::builder().backend_policy(policy).build()?)
+}
+
+#[cfg(feature = "uvc")]
+fn usb_devices() -> Result<Vec<Value>> {
+    Ok(unsafe { android::usb_manager_scan()? }
+        .into_iter()
+        .map(|d| json!({"id":d.device_path,"index":d.index,"name":d.name,"description":d.description,"vendorId":d.vendor_id,"productId":d.product_id}))
+        .collect())
+}
+#[cfg(not(feature = "uvc"))]
+fn usb_devices() -> Result<Vec<Value>> {
+    Err(camera::CameraError::BackendNotCompiled {
+        backend: BackendId::UVC,
+    }
+    .into())
+}
+
+#[cfg(feature = "uvc")]
+fn open_usb_path(path: &str) -> Result<Device> {
+    let fd = unsafe { android::usb_device_open(path)? };
+    Ok(runtime().block_on(system_for(Some(BackendId::UVC))?.open_usb_fd(fd.as_fd()))?)
+}
+#[cfg(not(feature = "uvc"))]
+fn open_usb_path(_path: &str) -> Result<Device> {
+    Err(camera::CameraError::BackendNotCompiled {
+        backend: BackendId::UVC,
+    }
+    .into())
+}
+
+#[cfg(feature = "uvc")]
+fn open_usb_descriptor(fd: jint) -> Result<Device> {
+    let owned = owned_fd::duplicate(fd)?;
+    Ok(runtime().block_on(system_for(Some(BackendId::UVC))?.open_usb_fd(owned.as_fd()))?)
+}
+#[cfg(not(feature = "uvc"))]
+fn open_usb_descriptor(_fd: jint) -> Result<Device> {
+    Err(camera::CameraError::BackendNotCompiled {
+        backend: BackendId::UVC,
+    }
+    .into())
 }
 fn boundary<T: Default>(
     env: &mut JNIEnv<'_>,
@@ -154,11 +210,11 @@ pub extern "system" fn Java_com_medivh_camera_MedivhCameraBridge_nativeDevices(
     name: JString,
 ) -> jstring {
     boundary(&mut env, |env| {
-        let b = backend(&text(env, name)?)?;
-        let devices = if b == BackendType::Uvc {
-            unsafe{android::usb_manager_scan()?}.into_iter().map(|d|json!({"id":d.device_path,"index":d.index,"name":d.name,"description":d.description,"vendorId":d.vendor_id,"productId":d.product_id})).collect::<Vec<_>>()
+        let selected = backend(&text(env, name)?)?;
+        let devices = if selected.as_ref() == Some(&BackendId::UVC) {
+            usb_devices()?
         } else {
-            runtime().block_on(CameraSystem::with_backend(b).devices())?.into_iter().map(|d|json!({"id":d.id.native_id(),"index":d.index,"name":d.name,"description":d.description})).collect()
+            runtime().block_on(system_for(selected)?.devices())?.into_iter().map(|d|json!({"id":d.id.native_id(),"persistentId":d.id.to_persistent_string(),"index":d.index,"name":d.name,"description":d.description,"facing":format!("{:?}",d.facing)})).collect()
         };
         output(env, json!(devices))
     })
@@ -197,21 +253,20 @@ pub extern "system" fn Java_com_medivh_camera_MedivhCameraBridge_nativeOpen(
     id: JString,
 ) -> jlong {
     boundary(&mut env, |env| {
-        let b = backend(&text(env, name)?)?;
+        let selected = backend(&text(env, name)?)?;
         let id = text(env, id)?;
-        let camera = if b == BackendType::Uvc {
-            let fd = unsafe { android::usb_device_open(&id)? };
-            runtime().block_on(CameraSystem::with_backend(b).open_usb_fd(fd.as_fd()))?
+        let camera = if selected.as_ref() == Some(&BackendId::UVC) {
+            open_usb_path(&id)?
         } else {
+            let system = system_for(selected)?;
             runtime().block_on(async {
-                let system = CameraSystem::with_backend(b);
                 let device = system
                     .devices()
                     .await?
                     .into_iter()
                     .find(|d| d.id.native_id() == id)
                     .ok_or_else(|| camera::CameraError::DeviceNotFound(id.clone()))?;
-                system.open(&device.id).await
+                system.open(DeviceSelector::Id(device.id)).await
             })?
         };
         store(camera)
@@ -227,12 +282,7 @@ pub extern "system" fn Java_com_medivh_camera_MedivhCameraBridge_nativeOpenUsbFd
         if fd < 0 {
             return Err(invalid("Negative USB descriptor"));
         }
-        let owned = owned_fd::duplicate(fd)?;
-        store(
-            runtime().block_on(
-                CameraSystem::with_backend(BackendType::Uvc).open_usb_fd(owned.as_fd()),
-            )?,
-        )
+        store(open_usb_descriptor(fd)?)
     })
 }
 #[no_mangle]
@@ -251,14 +301,15 @@ pub extern "system" fn Java_com_medivh_camera_MedivhCameraBridge_nativeStart(
             return Err(invalid("Dimensions and frame rate must be positive"));
         }
         let handle = handle(id)?;
-        let request = StreamRequest::builder()
-            .resolution(width as u32, height as u32)
-            .frame_rate(FrameRate::new(numerator as u32, denominator as u32)?)
-            .output(if native == JNI_TRUE {
-                OutputFormat::Native
-            } else {
-                OutputFormat::Rgb8
-            })
+        #[cfg(not(feature = "convert-rgb"))]
+        if native != JNI_TRUE {
+            return Err(invalid(
+                "RGB delivery was requested but camera-android/convert-rgb is not enabled",
+            ));
+        }
+        let request = CaptureRequest::builder()
+            .preferred_resolution(width as u32, height as u32)
+            .preferred_frame_rate(FrameRate::new(numerator as u32, denominator as u32)?)
             .build()?;
         let _gate = handle
             .lifecycle
@@ -271,8 +322,11 @@ pub extern "system" fn Java_com_medivh_camera_MedivhCameraBridge_nativeStart(
             let mut camera = handle.camera.lock().await;
             camera.start(request).await
         })?;
-        let config = session.negotiated_config();
-        let result = json!({"width":config.capture.width,"height":config.capture.height,"frameRateNumerator":config.frame_rate.numerator(),"frameRateDenominator":config.frame_rate.denominator(),"captureFormat":format!("{:?}",config.capture.format),"output":format!("{:?}",config.output),"adjustments":config.adjustments});
+        handle
+            .native_output
+            .store(native == JNI_TRUE, Ordering::Release);
+        let config = session.negotiated();
+        let result = json!({"width":config.capture.width,"height":config.capture.height,"frameRateNumerator":config.capture.frame_rate.numerator(),"frameRateDenominator":config.capture.frame_rate.denominator(),"captureFormat":format!("{:?}",config.capture.format),"output":if native == JNI_TRUE {"Native"} else {"Rgb8"},"adjustments":config.adjustments});
         *handle
             .session
             .lock()
@@ -302,16 +356,21 @@ pub extern "system" fn Java_com_medivh_camera_MedivhCameraBridge_nativeNextFrame
         let pointer = env.get_direct_buffer_address(&buffer)?;
         let handle = handle(id)?;
         let current = session(&handle)?;
-        let frame = runtime().block_on(async {
+        let native_output = handle.native_output.load(Ordering::Acquire);
+        let (frame, byte_length) = runtime().block_on(async {
             let mut reader = handle.reader.lock().await;
             if reader
                 .as_ref()
                 .is_none_or(|r| !Arc::ptr_eq(&r.session, &current))
             {
                 *reader = Some(Reader {
-                    frames: current.subscribe(),
+                    frames: current.subscribe(SubscriptionOptions::latest())?,
                     session: current,
                     pending: None,
+                    #[cfg(feature = "convert-rgb")]
+                    converter: RgbConverter::new(),
+                    #[cfg(feature = "convert-rgb")]
+                    rgb: Vec::new(),
                 });
             }
             let reader = reader.as_mut().unwrap();
@@ -323,22 +382,59 @@ pub extern "system" fn Java_com_medivh_camera_MedivhCameraBridge_nativeNextFrame
                         .await?,
                 );
             }
-            let frame = reader.pending.as_ref().unwrap();
-            if capacity < frame.bytes().len() {
-                return Err(invalid(format!(
-                    "Direct buffer needs {} bytes",
-                    frame.bytes().len()
-                )));
-            }
-            Ok(reader.pending.take().unwrap())
+            let frame = reader.pending.as_ref().unwrap().clone();
+            let byte_length = if native_output {
+                if capacity < frame.bytes().len() {
+                    return Err(invalid(format!(
+                        "Direct buffer needs {} bytes",
+                        frame.bytes().len()
+                    )));
+                }
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        frame.bytes().as_ptr(),
+                        pointer,
+                        frame.bytes().len(),
+                    )
+                };
+                frame.bytes().len()
+            } else {
+                #[cfg(feature = "convert-rgb")]
+                {
+                    let request = ConversionRequest::for_layout(frame.layout());
+                    let required = request.output_len()?;
+                    if capacity < required {
+                        return Err(invalid(format!("Direct buffer needs {required} bytes")));
+                    }
+                    reader.rgb.resize(required, 0);
+                    let Reader { converter, rgb, .. } = &mut *reader;
+                    converter.convert_into(&frame, request, rgb)?;
+                    unsafe { std::ptr::copy_nonoverlapping(rgb.as_ptr(), pointer, required) };
+                    required
+                }
+                #[cfg(not(feature = "convert-rgb"))]
+                unreachable!("RGB start is rejected when conversion is not compiled");
+            };
+            reader.pending.take();
+            Ok((frame, byte_length))
         })?;
-        unsafe {
-            std::ptr::copy_nonoverlapping(frame.bytes().as_ptr(), pointer, frame.bytes().len());
-        }
         let layout = frame.layout();
+        let (pixel_format, planes) = if native_output {
+            (
+                format!("{:?}", layout.format),
+                layout.planes.iter().map(|p|json!({"offset":p.offset,"length":p.length,"rowStride":p.row_stride,"pixelStride":p.pixel_stride})).collect::<Vec<_>>(),
+            )
+        } else {
+            (
+                "Rgb8".to_owned(),
+                vec![
+                    json!({"offset":0,"length":byte_length,"rowStride":layout.width as usize * 3,"pixelStride":3}),
+                ],
+            )
+        };
         output(
             env,
-            json!({"session":frame.key.session,"sequence":frame.key.sequence,"byteLength":frame.bytes().len(),"width":layout.width,"height":layout.height,"pixelFormat":format!("{:?}",layout.format),"planes":layout.planes.iter().map(|p|json!({"offset":p.offset,"length":p.length,"rowStride":p.row_stride,"pixelStride":p.pixel_stride})).collect::<Vec<_>>(),"colorMatrix":format!("{:?}",layout.color.matrix),"colorRange":format!("{:?}",layout.color.range),"sourceTimestampNs":frame.source_timestamp_ns,"clock":frame.source_timestamp().map(|t|format!("{:?}",t.clock)),"rotation":layout.orientation.rotation_degrees,"mirrored":layout.orientation.mirrored,"bottomUp":layout.bottom_up}),
+            json!({"session":frame.key.session,"sequence":frame.key.sequence,"byteLength":byte_length,"width":layout.width,"height":layout.height,"pixelFormat":pixel_format,"planes":planes,"colorMatrix":format!("{:?}",layout.color.matrix),"colorRange":format!("{:?}",layout.color.range),"sourceTimestampNs":frame.source_timestamp_ns,"clock":frame.source_timestamp().map(|t|format!("{:?}",t.clock)),"rotation":layout.orientation.rotation_degrees,"mirrored":layout.orientation.mirrored,"bottomUp":if native_output {layout.bottom_up} else {false}}),
         )
     })
 }
@@ -369,7 +465,7 @@ pub extern "system" fn Java_com_medivh_camera_MedivhCameraBridge_nativeMetrics(
             "retainedBuffers":m.retained_buffers,"conversionTotalNs":m.conversion_total_ns,
             "conversionP50Ns":m.conversion_p50_ns,"conversionP95Ns":m.conversion_p95_ns,
             "subscriberDrops":dropped,
-            "firstFrameLatencyMs":session.negotiated_config().first_frame_latency.as_secs_f64()*1000.0}),
+            "firstFrameLatencyMs":session.negotiated().first_frame_latency.as_secs_f64()*1000.0}),
         )
     })
 }
@@ -392,7 +488,7 @@ pub extern "system" fn Java_com_medivh_camera_MedivhCameraBridge_nativeStop(
             .map_err(|_| invalid("Session state poisoned"))?
             .take();
         if let Some(session) = session {
-            runtime().block_on(session.stop())?;
+            runtime().block_on(session.close())?;
         }
         Ok(())
     })
@@ -420,7 +516,7 @@ pub extern "system" fn Java_com_medivh_camera_MedivhCameraBridge_nativeClose(
                 .map_err(|_| invalid("Session state poisoned"))?
                 .take();
             if let Some(session) = session {
-                runtime().block_on(session.stop())?;
+                runtime().block_on(session.close())?;
             }
         }
         Ok(())

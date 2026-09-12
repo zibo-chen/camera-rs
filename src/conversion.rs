@@ -1,7 +1,9 @@
 //! Reusable conversion into caller-owned RGB storage; no implicit frame copies.
+#[cfg(feature = "runtime-tokio")]
+use crate::CapturedFrame;
 use crate::{
     utils::color_convert::{self, Yuv420Sp, YuvPlane},
-    CameraError, CameraResult, CapturedFrame, ColorInfo, FrameLayout, PixelFormat,
+    CameraError, CameraResult, ColorInfo, FrameLayout, PixelFormat,
 };
 
 /// Describes the RGB image a consumer actually needs.
@@ -44,12 +46,141 @@ impl ConversionRequest {
     }
 }
 
+fn is_exact_half(layout: &FrameLayout, request: ConversionRequest) -> bool {
+    let (width, height) = (layout.width as usize, layout.height as usize);
+    !layout.bottom_up
+        && width.is_multiple_of(2)
+        && height.is_multiple_of(2)
+        && (request.width as usize, request.height as usize) == (width / 2, height / 2)
+}
+
+fn direct_half_path(layout: &FrameLayout, request: ConversionRequest) -> Option<&'static str> {
+    if !is_exact_half(layout, request) {
+        return None;
+    }
+    match layout.format {
+        PixelFormat::Nv12 | PixelFormat::Nv21
+            if layout.planes.len() == 2
+                && layout.planes[0].pixel_stride == 1
+                && layout.planes[1].pixel_stride == 2 =>
+        {
+            Some("nv12-direct-half")
+        }
+        PixelFormat::Yuyv | PixelFormat::Uyvy
+            if layout.planes.len() == 1 && layout.planes[0].pixel_stride == 2 =>
+        {
+            Some("yuv422-direct-half")
+        }
+        PixelFormat::Yuv420p
+            if layout.planes.len() == 3
+                && layout.planes.iter().all(|plane| plane.pixel_stride == 1) =>
+        {
+            Some("yuv420p-direct-half")
+        }
+        _ => None,
+    }
+}
+
+fn supports_yuv_row_conversion(layout: &FrameLayout) -> bool {
+    match layout.format {
+        PixelFormat::Yuyv | PixelFormat::Uyvy => true,
+        PixelFormat::Nv12 | PixelFormat::Nv21 => {
+            layout.planes.len() == 2
+                && layout.planes[0].pixel_stride == 1
+                && layout.planes[1].pixel_stride == 2
+        }
+        PixelFormat::Yuv420p => {
+            layout.planes.len() == 3 && layout.planes.iter().all(|plane| plane.pixel_stride == 1)
+        }
+        _ => false,
+    }
+}
+
+/// Reports the production conversion strategy used for a valid layout/request pair.
+/// Intended for diagnostics and benchmark output, so benchmark labels cannot drift
+/// from the real dispatch conditions.
+pub fn selected_conversion_path(layout: &FrameLayout, request: ConversionRequest) -> &'static str {
+    if layout.format == PixelFormat::Mjpeg {
+        return "jpeg-adaptive-decode-scale";
+    }
+    if layout.format == PixelFormat::H264 {
+        return "unsupported-h264";
+    }
+    if let Some(path) = direct_half_path(layout, request) {
+        return path;
+    }
+    if (request.width, request.height) == (layout.width, layout.height) && !layout.bottom_up {
+        return "direct-full-size";
+    }
+    let yuv = matches!(
+        layout.format,
+        PixelFormat::Yuyv
+            | PixelFormat::Uyvy
+            | PixelFormat::Nv12
+            | PixelFormat::Nv21
+            | PixelFormat::Yuv420p
+    );
+    if yuv
+        && supports_yuv_row_conversion(layout)
+        && (request.width as usize).saturating_mul(4) >= layout.width as usize
+    {
+        "yuv-row-convert-nearest"
+    } else {
+        "mapped-nearest"
+    }
+}
+
+#[derive(Default)]
+struct NearestMap {
+    dimensions: (usize, usize, usize, usize, bool),
+    x: Vec<usize>,
+    y: Vec<usize>,
+}
+
+impl NearestMap {
+    fn update(
+        &mut self,
+        source_width: usize,
+        source_height: usize,
+        destination_width: usize,
+        destination_height: usize,
+        bottom_up: bool,
+    ) {
+        let dimensions = (
+            source_width,
+            source_height,
+            destination_width,
+            destination_height,
+            bottom_up,
+        );
+        if self.dimensions == dimensions {
+            return;
+        }
+        self.dimensions = dimensions;
+        self.x.resize(destination_width, 0);
+        self.y.resize(destination_height, 0);
+        for (destination, source) in self.x.iter_mut().enumerate() {
+            *source = destination * source_width / destination_width;
+        }
+        for (destination, source) in self.y.iter_mut().enumerate() {
+            let row = destination * source_height / destination_height;
+            *source = if bottom_up {
+                source_height - row - 1
+            } else {
+                row
+            };
+        }
+    }
+}
+
 #[derive(Default)]
 pub struct RgbConverter {
-    #[cfg(feature = "turbojpeg")]
+    #[cfg(feature = "decode-mjpeg")]
     jpeg: Option<turbojpeg::Decompressor>,
-    #[cfg(feature = "turbojpeg")]
+    #[cfg(feature = "decode-mjpeg")]
     jpeg_scratch: Vec<u8>,
+    nearest: NearestMap,
+    rgb_row_scratch: Vec<u8>,
 }
 impl RgbConverter {
     pub fn new() -> Self {
@@ -57,6 +188,7 @@ impl RgbConverter {
     }
     /// Convert without applying orientation/mirroring. Unknown YUV colorimetry
     /// requires an explicit override instead of silently assuming a matrix/range.
+    #[cfg(feature = "runtime-tokio")]
     pub fn convert_into(
         &mut self,
         frame: &CapturedFrame,
@@ -81,7 +213,7 @@ impl RgbConverter {
             ));
         }
         if layout.format == PixelFormat::Mjpeg {
-            #[cfg(feature = "turbojpeg")]
+            #[cfg(feature = "decode-mjpeg")]
             {
                 if self.jpeg.is_none() {
                     self.jpeg = Some(
@@ -137,17 +269,19 @@ impl RgbConverter {
                         },
                     )
                     .map_err(|e| CameraError::InvalidFormat(e.to_string()))?;
+                self.nearest
+                    .update(scaled.width, scaled.height, out_w, out_h, false);
                 resize_rgb_nearest(
                     &self.jpeg_scratch,
                     scaled.width,
-                    scaled.height,
                     out,
                     out_w,
-                    out_h,
+                    &self.nearest.x,
+                    &self.nearest.y,
                 );
                 return Ok(());
             }
-            #[cfg(not(feature = "turbojpeg"))]
+            #[cfg(not(feature = "decode-mjpeg"))]
             return Err(CameraError::UnsupportedFormat(
                 "Enable jpeg for MJPEG decoding".into(),
             ));
@@ -171,29 +305,56 @@ impl RgbConverter {
         } else {
             None
         };
-        if !layout.bottom_up
-            && w.is_multiple_of(2)
-            && h.is_multiple_of(2)
-            && (out_w, out_h) == (w / 2, h / 2)
-            && matches!(layout.format, PixelFormat::Nv12 | PixelFormat::Nv21)
-            && layout.planes[0].pixel_stride == 1
-            && layout.planes[1].pixel_stride == 2
-        {
-            let y = &layout.planes[0];
-            let uv = &layout.planes[1];
-            return color_convert::yuv420sp_to_rgb_half_with_coefficients_into(
-                Yuv420Sp {
-                    y: &data[y.offset..y.offset + y.length],
-                    uv: &data[uv.offset..uv.offset + uv.length],
-                    y_stride: y.row_stride,
-                    uv_stride: uv.row_stride,
-                    vu_order: layout.format == PixelFormat::Nv21,
-                },
-                w,
-                h,
-                coeff.unwrap(),
-                out,
-            );
+        if direct_half_path(layout, request).is_some() {
+            let p = |index: usize| {
+                let plane = &layout.planes[index];
+                YuvPlane {
+                    data: &data[plane.offset..plane.offset + plane.length],
+                    row_stride: plane.row_stride,
+                    pixel_stride: plane.pixel_stride,
+                }
+            };
+            return match layout.format {
+                PixelFormat::Nv12 | PixelFormat::Nv21 => {
+                    let y = &layout.planes[0];
+                    let uv = &layout.planes[1];
+                    color_convert::yuv420sp_to_rgb_half_with_coefficients_into(
+                        Yuv420Sp {
+                            y: &data[y.offset..y.offset + y.length],
+                            uv: &data[uv.offset..uv.offset + uv.length],
+                            y_stride: y.row_stride,
+                            uv_stride: uv.row_stride,
+                            vu_order: layout.format == PixelFormat::Nv21,
+                        },
+                        w,
+                        h,
+                        coeff.unwrap(),
+                        out,
+                    )
+                }
+                PixelFormat::Yuyv | PixelFormat::Uyvy => {
+                    let plane = &layout.planes[0];
+                    color_convert::yuv422_to_rgb_half_with_coefficients_into(
+                        &data[plane.offset..plane.offset + plane.length],
+                        w,
+                        h,
+                        plane.row_stride,
+                        layout.format == PixelFormat::Uyvy,
+                        coeff.unwrap(),
+                        out,
+                    )
+                }
+                PixelFormat::Yuv420p => color_convert::yuv420_to_rgb_half_with_coefficients_into(
+                    p(0),
+                    p(1),
+                    p(2),
+                    w,
+                    h,
+                    coeff.unwrap(),
+                    out,
+                ),
+                _ => unreachable!(),
+            };
         }
         // Same-size top-down frames use checked vectorized kernels. Scaling and
         // bottom-up layouts keep a direct scalar path without an intermediate image.
@@ -302,65 +463,36 @@ impl RgbConverter {
                 _ => {}
             }
         }
-        let at = |plane: usize, x: usize, y: usize| {
-            let p = &layout.planes[plane];
-            p.offset + y * p.row_stride + x * p.pixel_stride
-        };
-        for y in 0..out_h {
-            let source_y = y * h / out_h;
-            let sy = if layout.bottom_up {
-                h - source_y - 1
-            } else {
-                source_y
-            };
-            for x in 0..out_w {
-                let source_x = x * w / out_w;
-                let i = at(0, source_x, sy);
-                let dst = &mut out[(y * out_w + x) * 3..][..3];
-                match layout.format {
-                    PixelFormat::Rgb8 | PixelFormat::Rgba8 => dst.copy_from_slice(&data[i..i + 3]),
-                    PixelFormat::Bgr8 | PixelFormat::Bgra8 => {
-                        dst[0] = data[i + 2];
-                        dst[1] = data[i + 1];
-                        dst[2] = data[i];
-                    }
-                    PixelFormat::Argb8 => dst.copy_from_slice(&data[i + 1..i + 4]),
-                    PixelFormat::Gray8 => dst.fill(data[i]),
-                    _ => {
-                        let (yy, u, v) = match layout.format {
-                            PixelFormat::Yuyv => {
-                                let pair = at(0, source_x & !1, sy);
-                                (data[i], data[pair + 1], data[pair + 3])
-                            }
-                            PixelFormat::Uyvy => {
-                                let pair = at(0, source_x & !1, sy);
-                                (data[i + 1], data[pair], data[pair + 2])
-                            }
-                            PixelFormat::Nv12 | PixelFormat::Nv21 => {
-                                let uv = at(1, source_x / 2, sy / 2);
-                                if layout.format == PixelFormat::Nv12 {
-                                    (data[i], data[uv], data[uv + 1])
-                                } else {
-                                    (data[i], data[uv + 1], data[uv])
-                                }
-                            }
-                            PixelFormat::Yuv420p => (
-                                data[i],
-                                data[at(1, source_x / 2, sy / 2)],
-                                data[at(2, source_x / 2, sy / 2)],
-                            ),
-                            _ => unreachable!(),
-                        };
-                        color_convert::yuv_pixel(coeff.unwrap(), yy, u, v, dst);
-                    }
-                }
-            }
+        self.nearest.update(w, h, out_w, out_h, layout.bottom_up);
+        let yuv_row_fast = supports_yuv_row_conversion(layout);
+        if yuv && yuv_row_fast && out_w.saturating_mul(4) >= w {
+            self.rgb_row_scratch.resize(w * 3, 0);
+            return scale_yuv_nearest(
+                layout,
+                data,
+                out,
+                &self.nearest.x,
+                &self.nearest.y,
+                coeff.unwrap(),
+                &mut self.rgb_row_scratch,
+            );
         }
-        Ok(())
+        if yuv {
+            return scale_yuv_scalar(
+                layout,
+                data,
+                out,
+                out_w,
+                &self.nearest.x,
+                &self.nearest.y,
+                coeff.unwrap(),
+            );
+        }
+        scale_nearest(layout, data, out, out_w, &self.nearest.x, &self.nearest.y)
     }
 }
 
-#[cfg(feature = "turbojpeg")]
+#[cfg(feature = "decode-mjpeg")]
 fn jpeg_scaling(
     header: &turbojpeg::DecompressHeader,
     target_width: usize,
@@ -372,6 +504,10 @@ fn jpeg_scaling(
     turbojpeg::Decompressor::supported_scaling_factors()
         .into_iter()
         .filter(|factor| factor.num() <= factor.denom())
+        // libjpeg-turbo's fractional IDCTs above 1/2 (notably 3/4) are
+        // substantially slower than its full-size SIMD IDCT on tested ARM64
+        // and x86 builds. Decode full-size and use the cached nearest map.
+        .filter(|factor| factor.num() * 2 <= factor.denom() || factor.num() == factor.denom())
         .filter(|factor| {
             factor.scale(header.width) >= target_width
                 && factor.scale(header.height) >= target_height
@@ -384,23 +520,247 @@ fn jpeg_scaling(
         .unwrap_or(turbojpeg::ScalingFactor::ONE)
 }
 
-#[cfg(feature = "turbojpeg")]
+#[cfg(feature = "decode-mjpeg")]
 fn resize_rgb_nearest(
     source: &[u8],
     source_width: usize,
-    source_height: usize,
     destination: &mut [u8],
     destination_width: usize,
-    destination_height: usize,
+    x_map: &[usize],
+    y_map: &[usize],
 ) {
-    for y in 0..destination_height {
-        let source_y = y * source_height / destination_height;
-        for x in 0..destination_width {
-            let source_x = x * source_width / destination_width;
-            let source_offset = (source_y * source_width + source_x) * 3;
-            let destination_offset = (y * destination_width + x) * 3;
-            destination[destination_offset..destination_offset + 3]
-                .copy_from_slice(&source[source_offset..source_offset + 3]);
+    for (destination_row, &source_y) in destination
+        .chunks_exact_mut(destination_width * 3)
+        .zip(y_map)
+    {
+        let source_row = &source[source_y * source_width * 3..][..source_width * 3];
+        for (destination_pixel, &source_x) in
+            destination_row.as_chunks_mut::<3>().0.iter_mut().zip(x_map)
+        {
+            let source_offset = source_x * 3;
+            destination_pixel.copy_from_slice(&source_row[source_offset..source_offset + 3]);
         }
     }
+}
+
+fn scale_nearest(
+    layout: &FrameLayout,
+    data: &[u8],
+    destination: &mut [u8],
+    destination_width: usize,
+    x_map: &[usize],
+    y_map: &[usize],
+) -> CameraResult<()> {
+    let packed = &layout.planes[0];
+    match layout.format {
+        PixelFormat::Rgb8 | PixelFormat::Rgba8 => {
+            for (destination_row, &source_y) in destination
+                .chunks_exact_mut(destination_width * 3)
+                .zip(y_map)
+            {
+                let row = packed.offset + source_y * packed.row_stride;
+                for (pixel, &source_x) in
+                    destination_row.as_chunks_mut::<3>().0.iter_mut().zip(x_map)
+                {
+                    let source = row + source_x * packed.pixel_stride;
+                    pixel.copy_from_slice(&data[source..source + 3]);
+                }
+            }
+        }
+        PixelFormat::Bgr8 | PixelFormat::Bgra8 => {
+            for (destination_row, &source_y) in destination
+                .chunks_exact_mut(destination_width * 3)
+                .zip(y_map)
+            {
+                let row = packed.offset + source_y * packed.row_stride;
+                for (pixel, &source_x) in
+                    destination_row.as_chunks_mut::<3>().0.iter_mut().zip(x_map)
+                {
+                    let source = row + source_x * packed.pixel_stride;
+                    pixel[0] = data[source + 2];
+                    pixel[1] = data[source + 1];
+                    pixel[2] = data[source];
+                }
+            }
+        }
+        PixelFormat::Argb8 => {
+            for (destination_row, &source_y) in destination
+                .chunks_exact_mut(destination_width * 3)
+                .zip(y_map)
+            {
+                let row = packed.offset + source_y * packed.row_stride;
+                for (pixel, &source_x) in
+                    destination_row.as_chunks_mut::<3>().0.iter_mut().zip(x_map)
+                {
+                    let source = row + source_x * packed.pixel_stride + 1;
+                    pixel.copy_from_slice(&data[source..source + 3]);
+                }
+            }
+        }
+        PixelFormat::Gray8 => {
+            for (destination_row, &source_y) in destination
+                .chunks_exact_mut(destination_width * 3)
+                .zip(y_map)
+            {
+                let row = packed.offset + source_y * packed.row_stride;
+                for (pixel, &source_x) in
+                    destination_row.as_chunks_mut::<3>().0.iter_mut().zip(x_map)
+                {
+                    pixel.fill(data[row + source_x * packed.pixel_stride]);
+                }
+            }
+        }
+        PixelFormat::Yuyv
+        | PixelFormat::Uyvy
+        | PixelFormat::Nv12
+        | PixelFormat::Nv21
+        | PixelFormat::Yuv420p => unreachable!("YUV scaling uses scale_yuv_nearest"),
+        PixelFormat::Mjpeg | PixelFormat::H264 => unreachable!(),
+    }
+    Ok(())
+}
+
+fn scale_yuv_scalar(
+    layout: &FrameLayout,
+    data: &[u8],
+    destination: &mut [u8],
+    destination_width: usize,
+    x_map: &[usize],
+    y_map: &[usize],
+    coefficients: [i32; 6],
+) -> CameraResult<()> {
+    let y_plane = &layout.planes[0];
+    for (destination_row, &source_y) in destination
+        .chunks_exact_mut(destination_width * 3)
+        .zip(y_map)
+    {
+        let y_row = y_plane.offset + source_y * y_plane.row_stride;
+        for (pixel, &source_x) in destination_row.as_chunks_mut::<3>().0.iter_mut().zip(x_map) {
+            let y_offset = y_row + source_x * y_plane.pixel_stride;
+            let (y, u, v) = match layout.format {
+                PixelFormat::Yuyv | PixelFormat::Uyvy => {
+                    let pair = y_row + (source_x & !1) * 2;
+                    if layout.format == PixelFormat::Uyvy {
+                        (data[y_offset + 1], data[pair], data[pair + 2])
+                    } else {
+                        (data[y_offset], data[pair + 1], data[pair + 3])
+                    }
+                }
+                PixelFormat::Nv12 | PixelFormat::Nv21 => {
+                    let chroma = &layout.planes[1];
+                    let uv = chroma.offset
+                        + (source_y / 2) * chroma.row_stride
+                        + (source_x / 2) * chroma.pixel_stride;
+                    if layout.format == PixelFormat::Nv12 {
+                        (data[y_offset], data[uv], data[uv + 1])
+                    } else {
+                        (data[y_offset], data[uv + 1], data[uv])
+                    }
+                }
+                PixelFormat::Yuv420p => {
+                    let u = &layout.planes[1];
+                    let v = &layout.planes[2];
+                    (
+                        data[y_offset],
+                        data[u.offset
+                            + (source_y / 2) * u.row_stride
+                            + (source_x / 2) * u.pixel_stride],
+                        data[v.offset
+                            + (source_y / 2) * v.row_stride
+                            + (source_x / 2) * v.pixel_stride],
+                    )
+                }
+                _ => unreachable!(),
+            };
+            color_convert::yuv_pixel(coefficients, y, u, v, pixel);
+        }
+    }
+    Ok(())
+}
+
+fn scale_yuv_nearest(
+    layout: &FrameLayout,
+    data: &[u8],
+    destination: &mut [u8],
+    x_map: &[usize],
+    y_map: &[usize],
+    coefficients: [i32; 6],
+    rgb_row: &mut [u8],
+) -> CameraResult<()> {
+    let width = layout.width as usize;
+    let y_plane = &layout.planes[0];
+    let mut converted_row = None;
+    for (destination_row, &source_y) in destination.chunks_exact_mut(x_map.len() * 3).zip(y_map) {
+        if converted_row != Some(source_y) {
+            match layout.format {
+                PixelFormat::Yuyv | PixelFormat::Uyvy => {
+                    let row_start = y_plane.offset + source_y * y_plane.row_stride;
+                    color_convert::yuv422_to_rgb_with_coefficients_into(
+                        &data[row_start..row_start + width * 2],
+                        width,
+                        1,
+                        width * 2,
+                        layout.format == PixelFormat::Uyvy,
+                        coefficients,
+                        rgb_row,
+                    )?;
+                }
+                PixelFormat::Nv12 | PixelFormat::Nv21 => {
+                    let uv_plane = &layout.planes[1];
+                    let y_start = y_plane.offset + source_y * y_plane.row_stride;
+                    let uv_start = uv_plane.offset + (source_y / 2) * uv_plane.row_stride;
+                    let chroma_width = width.div_ceil(2) * 2;
+                    color_convert::yuv420sp_to_rgb_with_coefficients_into(
+                        Yuv420Sp {
+                            y: &data[y_start..y_start + width],
+                            uv: &data[uv_start..uv_start + chroma_width],
+                            y_stride: width,
+                            uv_stride: chroma_width,
+                            vu_order: layout.format == PixelFormat::Nv21,
+                        },
+                        width,
+                        1,
+                        coefficients,
+                        rgb_row,
+                    )?;
+                }
+                PixelFormat::Yuv420p => {
+                    let u_plane = &layout.planes[1];
+                    let v_plane = &layout.planes[2];
+                    let y_start = y_plane.offset + source_y * y_plane.row_stride;
+                    let u_start = u_plane.offset + (source_y / 2) * u_plane.row_stride;
+                    let v_start = v_plane.offset + (source_y / 2) * v_plane.row_stride;
+                    let chroma_width = width.div_ceil(2);
+                    color_convert::yuv420_to_rgb_with_coefficients_into(
+                        YuvPlane {
+                            data: &data[y_start..y_start + width],
+                            row_stride: width,
+                            pixel_stride: y_plane.pixel_stride,
+                        },
+                        YuvPlane {
+                            data: &data[u_start..u_start + chroma_width],
+                            row_stride: chroma_width,
+                            pixel_stride: u_plane.pixel_stride,
+                        },
+                        YuvPlane {
+                            data: &data[v_start..v_start + chroma_width],
+                            row_stride: chroma_width,
+                            pixel_stride: v_plane.pixel_stride,
+                        },
+                        width,
+                        1,
+                        coefficients,
+                        rgb_row,
+                    )?;
+                }
+                _ => unreachable!(),
+            }
+            converted_row = Some(source_y);
+        }
+        for (pixel, &source_x) in destination_row.as_chunks_mut::<3>().0.iter_mut().zip(x_map) {
+            let source = source_x * 3;
+            pixel.copy_from_slice(&rgb_row[source..source + 3]);
+        }
+    }
+    Ok(())
 }

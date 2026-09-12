@@ -16,7 +16,10 @@ use crate::types::{
     CameraConfig, CameraControlRange, CameraControlType, CameraControlValue, CameraDeviceInfo,
     CameraResult, VideoFormat,
 };
-use crate::utils::color_convert::{rgba8888_to_rgb_into, yuv420_to_rgb_into, YuvPlane};
+use crate::utils::color_convert::{
+    rgba8888_to_rgb_into, yuv420_to_rgb_into, yuv420sp_to_rgb_with_coefficients_into, Yuv420Sp,
+    YuvPlane, BT601_FULL_COEFFICIENTS,
+};
 
 use super::ffi;
 
@@ -168,6 +171,18 @@ impl Camera2Camera {
         })
     }
 
+    pub(crate) fn set_options(&self, options: crate::Camera2Options) -> CameraResult<()> {
+        let native = self.native.lock().unwrap();
+        let max_images = options.max_images.unwrap_or(4) as i32;
+        let template = options.request_template.unwrap_or_default().native_value();
+        let status = unsafe { ffi::ndk_camera2_set_options(native.ptr, max_images, template) };
+        if status.is_ok() {
+            Ok(())
+        } else {
+            Err(status.error("configure Camera2 options"))
+        }
+    }
+
     /// Select camera by facing direction.
     pub fn with_facing(facing: CameraFacing) -> CameraResult<Self> {
         log::info!("Selecting camera with facing: {:?}", facing);
@@ -304,26 +319,7 @@ unsafe extern "C" fn frame_callback(context: *mut c_void, frame: *const ffi::Ndk
                         "Invalid Camera2 plane metadata".into(),
                     ));
                 }
-                yuv420_to_rgb_into(
-                    YuvPlane {
-                        data: std::slice::from_raw_parts(frame.y_data, frame.y_len as usize),
-                        row_stride: frame.row_stride_y as usize,
-                        pixel_stride: 1,
-                    },
-                    YuvPlane {
-                        data: std::slice::from_raw_parts(frame.uv_data, frame.uv_len as usize),
-                        row_stride: frame.row_stride_uv as usize,
-                        pixel_stride: frame.pixel_stride_uv as usize,
-                    },
-                    YuvPlane {
-                        data: std::slice::from_raw_parts(frame.v_data, frame.v_len as usize),
-                        row_stride: frame.row_stride_v as usize,
-                        pixel_stride: frame.pixel_stride_v as usize,
-                    },
-                    width,
-                    height,
-                    rgb,
-                )
+                convert_camera2_yuv(frame, width, height, rgb)
             },
         )
     }));
@@ -332,6 +328,63 @@ unsafe extern "C" fn frame_callback(context: *mut c_void, frame: *const ffi::Ndk
         Err(_) => log::error!("Camera2 callback panicked; frame discarded"),
         _ => {}
     }
+}
+
+unsafe fn convert_camera2_yuv(
+    frame: &ffi::NdkFrameData,
+    width: usize,
+    height: usize,
+    rgb: &mut [u8],
+) -> CameraResult<()> {
+    let y = std::slice::from_raw_parts(frame.y_data, frame.y_len as usize);
+    let u_span = crate::format::ChromaPlaneSpan {
+        start: frame.uv_data as usize,
+        length: frame.uv_len as usize,
+        row_stride: frame.row_stride_uv as usize,
+        pixel_stride: frame.pixel_stride_uv as usize,
+    };
+    let v_span = crate::format::ChromaPlaneSpan {
+        start: frame.v_data as usize,
+        length: frame.v_len as usize,
+        row_stride: frame.row_stride_v as usize,
+        pixel_stride: frame.pixel_stride_v as usize,
+    };
+    if let Some(chroma) = crate::format::interleaved_chroma_layout(width, height, u_span, v_span) {
+        let uv = std::slice::from_raw_parts(chroma.start as *const u8, chroma.length);
+        return yuv420sp_to_rgb_with_coefficients_into(
+            Yuv420Sp {
+                y,
+                uv,
+                y_stride: frame.row_stride_y as usize,
+                uv_stride: chroma.row_stride,
+                vu_order: chroma.format == crate::PixelFormat::Nv21,
+            },
+            width,
+            height,
+            BT601_FULL_COEFFICIENTS,
+            rgb,
+        );
+    }
+    yuv420_to_rgb_into(
+        YuvPlane {
+            data: y,
+            row_stride: frame.row_stride_y as usize,
+            pixel_stride: 1,
+        },
+        YuvPlane {
+            data: std::slice::from_raw_parts(frame.uv_data, frame.uv_len as usize),
+            row_stride: frame.row_stride_uv as usize,
+            pixel_stride: frame.pixel_stride_uv as usize,
+        },
+        YuvPlane {
+            data: std::slice::from_raw_parts(frame.v_data, frame.v_len as usize),
+            row_stride: frame.row_stride_v as usize,
+            pixel_stride: frame.pixel_stride_v as usize,
+        },
+        width,
+        height,
+        rgb,
+    )
 }
 
 unsafe fn native_frame_layout(

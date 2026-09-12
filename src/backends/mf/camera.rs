@@ -17,9 +17,14 @@ use std::{
     thread::JoinHandle,
     time::Duration,
 };
+#[cfg(feature = "decode-mjpeg")]
 use turbojpeg::{Decompressor, Image, PixelFormat};
+#[cfg(feature = "decode-mjpeg")]
+type JpegDecoder = Decompressor;
+#[cfg(not(feature = "decode-mjpeg"))]
+struct JpegDecoder;
 use windows::{
-    core::{implement, HRESULT},
+    core::{implement, Interface, HRESULT},
     Win32::Media::MediaFoundation::*,
 };
 const MEDIA_FOUNDATION_FIRST_VIDEO_STREAM: u32 = 0xFFFF_FFFC;
@@ -74,11 +79,99 @@ struct Worker {
     media_source: IMFMediaSource,
     hub: Arc<FrameHub>,
     config: Arc<Mutex<Option<CameraConfig>>>,
-    decoder: Option<Decompressor>,
+    decoder: Option<JpegDecoder>,
+    compressed_scratch: Vec<u8>,
     session: u64,
     running: bool,
     stopping: Option<Reply>,
     stride: i32,
+}
+
+enum MediaBufferLock {
+    Linear(IMFMediaBuffer),
+    TwoDimensional(IMF2DBuffer),
+}
+
+impl Drop for MediaBufferLock {
+    fn drop(&mut self) {
+        unsafe {
+            match self {
+                Self::Linear(buffer) => {
+                    let _ = buffer.Unlock();
+                }
+                Self::TwoDimensional(buffer) => {
+                    let _ = buffer.Unlock2D();
+                }
+            }
+        }
+    }
+}
+
+fn two_dimensional_length(config: &CameraConfig, pitch: usize) -> CameraResult<usize> {
+    let width = config.width as usize;
+    let height = config.height as usize;
+    let (rows, final_row_bytes) = match config.format {
+        VideoFormat::NV12 => (height + height.div_ceil(2), width),
+        VideoFormat::YUYV | VideoFormat::UYVY => (height, width.saturating_mul(2)),
+        VideoFormat::RGB => (height, width.saturating_mul(3)),
+        VideoFormat::Gray => (height, width),
+        _ => return Err(CameraError::UnsupportedFormat("MF 2D buffer format".into())),
+    };
+    if rows == 0 || final_row_bytes == 0 || pitch < final_row_bytes {
+        return Err(CameraError::InvalidFormat("Invalid MF 2D pitch".into()));
+    }
+    (rows - 1)
+        .checked_mul(pitch)
+        .and_then(|bytes| bytes.checked_add(final_row_bytes))
+        .ok_or_else(|| CameraError::InvalidFormat("MF 2D buffer size overflow".into()))
+}
+
+unsafe fn lock_media_buffer(
+    buffer: IMFMediaBuffer,
+    config: &CameraConfig,
+    fallback_stride: i32,
+) -> CameraResult<(*mut u8, usize, i32, MediaBufferLock)> {
+    if config.format != VideoFormat::MJPEG {
+        if let Ok(two_dimensional) = buffer.cast::<IMF2DBuffer>() {
+            let mut scanline = std::ptr::null_mut();
+            let mut pitch = 0i32;
+            if two_dimensional.Lock2D(&mut scanline, &mut pitch).is_ok() {
+                let usable = !scanline.is_null()
+                    && pitch != 0
+                    && !(config.format == VideoFormat::NV12 && pitch < 0);
+                if usable {
+                    if let Ok(length) =
+                        two_dimensional_length(config, pitch.unsigned_abs() as usize)
+                    {
+                        let pointer = if pitch < 0 {
+                            scanline
+                                .offset((config.height as isize - 1).saturating_mul(pitch as isize))
+                        } else {
+                            scanline
+                        };
+                        return Ok((
+                            pointer,
+                            length,
+                            pitch,
+                            MediaBufferLock::TwoDimensional(two_dimensional),
+                        ));
+                    }
+                }
+                let _ = two_dimensional.Unlock2D();
+            }
+        }
+    }
+    let mut pointer = std::ptr::null_mut();
+    let mut length = 0u32;
+    buffer
+        .Lock(&mut pointer, None, Some(&mut length))
+        .map_err(mf_error)?;
+    Ok((
+        pointer,
+        length as usize,
+        fallback_stride,
+        MediaBufferLock::Linear(buffer),
+    ))
 }
 
 impl Drop for Worker {
@@ -324,25 +417,51 @@ impl Worker {
             .unwrap()
             .clone()
             .ok_or_else(|| CameraError::StreamError("Missing MF format".into()))?;
-        let buffer = unsafe { sample.ConvertToContiguousBuffer() }.map_err(mf_error)?;
-        let mut pointer = std::ptr::null_mut();
-        let mut length = 0;
-        unsafe { buffer.Lock(&mut pointer, None, Some(&mut length)) }.map_err(mf_error)?;
-        struct BufferLock<'a>(&'a IMFMediaBuffer);
-        impl Drop for BufferLock<'_> {
-            fn drop(&mut self) {
-                let _ = unsafe { self.0.Unlock() };
+        let buffer = if unsafe { sample.GetBufferCount() }.map_err(mf_error)? == 1 {
+            unsafe { sample.GetBufferByIndex(0) }.map_err(mf_error)?
+        } else {
+            unsafe { sample.ConvertToContiguousBuffer() }.map_err(mf_error)?
+        };
+        let (pointer, length, stride, lock) =
+            unsafe { lock_media_buffer(buffer, &config, self.stride) }?;
+        if pointer.is_null() || length == 0 {
+            return Err(CameraError::BufferEmpty);
+        }
+        if !self.hub.wants_native() && config.format == VideoFormat::MJPEG {
+            #[cfg(not(feature = "decode-mjpeg"))]
+            return Err(CameraError::UnsupportedFormat(
+                "MJPEG decoding requires the decode-mjpeg feature".into(),
+            ));
+            #[cfg(feature = "decode-mjpeg")]
+            {
+                let data = unsafe { std::slice::from_raw_parts(pointer, length) };
+                self.compressed_scratch.clear();
+                self.compressed_scratch.extend_from_slice(data);
+                drop(lock);
+                let decoder = &mut self.decoder;
+                return self
+                    .hub
+                    .publish_rgb_metadata(
+                        self.session,
+                        config.width,
+                        config.height,
+                        timestamp
+                            .checked_mul(100)
+                            .map(|nanoseconds| crate::SourceTimestamp {
+                                nanoseconds,
+                                clock: crate::ClockDomain::MediaPresentation,
+                            }),
+                        None,
+                        |rgb| decode_into(&self.compressed_scratch, &config, stride, decoder, rgb),
+                    )
+                    .map(|_| ());
             }
         }
-        let lock = BufferLock(&buffer);
         // Always unlock, including failed conversion. Bytes stay borrowed while
         // the shared pool receives the converted pixels.
-        let result = if pointer.is_null() || length == 0 {
-            Err(CameraError::BufferEmpty)
-        } else {
-            let data = unsafe { std::slice::from_raw_parts(pointer, length as usize) };
+        let result = {
+            let data = unsafe { std::slice::from_raw_parts(pointer, length) };
             let decoder = &mut self.decoder;
-            let stride = self.stride;
             if self.hub.wants_native() {
                 let format = match config.format {
                     VideoFormat::MJPEG => crate::PixelFormat::Mjpeg,
@@ -478,7 +597,7 @@ impl Worker {
 
 fn mf_error(error: windows::core::Error) -> CameraError {
     CameraError::Native {
-        backend: crate::BackendType::MediaFoundation,
+        backend: crate::BackendId::MEDIA_FOUNDATION,
         operation: "capture worker".into(),
         code: error.code().0 as i64,
         message: error.to_string(),
@@ -489,36 +608,44 @@ fn decode_into(
     data: &[u8],
     config: &CameraConfig,
     stride: i32,
-    decoder: &mut Option<Decompressor>,
+    _decoder: &mut Option<JpegDecoder>,
     rgb: &mut [u8],
 ) -> CameraResult<()> {
     let width = config.width as usize;
     let height = config.height as usize;
     if config.format == VideoFormat::MJPEG {
-        if decoder.is_none() {
-            *decoder = Some(Decompressor::new().map_err(|e| CameraError::Other(e.to_string()))?);
+        #[cfg(not(feature = "decode-mjpeg"))]
+        return Err(CameraError::UnsupportedFormat(
+            "MJPEG decoding requires the decode-mjpeg feature".into(),
+        ));
+        #[cfg(feature = "decode-mjpeg")]
+        {
+            if _decoder.is_none() {
+                *_decoder =
+                    Some(Decompressor::new().map_err(|e| CameraError::Other(e.to_string()))?);
+            }
+            let decoder = _decoder.as_mut().unwrap();
+            let header = decoder
+                .read_header(data)
+                .map_err(|e| CameraError::InvalidFormat(e.to_string()))?;
+            if header.width != width || header.height != height {
+                return Err(CameraError::InvalidFormat(
+                    "MF MJPEG dimension mismatch".into(),
+                ));
+            }
+            return decoder
+                .decompress(
+                    data,
+                    Image {
+                        pixels: rgb,
+                        width,
+                        height,
+                        pitch: width * 3,
+                        format: PixelFormat::RGB,
+                    },
+                )
+                .map_err(|e| CameraError::InvalidFormat(e.to_string()));
         }
-        let decoder = decoder.as_mut().unwrap();
-        let header = decoder
-            .read_header(data)
-            .map_err(|e| CameraError::InvalidFormat(e.to_string()))?;
-        if header.width != width || header.height != height {
-            return Err(CameraError::InvalidFormat(
-                "MF MJPEG dimension mismatch".into(),
-            ));
-        }
-        return decoder
-            .decompress(
-                data,
-                Image {
-                    pixels: rgb,
-                    width,
-                    height,
-                    pitch: width * 3,
-                    format: PixelFormat::RGB,
-                },
-            )
-            .map_err(|e| CameraError::InvalidFormat(e.to_string()));
     }
     if config.format == VideoFormat::NV12 {
         if stride <= 0 {
@@ -557,6 +684,17 @@ fn decode_into(
         ));
     }
     let converter = crate::utils::color_convert::ColorConverter::new();
+    if stride > 0 && pitch == row_bytes {
+        match config.format {
+            VideoFormat::YUYV => {
+                return converter.yuyv_to_rgb_into(data, config.width, config.height, rgb)
+            }
+            VideoFormat::UYVY => {
+                return converter.uyvy_to_rgb_into(data, config.width, config.height, rgb)
+            }
+            _ => {}
+        }
+    }
     for (row, destination) in rgb.chunks_exact_mut(width * 3).enumerate() {
         let source_row = if stride < 0 { height - row - 1 } else { row };
         let offset = source_row
@@ -670,6 +808,7 @@ impl MFCamera {
                         hub: worker_hub,
                         config: worker_config,
                         decoder: None,
+                        compressed_scratch: Vec::new(),
                         session: 0,
                         running: false,
                         stopping: None,
@@ -726,7 +865,9 @@ impl MFCamera {
             })))
             .map_err(|_| CameraError::StreamError("MF worker stopped".into()))?;
         rx.recv_timeout(Duration::from_secs(5))
-            .map_err(|_| CameraError::Timeout)?
+            .map_err(|_| CameraError::Timeout {
+                stage: crate::OperationStage::BackendCommand,
+            })?
     }
     fn start_sync(&self, config: CameraConfig) -> CameraResult<()> {
         let _lifecycle = self.lifecycle.lock().unwrap();
@@ -737,16 +878,20 @@ impl MFCamera {
         let worker_cancelled = cancelled.clone();
         let result = self.call(move |worker| {
             if worker_cancelled.load(std::sync::atomic::Ordering::Acquire) {
-                return Err(CameraError::Timeout);
+                return Err(CameraError::Timeout {
+                    stage: crate::OperationStage::Startup,
+                });
             }
             let result = worker.start(config);
             if worker_cancelled.load(std::sync::atomic::Ordering::Acquire) {
                 worker.fail();
-                return Err(CameraError::Timeout);
+                return Err(CameraError::Timeout {
+                    stage: crate::OperationStage::Startup,
+                });
             }
             result
         });
-        if matches!(result, Err(CameraError::Timeout)) {
+        if matches!(result, Err(CameraError::Timeout { .. })) {
             cancelled.store(true, std::sync::atomic::Ordering::Release);
             self.hub.stop();
             // Complete native flushing even if the waiting caller timed out.
@@ -763,7 +908,9 @@ impl MFCamera {
             .send(Event::Stop(tx))
             .map_err(|_| CameraError::StreamError("MF worker stopped".into()))?;
         rx.recv_timeout(Duration::from_secs(5))
-            .map_err(|_| CameraError::Timeout)?
+            .map_err(|_| CameraError::Timeout {
+                stage: crate::OperationStage::Close,
+            })?
     }
     pub fn cleanup(&self) {
         let _ = self.stop_sync();
@@ -874,5 +1021,20 @@ mod tests {
         decode_into(&[3, 2, 1, 0, 6, 5, 4], &config, -4, &mut None, &mut out).unwrap();
         assert_eq!(out, [4, 5, 6, 1, 2, 3]);
         assert!(decode_into(&[0; 2], &config, -4, &mut None, &mut out).is_err());
+    }
+
+    #[test]
+    fn computes_checked_2d_surface_extents() {
+        assert_eq!(
+            two_dimensional_length(&CameraConfig::new(VideoFormat::RGB, 4, 3, 30), 16).unwrap(),
+            44
+        );
+        assert_eq!(
+            two_dimensional_length(&CameraConfig::new(VideoFormat::NV12, 4, 4, 30), 8).unwrap(),
+            44
+        );
+        assert!(
+            two_dimensional_length(&CameraConfig::new(VideoFormat::YUYV, 4, 3, 30), 7).is_err()
+        );
     }
 }

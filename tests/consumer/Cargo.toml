@@ -1,0 +1,10 @@
+[package]
+name = "camera-public-consumer"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[workspace]
+
+[dependencies]
+camera = { path = "../..", default-features = false, features = ["blocking", "convert-rgb"] }

@@ -9,6 +9,11 @@ case "$target" in
  armv7-linux-androideabi) clang_target=armv7a-linux-androideabi24; abi=armeabi-v7a ;;
  *) echo "Supported targets: aarch64-linux-android, armv7-linux-androideabi" >&2; exit 2 ;;
 esac
+if [[ "$target" == armv7-linux-androideabi ]]; then
+ export CARGO_TARGET_ARMV7_LINUX_ANDROIDEABI_RUSTFLAGS="-C target-feature=+neon"
+ export CFLAGS_armv7_linux_androideabi="-mfpu=neon-vfpv4"
+ export CXXFLAGS_armv7_linux_androideabi="-mfpu=neon-vfpv4"
+fi
 prebuilt=("$ANDROID_NDK_HOME"/toolchains/llvm/prebuilt/*)
 camera_tools="${prebuilt[0]}/bin"
 key="${target//-/_}"

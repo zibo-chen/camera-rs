@@ -1,7 +1,9 @@
 use camera::{
-    ColorInfo, ColorMatrix, ColorRange, ConversionRequest, FrameLayout, Orientation, PixelFormat,
-    PlaneLayout, RgbConverter,
+    selected_conversion_path, ColorInfo, ColorMatrix, ColorRange, ConversionRequest, FrameLayout,
+    Orientation, PixelFormat, PlaneLayout, RgbConverter,
 };
+#[cfg(feature = "benchmark-internals")]
+use camera::{FrameHub, SubscriptionOptions};
 use std::{hint::black_box, time::Instant};
 
 fn color(matrix: ColorMatrix, range: ColorRange) -> ColorInfo {
@@ -36,7 +38,7 @@ fn packed(
             orientation: Orientation::default(),
             bottom_up: false,
         },
-        data,
+        data.to_vec(),
     )
 }
 
@@ -72,6 +74,72 @@ fn nv12(
             bottom_up: false,
         },
         vec![128; y_len + uv_len],
+    )
+}
+
+fn nv12_padded(width: usize, height: usize, padding: usize) -> (FrameLayout, Vec<u8>) {
+    let y_stride = width + padding;
+    let uv_stride = width + padding;
+    let y_len = y_stride * height;
+    let uv_len = uv_stride * height.div_ceil(2);
+    (
+        FrameLayout {
+            width: width as u32,
+            height: height as u32,
+            format: PixelFormat::Nv12,
+            planes: vec![
+                PlaneLayout {
+                    offset: 0,
+                    length: y_len,
+                    row_stride: y_stride,
+                    pixel_stride: 1,
+                },
+                PlaneLayout {
+                    offset: y_len,
+                    length: uv_len,
+                    row_stride: uv_stride,
+                    pixel_stride: 2,
+                },
+            ],
+            color: color(ColorMatrix::Bt709, ColorRange::Limited),
+            orientation: Orientation::default(),
+            bottom_up: false,
+        },
+        vec![128; y_len + uv_len],
+    )
+}
+
+#[cfg(feature = "decode-mjpeg")]
+fn mjpeg(width: usize, height: usize) -> (FrameLayout, Vec<u8>) {
+    let pixels = vec![128; width * height * 3];
+    let data = turbojpeg::compress(
+        turbojpeg::Image {
+            pixels: &pixels,
+            width,
+            height,
+            pitch: width * 3,
+            format: turbojpeg::PixelFormat::RGB,
+        },
+        90,
+        turbojpeg::Subsamp::None,
+    )
+    .unwrap();
+    (
+        FrameLayout {
+            width: width as u32,
+            height: height as u32,
+            format: PixelFormat::Mjpeg,
+            planes: vec![PlaneLayout {
+                offset: 0,
+                length: data.len(),
+                row_stride: 0,
+                pixel_stride: 1,
+            }],
+            color: ColorInfo::default(),
+            orientation: Orientation::default(),
+            bottom_up: false,
+        },
+        data.to_vec(),
     )
 }
 
@@ -113,7 +181,7 @@ fn i420(width: usize, height: usize, color: ColorInfo) -> (FrameLayout, Vec<u8>)
     )
 }
 
-fn run(label: &str, layout: &FrameLayout, data: &[u8], request: ConversionRequest) {
+fn run(label: &str, layout: &FrameLayout, data: &[u8], request: ConversionRequest) -> f64 {
     let mut converter = RgbConverter::new();
     let mut output = vec![0; request.output_len().unwrap()];
     for _ in 0..5 {
@@ -137,71 +205,26 @@ fn run(label: &str, layout: &FrameLayout, data: &[u8], request: ConversionReques
     samples.sort_unstable();
     let percentile = |percent: usize| samples[(samples.len() * percent).div_ceil(100) - 1];
     let mean = samples.iter().sum::<u64>() as f64 / samples.len() as f64;
-    let kernel = selected_kernel(layout, request);
+    let kernel = selected_conversion_path(layout, request);
     let strides: Vec<_> = layout.planes.iter().map(|plane| plane.row_stride).collect();
+    let p50_ms = percentile(50) as f64 / 1_000_000.0;
+    let megapixels_per_second = request.width as f64 * request.height as f64 / p50_ms / 1_000.0;
+    let checksum = output
+        .iter()
+        .fold(0u64, |sum, &value| sum.wrapping_add(u64::from(value)));
+    black_box(checksum);
     println!(
         "case={label} kernel={kernel} strides={strides:?} output={}x{}",
         request.width, request.height
     );
     println!(
-        "{label:<28} mean={:.3} p50={:.3} p95={:.3} p99={:.3} ms",
+        "{label:<28} mean={:.3} p50={:.3} p95={:.3} p99={:.3} ms throughput={megapixels_per_second:.1} MP/s checksum={checksum}",
         mean / 1_000_000.0,
         percentile(50) as f64 / 1_000_000.0,
         percentile(95) as f64 / 1_000_000.0,
         percentile(99) as f64 / 1_000_000.0,
     );
-}
-
-#[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
-fn selected_kernel(layout: &FrameLayout, request: ConversionRequest) -> &'static str {
-    match layout.format {
-        PixelFormat::Yuv420p => "neon-planar-contiguous-two-row",
-        PixelFormat::Nv12 | PixelFormat::Nv21
-            if request.width < layout.width || request.height < layout.height =>
-        {
-            "neon-semiplanar-direct-half"
-        }
-        PixelFormat::Nv12 | PixelFormat::Nv21 => "neon-semiplanar-two-row",
-        PixelFormat::Bgra8 | PixelFormat::Rgba8 | PixelFormat::Argb8 => "neon-packed8888",
-        PixelFormat::Yuyv | PixelFormat::Uyvy => "neon-packed422",
-        _ => "scalar",
-    }
-}
-
-#[cfg(target_arch = "x86_64")]
-fn selected_kernel(layout: &FrameLayout, request: ConversionRequest) -> &'static str {
-    if std::arch::is_x86_feature_detected!("avx2") {
-        return match layout.format {
-            PixelFormat::Yuv420p => "avx2-planar",
-            PixelFormat::Nv12 | PixelFormat::Nv21
-                if request.width < layout.width || request.height < layout.height =>
-            {
-                "avx2-semiplanar-direct-half"
-            }
-            PixelFormat::Nv12 | PixelFormat::Nv21 => "avx2-semiplanar",
-            PixelFormat::Bgra8 | PixelFormat::Rgba8 | PixelFormat::Argb8 => "avx2-packed8888",
-            PixelFormat::Yuyv | PixelFormat::Uyvy => "avx2-packed422",
-            _ => "scalar",
-        };
-    }
-    if std::arch::is_x86_feature_detected!("ssse3")
-        && matches!(
-            layout.format,
-            PixelFormat::Bgra8 | PixelFormat::Rgba8 | PixelFormat::Argb8
-        )
-    {
-        "ssse3-packed8888"
-    } else {
-        "scalar"
-    }
-}
-
-#[cfg(not(any(
-    all(target_arch = "aarch64", target_feature = "neon"),
-    target_arch = "x86_64"
-)))]
-fn selected_kernel(_layout: &FrameLayout, _request: ConversionRequest) -> &'static str {
-    "scalar"
+    p50_ms
 }
 
 fn benchmark_resolution(width: usize, height: usize) {
@@ -242,12 +265,104 @@ fn benchmark_resolution(width: usize, height: usize) {
             ConversionRequest::for_layout(layout),
         );
     }
+    let (layout, data) = nv12_padded(width, height, 64);
+    run(
+        &format!("NV12 padded {width}x{height}"),
+        &layout,
+        &data,
+        ConversionRequest::for_layout(&layout),
+    );
     let (layout, data) = nv12(width, height, PixelFormat::Nv12, full_601);
     run(
         &format!("NV12 half {width}x{height}"),
         &layout,
         &data,
         ConversionRequest::new((width / 2) as u32, (height / 2) as u32).unwrap(),
+    );
+    for (label, (layout, data)) in [
+        (
+            "NV12 arbitrary 2:3",
+            nv12(width, height, PixelFormat::Nv12, full_601),
+        ),
+        (
+            "YUYV arbitrary 2:3",
+            packed(width, height, PixelFormat::Yuyv, 2, full_601),
+        ),
+        ("I420 arbitrary 2:3", i420(width, height, full_601)),
+    ] {
+        run(
+            &format!("{label} {width}x{height}"),
+            &layout,
+            &data,
+            ConversionRequest::new((width * 2 / 3) as u32, (height * 2 / 3) as u32).unwrap(),
+        );
+    }
+    for (label, (layout, data)) in [
+        (
+            "YUYV half",
+            packed(width, height, PixelFormat::Yuyv, 2, full_601),
+        ),
+        ("I420 half", i420(width, height, full_601)),
+    ] {
+        run(
+            &format!("{label} {width}x{height}"),
+            &layout,
+            &data,
+            ConversionRequest::new((width / 2) as u32, (height / 2) as u32).unwrap(),
+        );
+    }
+}
+
+#[cfg(feature = "benchmark-internals")]
+fn benchmark_publish(width: usize, height: usize) {
+    let hub = FrameHub::new(6);
+    let session = hub.start();
+    let _receiver = hub.subscribe_with(SubscriptionOptions::latest()).unwrap();
+    for _ in 0..8 {
+        hub.publish_rgb(session, width as u32, height as u32, None, |rgb| {
+            black_box(rgb);
+            Ok(())
+        })
+        .unwrap();
+    }
+    let mut samples = Vec::with_capacity(120);
+    for _ in 0..120 {
+        let begin = Instant::now();
+        hub.publish_rgb(session, width as u32, height as u32, None, |rgb| {
+            black_box(rgb);
+            Ok(())
+        })
+        .unwrap();
+        samples.push(begin.elapsed().as_nanos() as u64);
+    }
+    samples.sort_unstable();
+    println!(
+        "FrameHub publish {width}x{height} p50={:.3} us latest_sequence={}",
+        samples[samples.len() / 2] as f64 / 1_000.0,
+        hub.latest().unwrap().key.sequence
+    );
+}
+
+fn assert_scaling_regression() {
+    let width = 1920;
+    let height = 1080;
+    let full = color(ColorMatrix::Bt601, ColorRange::Full);
+    let (layout, data) = nv12(width, height, PixelFormat::Nv12, full);
+    let direct = run(
+        "NV12 regression direct",
+        &layout,
+        &data,
+        ConversionRequest::for_layout(&layout),
+    );
+    let arbitrary = run(
+        "NV12 regression arbitrary",
+        &layout,
+        &data,
+        ConversionRequest::new(1280, 720).unwrap(),
+    );
+    assert!(
+        arbitrary <= direct * 2.75,
+        "arbitrary NV12 scaling regressed: {arbitrary:.3}ms vs direct {direct:.3}ms"
     );
 }
 
@@ -263,7 +378,51 @@ fn main() {
             "release"
         }
     );
-    for (width, height) in [(1280, 720), (1920, 1080), (3840, 2160)] {
+    let resolutions: &[(usize, usize)] = if std::env::var_os("CAMERA_BENCH_QUICK").is_some() {
+        &[(1920, 1080)]
+    } else {
+        &[(1280, 720), (1920, 1080), (3840, 2160)]
+    };
+    for &(width, height) in resolutions {
         benchmark_resolution(width, height);
+    }
+    #[cfg(feature = "benchmark-internals")]
+    benchmark_publish(1920, 1080);
+    #[cfg(feature = "decode-mjpeg")]
+    {
+        let (layout, data) = mjpeg(1920, 1080);
+        run(
+            "MJPEG 1080p full",
+            &layout,
+            &data,
+            ConversionRequest::for_layout(&layout),
+        );
+        run(
+            "MJPEG 1080p to 720p",
+            &layout,
+            &data,
+            ConversionRequest::new(1280, 720).unwrap(),
+        );
+        run(
+            "MJPEG 1080p exact 3/4",
+            &layout,
+            &data,
+            ConversionRequest::new(1440, 810).unwrap(),
+        );
+        run(
+            "MJPEG 1080p half",
+            &layout,
+            &data,
+            ConversionRequest::new(960, 540).unwrap(),
+        );
+        run(
+            "MJPEG 1080p to 360p",
+            &layout,
+            &data,
+            ConversionRequest::new(640, 360).unwrap(),
+        );
+    }
+    if std::env::var_os("CAMERA_BENCH_ASSERT").is_some() {
+        assert_scaling_regression();
     }
 }

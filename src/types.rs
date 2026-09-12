@@ -6,6 +6,7 @@ use crate::error::CameraError;
 pub type CameraResult<T> = Result<T, CameraError>;
 
 /// 视频格式枚举
+#[allow(clippy::upper_case_acronyms)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VideoFormat {
     /// MJPEG 压缩格式

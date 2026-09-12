@@ -1,6 +1,6 @@
 //! Immutable frames, bounded storage, and independent cancellation-safe readers.
 use crate::format::*;
-use crate::{pixels::Pixels, CameraError, CameraResult, StreamStats};
+use crate::{pixels::Pixels, CameraError, CameraResult, StreamStats, SubscriptionOptions};
 use parking_lot::Mutex;
 use std::{
     collections::VecDeque,
@@ -117,6 +117,29 @@ impl CapturedFrame {
         let p = self.layout.planes.get(index)?;
         self.bytes().get(p.offset..p.offset + p.length)
     }
+    pub fn rgb_view(&self) -> CameraResult<RgbView<'_>> {
+        if self.layout.format != PixelFormat::Rgb8 || self.layout.planes.len() != 1 {
+            return Err(CameraError::UnsupportedFormat(
+                "Frame layout is not packed RGB8".into(),
+            ));
+        }
+        let plane = self.layout.planes[0];
+        if plane.pixel_stride != 3 {
+            return Err(CameraError::InvalidFormat(
+                "RGB8 pixel stride must be three bytes".into(),
+            ));
+        }
+        let bytes = self
+            .bytes()
+            .get(plane.offset..plane.offset + plane.length)
+            .ok_or_else(|| CameraError::InvalidFormat("RGB plane is outside the frame".into()))?;
+        Ok(RgbView {
+            bytes,
+            width: self.layout.width as usize,
+            height: self.layout.height as usize,
+            row_stride: plane.row_stride,
+        })
+    }
     pub fn source_timestamp(&self) -> Option<SourceTimestamp> {
         self.source_timestamp_ns.map(|nanoseconds| SourceTimestamp {
             nanoseconds,
@@ -135,6 +158,7 @@ impl CapturedFrame {
     pub fn to_owned_bytes(&self) -> Vec<u8> {
         self.bytes().to_vec()
     }
+    #[allow(dead_code)]
     pub(crate) fn rgb_pixels(&self) -> CameraResult<&Arc<Pixels<u8>>> {
         match &self.storage {
             Storage::Rgb(p) => Ok(p),
@@ -144,14 +168,49 @@ impl CapturedFrame {
         }
     }
     #[cfg(feature = "ndarray")]
-    pub fn ndarray(&self) -> CameraResult<ndarray::ArrayView3<'_, u8>> {
-        Ok(self.rgb_pixels()?.view())
+    pub fn ndarray_view(&self) -> CameraResult<ndarray::ArrayView3<'_, u8>> {
+        use ndarray::ShapeBuilder;
+        let view = self.rgb_view()?;
+        ndarray::ArrayView3::from_shape(
+            (view.height, view.width, 3).strides((view.row_stride, 3, 1)),
+            view.bytes,
+        )
+        .map_err(|error| CameraError::InvalidFormat(error.to_string()))
     }
-    /// Clone the shared RGB allocation without copying pixels. Long-lived references
-    /// occupy pool slots; copy explicitly if the application needs archival storage.
-    #[cfg(feature = "ndarray")]
-    pub fn shared_ndarray(&self) -> CameraResult<Arc<ndarray::Array3<u8>>> {
-        Ok(self.rgb_pixels()?.clone())
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct RgbView<'a> {
+    bytes: &'a [u8],
+    width: usize,
+    height: usize,
+    row_stride: usize,
+}
+
+impl<'a> RgbView<'a> {
+    pub fn width(&self) -> usize {
+        self.width
+    }
+
+    pub fn height(&self) -> usize {
+        self.height
+    }
+
+    pub fn row_stride(&self) -> usize {
+        self.row_stride
+    }
+
+    pub fn row(&self, index: usize) -> Option<&'a [u8]> {
+        if index >= self.height {
+            return None;
+        }
+        let start = index.checked_mul(self.row_stride)?;
+        self.bytes
+            .get(start..start.checked_add(self.width.checked_mul(3)?)?)
+    }
+
+    pub fn bytes(&self) -> &'a [u8] {
+        self.bytes
     }
 }
 #[derive(Clone, Default, Debug)]
@@ -176,6 +235,14 @@ struct Snapshot {
     recovering: bool,
     latest: Option<Frame>,
 }
+struct Publication {
+    session: u64,
+    layout: FrameLayout,
+    timestamp: Option<SourceTimestamp>,
+    source_sequence: Option<u64>,
+    captured_at: Instant,
+    elapsed: u64,
+}
 struct Slot {
     data: Option<Storage>,
     bytes: usize,
@@ -193,6 +260,8 @@ struct Subscriber {
     queue: Mutex<VecDeque<Frame>>,
     delivery: DeliveryPolicy,
     dropped: AtomicU64,
+    max_rate: Option<FrameRate>,
+    last_enqueued: Mutex<Option<Instant>>,
     owner: std::sync::OnceLock<Arc<AtomicBool>>,
 }
 /// Internal publisher. Public applications receive FrameReceiver instead.
@@ -201,8 +270,8 @@ pub struct FrameHub {
     state: watch::Sender<Snapshot>,
     pool: Arc<Mutex<Pool>>,
     subscribers: Arc<Mutex<Vec<Weak<Subscriber>>>>,
-    output: Arc<Mutex<OutputFormat>>,
-    delivery: Arc<Mutex<DeliveryPolicy>>,
+    native_output: Arc<AtomicBool>,
+    events: Arc<Mutex<Option<tokio::sync::broadcast::Sender<crate::SessionEvent>>>>,
 }
 impl Default for FrameHub {
     fn default() -> Self {
@@ -227,8 +296,8 @@ impl FrameHub {
                 conversion_samples: VecDeque::with_capacity(256),
             })),
             subscribers: Arc::new(Mutex::new(vec![])),
-            output: Arc::new(Mutex::new(OutputFormat::Rgb8)),
-            delivery: Arc::new(Mutex::new(DeliveryPolicy::Latest)),
+            native_output: Arc::new(AtomicBool::new(false)),
+            events: Arc::new(Mutex::new(None)),
         }
     }
     pub(crate) fn configure(&self, r: &StreamRequest) -> CameraResult<()> {
@@ -253,8 +322,8 @@ impl FrameHub {
             ));
         }
         pool.budget = r.memory;
-        *self.output.lock() = r.output;
-        *self.delivery.lock() = r.delivery;
+        self.native_output
+            .store(r.output == OutputFormat::Native, Ordering::Release);
         Ok(())
     }
     pub fn start(&self) -> u64 {
@@ -274,6 +343,18 @@ impl FrameHub {
             latest: None,
         });
         session
+    }
+    pub(crate) fn set_event_sender(
+        &self,
+        sender: tokio::sync::broadcast::Sender<crate::SessionEvent>,
+    ) {
+        *self.events.lock() = Some(sender);
+    }
+
+    fn report_resource_pressure(&self, dropped_frames: u64) {
+        if let Some(sender) = self.events.lock().as_ref() {
+            let _ = sender.send(crate::SessionEvent::ResourcePressure { dropped_frames });
+        }
     }
     fn clear_queues(&self) {
         self.subscribers.lock().retain(|s| {
@@ -309,16 +390,29 @@ impl FrameHub {
         self.state.borrow().latest.clone()
     }
     pub(crate) fn wants_native(&self) -> bool {
-        *self.output.lock() == OutputFormat::Native
+        self.native_output.load(Ordering::Acquire)
     }
-    pub fn subscribe(&self) -> FrameReceiver {
-        self.subscribe_with(*self.delivery.lock())
+    #[allow(dead_code)]
+    pub(crate) fn record_input_drop(&self, session: u64) {
+        if self.session() == session {
+            let mut pool = self.pool.lock();
+            pool.metrics.received += 1;
+            pool.metrics.pool_drops += 1;
+            let dropped = pool.metrics.pool_drops;
+            drop(pool);
+            self.report_resource_pressure(dropped);
+        }
     }
-    pub(crate) fn subscribe_with(&self, delivery: DeliveryPolicy) -> FrameReceiver {
+    #[doc(hidden)]
+    pub fn subscribe_with(&self, options: SubscriptionOptions) -> CameraResult<FrameReceiver> {
+        let budget = self.pool.lock().budget;
+        options.validate(budget)?;
         let subscriber = Arc::new(Subscriber {
             queue: Mutex::new(VecDeque::new()),
-            delivery,
+            delivery: options.delivery,
             dropped: AtomicU64::new(0),
+            max_rate: options.max_rate,
+            last_enqueued: Mutex::new(None),
             owner: std::sync::OnceLock::new(),
         });
         let state = self.state.subscribe();
@@ -326,23 +420,24 @@ impl FrameHub {
             let snapshot = state.borrow();
             let mut subs = self.subscribers.lock();
             if let Some(f) = snapshot.latest.clone() {
+                *subscriber.last_enqueued.lock() = Some(f.captured_at);
                 subscriber.queue.lock().push_back(f);
             }
             subs.push(Arc::downgrade(&subscriber));
         }
-        FrameReceiver {
+        Ok(FrameReceiver {
             state,
             subscriber,
             last: None,
-        }
+        })
     }
     pub async fn wait_after(
         &self,
         after: Option<FrameKey>,
         timeout: Duration,
     ) -> CameraResult<Frame> {
-        let mut rx = self.subscribe_with(DeliveryPolicy::Latest);
-        rx.last = after;
+        let mut rx = self.subscribe_with(SubscriptionOptions::latest())?;
+        rx.last = after.or_else(|| rx.state.borrow().latest.as_ref().map(|frame| frame.key));
         rx.next_timeout(timeout).await
     }
     pub fn publish_rgb(
@@ -365,6 +460,7 @@ impl FrameHub {
             convert,
         )
     }
+    #[allow(dead_code)]
     pub(crate) fn publish_rgb_metadata(
         &self,
         session: u64,
@@ -433,6 +529,135 @@ impl FrameHub {
             Ok(())
         })
     }
+
+    pub(crate) fn writable_native(
+        &self,
+        session: u64,
+        layout: FrameLayout,
+    ) -> CameraResult<NativeWriteLease> {
+        let length = Self::frame_length(&layout, false)?;
+        layout.validate(length)?;
+        let lease = self
+            .reserve(session, &layout, false)?
+            .ok_or(CameraError::BufferEmpty)?;
+        Ok(NativeWriteLease {
+            lease: Some(lease),
+            session,
+            layout,
+            timestamp: None,
+            captured_at: Instant::now(),
+        })
+    }
+
+    fn frame_length(layout: &FrameLayout, rgb: bool) -> CameraResult<usize> {
+        let length = if rgb {
+            (layout.width as usize)
+                .checked_mul(layout.height as usize)
+                .and_then(|n| n.checked_mul(3))
+        } else {
+            layout
+                .planes
+                .iter()
+                .filter_map(|plane| plane.offset.checked_add(plane.length))
+                .max()
+        };
+        length
+            .filter(|&length| length > 0 && length <= MAX_FRAME_BYTES)
+            .ok_or_else(|| CameraError::InvalidFormat("Frame exceeds size limit".into()))
+    }
+
+    fn reserve(
+        &self,
+        session: u64,
+        layout: &FrameLayout,
+        rgb: bool,
+    ) -> CameraResult<Option<Lease>> {
+        {
+            let state = self.state.borrow();
+            if !state.active || state.session != session {
+                return Ok(None);
+            }
+        }
+        let length = Self::frame_length(layout, rgb)?;
+        let mut pool = self.pool.lock();
+        {
+            let state = self.state.borrow();
+            if !state.active || state.session != session {
+                return Ok(None);
+            }
+        }
+        pool.metrics.received += 1;
+        let index = pool
+            .slots
+            .iter_mut()
+            .position(|slot| slot.data.as_mut().is_some_and(Storage::unique));
+        let index = match index {
+            Some(index) => index,
+            None if pool.slots.len() < pool.budget.buffers => {
+                pool.slots.push(Slot {
+                    data: None,
+                    bytes: 0,
+                });
+                pool.slots.len() - 1
+            }
+            _ => {
+                pool.metrics.pool_drops += 1;
+                let dropped = pool.metrics.pool_drops;
+                drop(pool);
+                self.report_resource_pressure(dropped);
+                return Ok(None);
+            }
+        };
+        let used: usize = pool.slots.iter().map(|slot| slot.bytes).sum();
+        if length
+            > pool
+                .budget
+                .bytes
+                .saturating_sub(used - pool.slots[index].bytes)
+        {
+            if pool.slots[index].bytes == 0 {
+                pool.slots.pop();
+            }
+            pool.metrics.pool_drops += 1;
+            let dropped = pool.metrics.pool_drops;
+            drop(pool);
+            self.report_resource_pressure(dropped);
+            return Ok(None);
+        }
+        let existing = pool.slots[index].data.take();
+        let storage = match existing {
+            Some(Storage::Rgb(pixels))
+                if rgb && pixels.dim() == (layout.height as usize, layout.width as usize, 3) =>
+            {
+                Storage::Rgb(pixels)
+            }
+            Some(Storage::Bytes(mut bytes)) if !rgb => {
+                let buffer = Arc::get_mut(&mut bytes).expect("exclusive native slot");
+                if length > buffer.capacity() {
+                    buffer.reserve(length - buffer.len());
+                }
+                buffer.resize(length, 0);
+                Storage::Bytes(bytes)
+            }
+            _ if rgb => Storage::Rgb(Arc::new(Pixels::zeros((
+                layout.height as usize,
+                layout.width as usize,
+                3,
+            )))),
+            _ => Storage::Bytes(Arc::new(vec![0; length])),
+        };
+        pool.slots[index].bytes = match &storage {
+            Storage::Bytes(bytes) => bytes.capacity(),
+            Storage::Rgb(_) => length,
+        };
+        drop(pool);
+        Ok(Some(Lease {
+            hub: self.clone(),
+            index,
+            data: Some(storage),
+        }))
+    }
+
     fn publish(
         &self,
         session: u64,
@@ -443,104 +668,8 @@ impl FrameHub {
         convert: impl FnOnce(&mut [u8]) -> CameraResult<()>,
     ) -> CameraResult<bool> {
         let now = Instant::now();
-        let timestamp_ns = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos()
-            .min(u64::MAX as u128) as u64;
-        {
-            let state = self.state.borrow();
-            if !state.active || state.session != session {
-                return Ok(false);
-            }
-        }
-        let length = if rgb {
-            (layout.width as usize)
-                .checked_mul(layout.height as usize)
-                .and_then(|n| n.checked_mul(3))
-        } else {
-            layout
-                .planes
-                .iter()
-                .filter_map(|p| p.offset.checked_add(p.length))
-                .max()
-        }
-        .filter(|&n| n > 0 && n <= MAX_FRAME_BYTES)
-        .ok_or_else(|| CameraError::InvalidFormat("Frame exceeds size limit".into()))?;
-        let (index, storage) = {
-            let mut pool = self.pool.lock();
-            {
-                let state = self.state.borrow();
-                if !state.active || state.session != session {
-                    return Ok(false);
-                }
-            }
-            pool.metrics.received += 1;
-            let index = pool
-                .slots
-                .iter_mut()
-                .position(|s| s.data.as_mut().is_some_and(Storage::unique));
-            let index = match index {
-                Some(i) => i,
-                None if pool.slots.len() < pool.budget.buffers => {
-                    pool.slots.push(Slot {
-                        data: None,
-                        bytes: 0,
-                    });
-                    pool.slots.len() - 1
-                }
-                _ => {
-                    pool.metrics.pool_drops += 1;
-                    return Ok(false);
-                }
-            };
-            let used: usize = pool.slots.iter().map(|s| s.bytes).sum();
-            if length
-                > pool
-                    .budget
-                    .bytes
-                    .saturating_sub(used - pool.slots[index].bytes)
-            {
-                if pool.slots[index].bytes == 0 {
-                    pool.slots.pop();
-                }
-                pool.metrics.pool_drops += 1;
-                return Ok(false);
-            }
-            let existing = pool.slots[index].data.take();
-            let storage = match existing {
-                Some(Storage::Rgb(p))
-                    if rgb && p.dim() == (layout.height as usize, layout.width as usize, 3) =>
-                {
-                    Storage::Rgb(p)
-                }
-                Some(Storage::Bytes(mut p)) if !rgb => {
-                    let bytes = Arc::get_mut(&mut p).expect("exclusive native slot");
-                    if length > bytes.capacity() {
-                        bytes.reserve_exact(length - bytes.len());
-                    }
-                    bytes.resize(length, 0);
-                    Storage::Bytes(p)
-                }
-                _ if rgb => Storage::Rgb(Arc::new(Pixels::zeros((
-                    layout.height as usize,
-                    layout.width as usize,
-                    3,
-                )))),
-                _ => Storage::Bytes(Arc::new(vec![0; length])),
-            };
-            pool.slots[index].bytes = match &storage {
-                Storage::Bytes(p) => p.capacity(),
-                _ => length,
-            };
-            (index, storage)
-        };
-        // Lease returns reserved storage even when conversion panics. Conversion never
-        // holds the pool mutex, so monitoring cannot stall behind JPEG/SIMD work.
-        let mut lease = Lease {
-            hub: self,
-            index,
-            data: Some(storage),
+        let Some(mut lease) = self.reserve(session, &layout, rgb)? else {
+            return Ok(false);
         };
         let begin = Instant::now();
         let result = convert(lease.data.as_mut().unwrap().bytes_mut());
@@ -551,6 +680,33 @@ impl FrameHub {
             }
             return Err(error);
         }
+        self.finish_publish(
+            Publication {
+                session,
+                layout,
+                timestamp,
+                source_sequence,
+                captured_at: now,
+                elapsed,
+            },
+            &lease,
+        )
+    }
+
+    fn finish_publish(&self, publication: Publication, lease: &Lease) -> CameraResult<bool> {
+        let Publication {
+            session,
+            layout,
+            timestamp,
+            source_sequence,
+            captured_at: now,
+            elapsed,
+        } = publication;
+        let timestamp_ns = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+            .min(u64::MAX as u128) as u64;
         let mut published = false;
         self.state.send_if_modified(|state| {
             if !state.active || state.session != session {
@@ -579,6 +735,16 @@ impl FrameHub {
                 {
                     queue.clear();
                     return false;
+                }
+                if let Some(rate) = subscriber.max_rate {
+                    let mut last = subscriber.last_enqueued.lock();
+                    if last.is_some_and(|previous| {
+                        frame.captured_at.saturating_duration_since(previous) < rate.interval()
+                    }) {
+                        subscriber.dropped.fetch_add(1, Ordering::Relaxed);
+                        return true;
+                    }
+                    *last = Some(frame.captured_at);
                 }
                 match subscriber.delivery {
                     DeliveryPolicy::Latest => {
@@ -683,12 +849,52 @@ impl FrameHub {
         }
     }
 }
-struct Lease<'a> {
-    hub: &'a FrameHub,
+pub(crate) struct NativeWriteLease {
+    lease: Option<Lease>,
+    session: u64,
+    layout: FrameLayout,
+    timestamp: Option<SourceTimestamp>,
+    captured_at: Instant,
+}
+
+impl NativeWriteLease {
+    pub(crate) fn bytes_mut(&mut self) -> &mut [u8] {
+        self.lease
+            .as_mut()
+            .expect("lease is present until commit")
+            .data
+            .as_mut()
+            .expect("reserved storage is present")
+            .bytes_mut()
+    }
+
+    pub(crate) fn set_timestamp(&mut self, timestamp: SourceTimestamp) {
+        self.timestamp = Some(timestamp);
+    }
+
+    pub(crate) fn commit(mut self) -> CameraResult<bool> {
+        let lease = self.lease.take().expect("lease is present until commit");
+        let hub = lease.hub.clone();
+        hub.finish_publish(
+            Publication {
+                session: self.session,
+                layout: self.layout,
+                timestamp: self.timestamp,
+                source_sequence: None,
+                captured_at: self.captured_at,
+                elapsed: 0,
+            },
+            &lease,
+        )
+    }
+}
+
+struct Lease {
+    hub: FrameHub,
     index: usize,
     data: Option<Storage>,
 }
-impl Drop for Lease<'_> {
+impl Drop for Lease {
     fn drop(&mut self) {
         self.hub.pool.lock().slots[self.index].data = self.data.take();
     }
@@ -755,6 +961,8 @@ impl FrameReceiver {
     pub async fn next_timeout(&mut self, timeout: Duration) -> CameraResult<Frame> {
         tokio::time::timeout(timeout, self.next())
             .await
-            .map_err(|_| CameraError::Timeout)?
+            .map_err(|_| CameraError::Timeout {
+                stage: crate::OperationStage::FrameWait,
+            })?
     }
 }

@@ -78,7 +78,7 @@ pub enum NdkCameraStatus {
 impl NdkCameraStatus {
     pub fn error(self, operation: impl Into<String>) -> crate::CameraError {
         crate::CameraError::Native {
-            backend: crate::BackendType::Camera2,
+            backend: crate::BackendId::CAMERA2,
             operation: operation.into(),
             code: self as i32 as i64,
             message: self.to_error_string().into(),
@@ -112,6 +112,11 @@ extern "C" {
     // Lifecycle
     pub fn ndk_camera2_create() -> *mut NdkCamera2;
     pub fn ndk_camera2_destroy(cam: *mut NdkCamera2);
+    pub fn ndk_camera2_set_options(
+        cam: *mut NdkCamera2,
+        max_images: i32,
+        request_template: i32,
+    ) -> NdkCameraStatus;
 
     // Device enumeration
     pub fn ndk_camera2_get_device_count(

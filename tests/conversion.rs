@@ -1,6 +1,8 @@
+#![cfg(feature = "convert-rgb")]
+
 use camera::{
-    ColorInfo, ColorMatrix, ColorRange, ConversionRequest, FrameLayout, Orientation, PixelFormat,
-    PlaneLayout, RgbConverter,
+    selected_conversion_path, ColorInfo, ColorMatrix, ColorRange, ConversionRequest, FrameLayout,
+    Orientation, PixelFormat, PlaneLayout, RgbConverter,
 };
 fn packed(format: PixelFormat, stride: usize, pixel_stride: usize, length: usize) -> FrameLayout {
     FrameLayout {
@@ -119,6 +121,231 @@ fn conversion_request_downscales_bgra_without_a_full_size_destination() {
     assert_eq!(out, [1, 2, 3, 7, 8, 9]);
 }
 
+fn nearest_rgb_reference(
+    full: &[u8],
+    source_width: usize,
+    source_height: usize,
+    width: usize,
+    height: usize,
+) -> Vec<u8> {
+    let mut scaled = vec![0; width * height * 3];
+    for y in 0..height {
+        let source_y = y * source_height / height;
+        for x in 0..width {
+            let source_x = x * source_width / width;
+            let source = (source_y * source_width + source_x) * 3;
+            let destination = (y * width + x) * 3;
+            scaled[destination..destination + 3].copy_from_slice(&full[source..source + 3]);
+        }
+    }
+    scaled
+}
+
+#[test]
+fn arbitrary_scaling_matches_full_conversion_for_packed_and_yuv_formats() {
+    let color = ColorInfo {
+        matrix: ColorMatrix::Bt601,
+        range: ColorRange::Full,
+        ..Default::default()
+    };
+    let layouts_and_data: [(FrameLayout, Vec<u8>); 3] = [
+        (
+            FrameLayout {
+                width: 8,
+                height: 6,
+                format: PixelFormat::Rgb8,
+                planes: vec![PlaneLayout {
+                    offset: 0,
+                    length: 8 * 6 * 3,
+                    row_stride: 8 * 3,
+                    pixel_stride: 3,
+                }],
+                color: ColorInfo::default(),
+                orientation: Orientation::default(),
+                bottom_up: false,
+            },
+            (0..8 * 6 * 3).map(|value| value as u8).collect(),
+        ),
+        (
+            FrameLayout {
+                width: 8,
+                height: 6,
+                format: PixelFormat::Yuyv,
+                planes: vec![PlaneLayout {
+                    offset: 0,
+                    length: 8 * 6 * 2,
+                    row_stride: 8 * 2,
+                    pixel_stride: 2,
+                }],
+                color,
+                orientation: Orientation::default(),
+                bottom_up: false,
+            },
+            (0..8 * 6 * 2)
+                .map(|value| (value * 17 + 31) as u8)
+                .collect(),
+        ),
+        (
+            FrameLayout {
+                width: 8,
+                height: 6,
+                format: PixelFormat::Nv12,
+                planes: vec![
+                    PlaneLayout {
+                        offset: 0,
+                        length: 8 * 6,
+                        row_stride: 8,
+                        pixel_stride: 1,
+                    },
+                    PlaneLayout {
+                        offset: 8 * 6,
+                        length: 8 * 3,
+                        row_stride: 8,
+                        pixel_stride: 2,
+                    },
+                ],
+                color,
+                orientation: Orientation::default(),
+                bottom_up: false,
+            },
+            (0..8 * 6 + 8 * 3)
+                .map(|value| (value * 13 + 47) as u8)
+                .collect(),
+        ),
+    ];
+
+    for (layout, data) in layouts_and_data {
+        let mut converter = RgbConverter::new();
+        let mut full = vec![0; 8 * 6 * 3];
+        converter
+            .convert_layout_into(
+                &layout,
+                &data,
+                ConversionRequest::for_layout(&layout),
+                &mut full,
+            )
+            .unwrap();
+        let mut scaled = vec![0; 5 * 4 * 3];
+        converter
+            .convert_layout_into(
+                &layout,
+                &data,
+                ConversionRequest::new(5, 4).unwrap(),
+                &mut scaled,
+            )
+            .unwrap();
+        assert_eq!(
+            scaled,
+            nearest_rgb_reference(&full, 8, 6, 5, 4),
+            "format {:?}",
+            layout.format
+        );
+
+        let mut half = vec![0; 4 * 3 * 3];
+        converter
+            .convert_layout_into(
+                &layout,
+                &data,
+                ConversionRequest::new(4, 3).unwrap(),
+                &mut half,
+            )
+            .unwrap();
+        assert_eq!(
+            half,
+            nearest_rgb_reference(&full, 8, 6, 4, 3),
+            "half-size format {:?}",
+            layout.format
+        );
+    }
+}
+
+#[test]
+fn diagnostic_path_uses_the_same_exact_half_and_arbitrary_rules_as_conversion() {
+    let layout = FrameLayout {
+        width: 1920,
+        height: 1080,
+        format: PixelFormat::Nv12,
+        planes: vec![
+            PlaneLayout {
+                offset: 0,
+                length: 1920 * 1080,
+                row_stride: 1920,
+                pixel_stride: 1,
+            },
+            PlaneLayout {
+                offset: 1920 * 1080,
+                length: 1920 * 540,
+                row_stride: 1920,
+                pixel_stride: 2,
+            },
+        ],
+        color: ColorInfo {
+            matrix: ColorMatrix::Bt709,
+            range: ColorRange::Limited,
+            ..Default::default()
+        },
+        orientation: Orientation::default(),
+        bottom_up: false,
+    };
+
+    assert_eq!(
+        selected_conversion_path(&layout, ConversionRequest::new(960, 540).unwrap()),
+        "nv12-direct-half"
+    );
+    assert_eq!(
+        selected_conversion_path(&layout, ConversionRequest::new(1280, 720).unwrap()),
+        "yuv-row-convert-nearest"
+    );
+    assert_eq!(
+        selected_conversion_path(&layout, ConversionRequest::new(320, 180).unwrap()),
+        "mapped-nearest"
+    );
+
+    let packed_layout = FrameLayout {
+        format: PixelFormat::Yuyv,
+        planes: vec![PlaneLayout {
+            offset: 0,
+            length: 1920 * 1080 * 2,
+            row_stride: 1920 * 2,
+            pixel_stride: 2,
+        }],
+        ..layout.clone()
+    };
+    assert_eq!(
+        selected_conversion_path(&packed_layout, ConversionRequest::new(960, 540).unwrap()),
+        "yuv422-direct-half"
+    );
+
+    let planar_layout = FrameLayout {
+        format: PixelFormat::Yuv420p,
+        planes: vec![
+            PlaneLayout {
+                offset: 0,
+                length: 1920 * 1080,
+                row_stride: 1920,
+                pixel_stride: 1,
+            },
+            PlaneLayout {
+                offset: 1920 * 1080,
+                length: 960 * 540,
+                row_stride: 960,
+                pixel_stride: 1,
+            },
+            PlaneLayout {
+                offset: 1920 * 1080 + 960 * 540,
+                length: 960 * 540,
+                row_stride: 960,
+                pixel_stride: 1,
+            },
+        ],
+        ..layout
+    };
+    assert_eq!(
+        selected_conversion_path(&planar_layout, ConversionRequest::new(960, 540).unwrap()),
+        "yuv420p-direct-half"
+    );
+}
+
 #[test]
 fn conversion_request_validates_dimensions_and_exact_destination_size() {
     assert!(ConversionRequest::new(0, 1).is_err());
@@ -131,7 +358,7 @@ fn conversion_request_validates_dimensions_and_exact_destination_size() {
         .is_err());
 }
 
-#[cfg(feature = "turbojpeg")]
+#[cfg(feature = "decode-mjpeg")]
 #[test]
 fn mjpeg_conversion_scales_at_decode_time_and_resets_between_requests() {
     let width = 16;

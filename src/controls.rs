@@ -1,8 +1,9 @@
 //! Controls carry units and report whether readback is actual or only requested.
+use crate::api::CaptureSession;
 use crate::backends::BackendCamera;
 use crate::{
     BackendType, CameraControlType as Raw, CameraControlValue as RawValue, CameraError,
-    CameraResult, CaptureSession,
+    CameraResult,
 };
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum ControlId {
@@ -59,6 +60,36 @@ pub enum ControlReadback {
     Actual(ControlValue),
     Requested(ControlValue),
     Unknown,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Kelvin(u32);
+impl Kelvin {
+    pub fn new(value: u32) -> CameraResult<Self> {
+        if !(1_000..=40_000).contains(&value) {
+            return Err(CameraError::InvalidConfig(
+                "White-balance temperature must be 1000..=40000 K".into(),
+            ));
+        }
+        Ok(Self(value))
+    }
+    pub const fn get(self) -> u32 {
+        self.0
+    }
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Exposure {
+    Auto,
+    Manual(std::time::Duration),
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WhiteBalance {
+    Auto,
+    Temperature(Kelvin),
+}
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Focus {
+    Auto,
+    Position(f64),
 }
 #[derive(Clone, Debug)]
 pub struct ControlRange {
@@ -259,7 +290,7 @@ fn descriptor(camera: &BackendCamera, id: ControlId) -> CameraResult<ControlDesc
         }
         #[cfg(all(
             any(feature = "native", feature = "backend-avfoundation"),
-            target_vendor = "apple"
+            any(target_os = "macos", target_os = "ios")
         ))]
         BackendCamera::AVFoundation(c) => {
             writable = Some(true);
@@ -299,14 +330,19 @@ fn descriptor(camera: &BackendCamera, id: ControlId) -> CameraResult<ControlDesc
 }
 impl CaptureSession {
     pub async fn controls(&self) -> CameraResult<Vec<ControlDescriptor>> {
-        if self.device().id.backend().is_none() {
+        if self.device().id.backend() == &crate::BackendId::SYNTHETIC {
             return Ok(Vec::new());
         }
         self.with_native(|c| {
-            Ok(IDS
-                .iter()
-                .filter_map(|&id| descriptor(&c, id).ok())
-                .collect())
+            let mut controls = Vec::new();
+            for &id in IDS {
+                match descriptor(&c, id) {
+                    Ok(descriptor) => controls.push(descriptor),
+                    Err(CameraError::ControlNotSupported(_)) => {}
+                    Err(error) => return Err(error),
+                }
+            }
+            Ok(controls)
         })
         .await
     }
@@ -343,6 +379,7 @@ impl CaptureSession {
                         any(feature = "native", feature = "backend-camera2"),
                         target_os = "android"
                     ))]
+                    #[allow(irrefutable_let_patterns)]
                     if let BackendCamera::Camera2(native) = &c {
                         let value = native
                             .supported_modes(raw)?
@@ -457,6 +494,71 @@ impl CaptureSession {
         }
         self.set_control(ControlId::ExposureTime, ControlValue::Number(value.round()))
             .await
+    }
+
+    pub async fn set_exposure(&self, exposure: Exposure) -> CameraResult<()> {
+        match exposure {
+            Exposure::Auto => {
+                self.set_control(
+                    ControlId::ExposureMode,
+                    ControlValue::Mode(ControlMode::Automatic),
+                )
+                .await
+            }
+            Exposure::Manual(duration) => {
+                self.set_control(
+                    ControlId::ExposureMode,
+                    ControlValue::Mode(ControlMode::Manual),
+                )
+                .await?;
+                self.set_exposure_time(duration).await
+            }
+        }
+    }
+
+    pub async fn set_white_balance(&self, value: WhiteBalance) -> CameraResult<()> {
+        match value {
+            WhiteBalance::Auto => {
+                self.set_control(
+                    ControlId::WhiteBalanceMode,
+                    ControlValue::Mode(ControlMode::Automatic),
+                )
+                .await
+            }
+            WhiteBalance::Temperature(kelvin) => {
+                self.set_control(
+                    ControlId::WhiteBalanceMode,
+                    ControlValue::Mode(ControlMode::Manual),
+                )
+                .await?;
+                self.set_control(
+                    ControlId::WhiteBalanceTemperature,
+                    ControlValue::Number(f64::from(kelvin.get())),
+                )
+                .await
+            }
+        }
+    }
+
+    pub async fn set_focus(&self, value: Focus) -> CameraResult<()> {
+        match value {
+            Focus::Auto => {
+                self.set_control(
+                    ControlId::FocusMode,
+                    ControlValue::Mode(ControlMode::Automatic),
+                )
+                .await
+            }
+            Focus::Position(position) => {
+                self.set_control(
+                    ControlId::FocusMode,
+                    ControlValue::Mode(ControlMode::Manual),
+                )
+                .await?;
+                self.set_control(ControlId::FocusPosition, ControlValue::Number(position))
+                    .await
+            }
+        }
     }
 }
 
