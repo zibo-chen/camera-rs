@@ -10,7 +10,7 @@
     <color name="status_reconnecting">#FF9800</color>
     <color name="status_error">#F44336</color>
     
-    <!-- 深色主题颜色 -->
+    <!-- Dark theme colors. -->
     <color name="background_dark">#121212</color>
     <color name="toolbar_background">#1E1E1E</color>
     <color name="panel_background">#1A1A1A</color>

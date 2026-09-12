@@ -1,180 +1,93 @@
-# Medivh Camera Android Example
+# Medivh Camera Android Backend Demo
 
-这是 `medivh-camera` 库的 Android 示例应用，展示如何在 Android 平台上使用 UVC 摄像头。
+这个应用是 `camera-rs` Android 后端的交互式诊断工具，不只用于展示画面。它会使用设备真实返回的数据完成以下流程：
 
-## 功能
+- 在 `Camera2`、`UVC`、`V4L2` 三个后端之间显式切换，不做静默回退。
+- 枚举所选后端的设备。
+- 启动前查询并展示原生格式、分辨率和有理数帧率；V4L2 的连续或步进范围也会保留在 JNI 结果中。
+- 按选中的格式、分辨率和帧率启动，而不是固定使用 `640x480@30`。
+- 显示实时帧率、后端收帧/发布数量、池丢帧、订阅丢帧和转换耗时。
+- 启动后检测控制 descriptor，区分可读、可写、数值范围、步进、默认值、模式及手动模式依赖。
+- 对可写数值控制使用滑杆，对曝光/对焦/白平衡等模式控制使用下拉选择，并支持恢复设备报告的默认值。
 
-- 📷 **设备枚举**: 列出所有连接的 UVC 摄像头
-- ⚙️ **配置选择**: 查看和选择摄像头支持的分辨率、帧率、格式
-- 🎥 **实时预览**: 显示摄像头视频流
-- 📊 **统计信息**: 显示帧率、丢帧率、缓冲区使用情况等
-- 🎛️ **参数控制**: 调整亮度、对比度、曝光、对焦等摄像头参数
-- 🔄 **热插拔支持**: 自动检测设备连接和断开
+## 后端权限边界
 
-## 构建步骤
+- `Camera2` 使用 Android `CAMERA` 运行时权限。
+- `UVC` 通过 `UsbManager` 请求用户授权，能力查询和启动都使用已经授权的 USB 文件描述符。
+- `V4L2` 直接打开 `/dev/video*`。普通 Android 应用通常没有设备节点 DAC/SELinux 权限；Demo 会展示结构化的 `permission_denied`，不会把它误报成“没有摄像头”。要实机测试 V4L2，需要设备镜像、ueventd/SELinux 策略或调试 root 环境允许应用访问节点。
 
-### 1. 环境准备
+## 构建
 
-确保已安装：
-- Android Studio
-- Android NDK (推荐 27.0.12077973)
-- Rust 和 cargo-ndk
-- 目标平台工具链：`rustup target add aarch64-linux-android`
-
-### 2. 编译 Rust JNI 库
+要求 Rust 1.88+、Android SDK、NDK 27，以及 `aarch64-linux-android` Rust target。
 
 ```bash
-cd medivh-camera/android_example
-chmod +x build-jni.sh
+rustup target add aarch64-linux-android
+export ANDROID_NDK_HOME="$ANDROID_HOME/ndk/27.0.12077973"
+cd android_example
+./gradlew assembleDebug
+```
+
+Gradle 会以以下特性构建 JNI：
+
+```text
+camera2,uvc,v4l2,convert-rgb,decode-mjpeg
+```
+
+也可以只构建 JNI：
+
+```bash
 ./build-jni.sh
 ```
 
-这将编译 `libmedivh_camera.so` 并放置到 `src/main/jniLibs/arm64-v8a/` 目录。
-
-### 3. 使用 Android Studio 构建
-
-1. 打开 Android Studio
-2. 选择 "Open an Existing Project"
-3. 选择 `UVCAndroid` 根目录
-4. 等待 Gradle 同步完成
-5. 选择 `medivh-camera.android_example` 模块
-6. 点击 Run 按钮
-
-## 项目结构
-
-```
-android_example/
-├── build.gradle                    # Gradle 配置
-├── build-jni.sh                    # JNI 库构建脚本
-├── proguard-rules.pro              # ProGuard 规则
-├── README.md                       # 本文件
-└── src/main/
-    ├── AndroidManifest.xml         # Android 清单
-    ├── java/com/medivh/camera/
-    │   ├── MedivhCamera.java       # 高层 API 封装
-    │   ├── MedivhCameraBridge.java # JNI 桥接
-    │   └── demo/
-    │       ├── MainActivity.java   # 主界面
-    │       └── MedivhCameraApp.java
-    ├── jniLibs/arm64-v8a/          # 编译后的 .so 文件
-    │   └── libmedivh_camera.so
-    └── res/
-        ├── layout/activity_main.xml
-        ├── values/strings.xml
-        ├── values/colors.xml
-        ├── values/styles.xml
-        └── xml/device_filter.xml   # USB 设备过滤器
-```
-
-## API 使用示例
-
-### 初始化
+## JNI 能力接口
 
 ```java
-// 在 Application 中初始化
-MedivhCamera.init();
-```
+JSONArray devices = MedivhCamera.devices("camera2");
+String id = devices.getJSONObject(0).getString("id");
+JSONObject capabilities = MedivhCamera.capabilities("camera2", id);
+JSONArray modes = capabilities.getJSONArray("modes");
 
-### 列出设备
-
-```java
-List<MedivhCamera.DeviceInfo> devices = MedivhCamera.listDevices();
-for (MedivhCamera.DeviceInfo device : devices) {
-    Log.d(TAG, "Found: " + device);
-}
-```
-
-### 获取支持的配置
-
-```java
-List<MedivhCamera.CameraConfig> configs = MedivhCamera.getSupportedConfigs(0);
-for (MedivhCamera.CameraConfig config : configs) {
-    Log.d(TAG, "Config: " + config);
-}
-```
-
-### 打开摄像头并预览
-
-```java
-MedivhCamera camera = new MedivhCamera();
-
-// 打开设备
-if (camera.open(0)) {
-    // 设置帧回调
-    camera.setFrameCallback(frame -> {
-        Bitmap bitmap = frame.toBitmap();
-        // 更新 UI
-        runOnUiThread(() -> imageView.setImageBitmap(bitmap));
-    });
-    
-    // 启动流
-    MedivhCamera.CameraConfig config = new MedivhCamera.CameraConfig(
-        MedivhCamera.VideoFormat.MJPEG, 640, 480, 30
+JSONObject mode = modes.getJSONObject(0);
+try (MedivhCamera camera = new MedivhCamera("camera2", id)) {
+    JSONObject negotiated = camera.start(
+        mode.getString("format"),
+        mode.getInt("width"),
+        mode.getInt("height"),
+        mode.getInt("frameRateNumerator"),
+        mode.getInt("frameRateDenominator")
     );
-    camera.startStream(config);
+    JSONArray controls = camera.controls();
 }
 ```
 
-### 获取统计信息
+`nativeCapabilities` 返回：
 
-```java
-MedivhCamera.StreamStats stats = camera.getStats();
-Log.d(TAG, "FPS: " + stats.currentFps);
-Log.d(TAG, "Dropped: " + stats.droppedFrames);
+- `knowledge`: `known`、`representative` 或 `unknown`。
+- `modes`: 离散/代表性格式、宽高、帧率分子分母和 FPS。
+- `ranges`: V4L2 等后端报告的连续或步进尺寸/帧间隔范围。
+- `nativeFormats`: 设备原生采集格式。
+- `conversions`: 到 RGB 的转换是否可用及缺少的 feature。
+- `limitations`: 后端发现的限制说明。
+
+JNI 错误消息是结构化 JSON，界面会同时展示稳定的 `code`、`recovery` 和可读消息。调用方应基于 `code`/`recovery` 分支，不能解析自然语言错误文本。
+
+## 设备测试
+
+仓库中的 `BackendInstrumentedTest` 会验证能力查询、指定格式启动、帧唯一性、统计、控制 descriptor、停止唤醒、重复启停和文件描述符稳定性：
+
+```bash
+./scripts/test-android-device.sh DEVICE_SERIAL camera2
+./scripts/test-android-device.sh DEVICE_SERIAL uvc
+./scripts/test-android-device.sh DEVICE_SERIAL v4l2
 ```
 
-### 控制摄像头参数
+在已授权 root 的调试设备上，可显式要求脚本在 APK 安装后临时放开一个 V4L2 节点。脚本会记录原 mode，并在测试成功或失败后恢复：
 
-```java
-// 获取支持的控制类型
-List<MedivhCamera.ControlType> controls = camera.getSupportedControls();
-
-// 获取范围
-MedivhCamera.ControlRange range = camera.getControlRange(MedivhCamera.ControlType.BRIGHTNESS);
-Log.d(TAG, "Brightness range: " + range.min + " - " + range.max);
-
-// 设置值
-camera.setControl(MedivhCamera.ControlType.BRIGHTNESS, 128);
-
-// 重置
-camera.resetControl(MedivhCamera.ControlType.BRIGHTNESS);
-camera.resetAllControls();
+```bash
+CAMERA_V4L2_ROOT=1 CAMERA_V4L2_DEVICE=/dev/video0 \
+  ./scripts/test-android-device.sh DEVICE_SERIAL v4l2
 ```
 
-### 清理
+这只处理设备节点 DAC 权限，不会修改 SELinux 状态或写入持久系统策略；在 Enforcing 设备上仍需要正确的系统策略。
 
-```java
-camera.stopStream();
-camera.close();
-```
-
-## 注意事项
-
-1. **USB 权限**: 首次连接 USB 摄像头时需要用户授权
-2. **设备兼容性**: 仅支持 UVC 兼容的 USB 摄像头
-3. **最小 SDK**: API 21 (Android 5.0)
-4. **架构支持**: 目前仅支持 arm64-v8a
-
-## 故障排除
-
-### 找不到设备
-
-1. 确保摄像头已正确连接
-2. 检查是否已授予 USB 权限
-3. 尝试重新插拔摄像头
-
-### 启动流失败
-
-1. 尝试选择不同的配置（YUYV 格式通常兼容性更好）
-2. 降低分辨率或帧率
-3. 查看 logcat 输出获取详细错误信息
-
-### 库加载失败
-
-1. 确保已运行 `build-jni.sh` 构建 JNI 库
-2. 检查 `jniLibs/arm64-v8a/libmedivh_camera.so` 是否存在
-3. 确保设备是 arm64 架构
-
-## 许可证
-
-MIT License
+同一个物理 USB 摄像头不能同时由 UVC、V4L2 和 Camera2 外接相机服务占用。切换后端前先停止并关闭当前会话。

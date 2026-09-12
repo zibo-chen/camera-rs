@@ -25,7 +25,7 @@ env "CC_$key=$camera_tools/$clang_target-clang" \
  "CMAKE_TOOLCHAIN_FILE_$key=$camera_root/cmake/android.cmake" \
  cargo build --manifest-path "$camera_root/camera-android/Cargo.toml" --release --target "$target" "$@"
 mkdir -p "$camera_root/android_example/src/main/jniLibs/$abi"
-cp "$camera_root/camera-android/target/$target/release/libcamera_android.so" "$camera_root/android_example/src/main/jniLibs/$abi/"
+cp "$camera_root/target/$target/release/libcamera_android.so" "$camera_root/android_example/src/main/jniLibs/$abi/"
 # The Camera2 C++ bridge links the NDK shared C++ runtime. Package the matching ABI.
 case "$target" in
  aarch64-linux-android) runtime_triple=aarch64-linux-android ;;

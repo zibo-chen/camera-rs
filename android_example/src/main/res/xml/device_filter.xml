@@ -1,6 +1,6 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
-    <!-- 匹配所有 UVC 摄像头 -->
+    <!-- Match all UVC cameras. -->
     <usb-device class="239" subclass="2" /> <!-- Video class -->
     <usb-device class="14" />               <!-- Video class (alternate) -->
 </resources>

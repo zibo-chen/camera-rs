@@ -8,10 +8,11 @@ tasks.register('buildRustJni', Exec) {
         fileTree("${rustProjectDir}/3rdparty"), fileTree("${rustProjectDir}/cmake"),
         fileTree("${rustProjectDir}/camera-android/src"), file("${rustProjectDir}/Cargo.toml"),
         file("${rustProjectDir}/Cargo.lock"), file("${rustProjectDir}/camera-android/Cargo.toml"),
-        file("${rustProjectDir}/camera-android/Cargo.lock"), file("${rustProjectDir}/build.rs"))
+        file("${rustProjectDir}/build.rs"))
     inputs.file(file("${rustProjectDir}/scripts/build-android-adapter.sh"))
     outputs.files(file("${projectDir}/src/main/jniLibs/arm64-v8a/libcamera_android.so"), file("${projectDir}/src/main/jniLibs/arm64-v8a/libc++_shared.so"))
-    commandLine 'bash', "${rustProjectDir}/scripts/build-android-adapter.sh", 'aarch64-linux-android'
+    commandLine 'bash', "${rustProjectDir}/scripts/build-android-adapter.sh", 'aarch64-linux-android',
+        '--no-default-features', '--features', 'camera2,uvc,v4l2,convert-rgb,decode-mjpeg'
 }
 tasks.matching { it.name == 'preBuild' }.configureEach { dependsOn 'buildRustJni' }
 
@@ -24,8 +25,8 @@ android {
         applicationId "com.medivh.camera.demo"
         minSdk 24
         targetSdk 34
-        versionCode 1
-        versionName "1.0"
+        versionCode 2
+        versionName "1.1"
 
         testInstrumentationRunner "androidx.test.runner.AndroidJUnitRunner"
         
@@ -36,10 +37,10 @@ android {
 
     buildTypes {
         release {
-            minifyEnabled true        // 代码混淆
-            shrinkResources true      // 资源压缩
-            crunchPngs true           // PNG压缩
-            debuggable false          // 禁用调试
+            minifyEnabled true        // Enable code shrinking and obfuscation.
+            shrinkResources true      // Remove unused resources.
+            crunchPngs true           // Compress PNG resources.
+            debuggable false          // Disable debugging.
             jniDebuggable false
             renderscriptDebuggable false
             proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'
@@ -49,6 +50,10 @@ android {
     compileOptions {
         sourceCompatibility JavaVersion.VERSION_1_8
         targetCompatibility JavaVersion.VERSION_1_8
+    }
+
+    sourceSets {
+        main.java.srcDir "${rustProjectDir}/camera-android/java"
     }
     
     buildFeatures {

@@ -1,10 +1,11 @@
 <?xml version="1.0" encoding="utf-8"?>
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
 
-    <!-- USB Host 功能 -->
+    <!-- USB host capability. -->
     <uses-feature android:name="android.hardware.usb.host" />
+    <uses-feature android:name="android.hardware.camera" android:required="false" />
     
-    <!-- 权限 -->
+    <!-- Permissions. -->
     <uses-permission android:name="android.permission.CAMERA" />
 
     <application
@@ -18,14 +19,13 @@
             android:name=".MainActivity"
             android:exported="true"
             android:launchMode="singleTask"
-            android:screenOrientation="portrait"
             android:configChanges="orientation|screenSize">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
             
-            <!-- USB 设备连接 -->
+            <!-- USB device attachment. -->
             <intent-filter>
                 <action android:name="android.hardware.usb.action.USB_DEVICE_ATTACHED" />
             </intent-filter>

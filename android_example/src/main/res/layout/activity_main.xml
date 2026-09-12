@@ -1,5 +1,6 @@
 <?xml version="1.0" encoding="utf-8"?>
 <LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:app="http://schemas.android.com/apk/res-auto"
     xmlns:tools="http://schemas.android.com/tools"
     android:layout_width="match_parent"
     android:layout_height="match_parent"
@@ -7,7 +8,7 @@
     android:background="@color/background_dark"
     tools:context=".MainActivity">
 
-    <!-- 顶部工具栏 -->
+    <!-- Top toolbar. -->
     <LinearLayout
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
@@ -27,7 +28,7 @@
             android:textSize="20sp"
             android:textStyle="bold" />
 
-        <!-- 状态指示器 -->
+        <!-- Status indicator. -->
         <LinearLayout
             android:layout_width="wrap_content"
             android:layout_height="wrap_content"
@@ -54,7 +55,7 @@
         </LinearLayout>
     </LinearLayout>
 
-    <!-- 主内容区域 - 默认手机竖屏布局 -->
+    <!-- Main content area for the default phone portrait layout. -->
     <LinearLayout
         android:layout_width="match_parent"
         android:layout_height="0dp"
@@ -62,14 +63,14 @@
         android:orientation="vertical"
         android:baselineAligned="false">
 
-        <!-- 顶部 - 视频预览区域 -->
+        <!-- Top video preview area. -->
         <FrameLayout
             android:layout_width="match_parent"
             android:layout_height="0dp"
             android:layout_weight="5"
             android:background="@color/preview_background">
 
-            <!-- 视频预览 -->
+            <!-- Video preview. -->
             <ImageView
                 android:id="@+id/image_preview"
                 android:layout_width="match_parent"
@@ -77,7 +78,7 @@
                 android:adjustViewBounds="true"
                 android:scaleType="fitCenter" />
 
-            <!-- 预览占位符 -->
+            <!-- Preview placeholder. -->
             <LinearLayout
                 android:id="@+id/preview_placeholder"
                 android:layout_width="match_parent"
@@ -102,7 +103,7 @@
                     android:textSize="16sp" />
             </LinearLayout>
 
-            <!-- 实时统计信息悬浮层 -->
+            <!-- Live statistics overlay. -->
             <LinearLayout
                 android:id="@+id/overlay_stats"
                 android:layout_width="wrap_content"
@@ -144,7 +145,7 @@
                     android:text="Frames: 0" />
             </LinearLayout>
 
-            <!-- 控制按钮悬浮层 -->
+            <!-- Control button overlay. -->
             <LinearLayout
                 android:layout_width="wrap_content"
                 android:layout_height="wrap_content"
@@ -176,7 +177,7 @@
             </LinearLayout>
         </FrameLayout>
 
-        <!-- 底部 - 控制面板 -->
+        <!-- Bottom control panel. -->
         <ScrollView
             android:layout_width="match_parent"
             android:layout_height="0dp"
@@ -190,7 +191,7 @@
                 android:orientation="vertical"
                 android:padding="16dp">
 
-                <!-- 设备选择卡片 -->
+                <!-- Device selector card. -->
                 <LinearLayout
                     android:layout_width="match_parent"
                     android:layout_height="wrap_content"
@@ -209,7 +210,7 @@
                             android:layout_width="20dp"
                             android:layout_height="20dp"
                             android:src="@drawable/ic_usb"
-                            android:tint="@color/accent" />
+                            app:tint="@color/accent" />
 
                         <TextView
                             android:layout_width="0dp"
@@ -231,7 +232,7 @@
                             android:contentDescription="@string/refresh_devices" />
                     </LinearLayout>
 
-                    <!-- 后端选择 -->
+                    <!-- Backend selector. -->
                     <RadioGroup
                         android:id="@+id/rg_backend"
                         android:layout_width="match_parent"
@@ -245,7 +246,7 @@
                             android:layout_height="wrap_content"
                             android:layout_weight="1"
                             android:text="@string/backend_uvc"
-                            android:checked="true"
+                            android:checked="false"
                             android:textColor="@color/text_primary"
                             android:textSize="12sp" />
 
@@ -254,7 +255,17 @@
                             android:layout_width="0dp"
                             android:layout_height="wrap_content"
                             android:layout_weight="1"
+                            android:checked="true"
                             android:text="@string/backend_camera2"
+                            android:textColor="@color/text_primary"
+                            android:textSize="12sp" />
+
+                        <RadioButton
+                            android:id="@+id/rb_v4l2"
+                            android:layout_width="0dp"
+                            android:layout_height="wrap_content"
+                            android:layout_weight="1"
+                            android:text="@string/backend_v4l2"
                             android:textColor="@color/text_primary"
                             android:textSize="12sp" />
                     </RadioGroup>
@@ -277,7 +288,7 @@
                         android:paddingHorizontal="12dp" />
                 </LinearLayout>
 
-                <!-- 配置选择卡片 -->
+                <!-- Configuration selector card. -->
                 <LinearLayout
                     android:layout_width="match_parent"
                     android:layout_height="wrap_content"
@@ -296,7 +307,7 @@
                             android:layout_width="20dp"
                             android:layout_height="20dp"
                             android:src="@drawable/ic_settings"
-                            android:tint="@color/accent" />
+                            app:tint="@color/accent" />
 
                         <TextView
                             android:layout_width="0dp"
@@ -336,7 +347,7 @@
                         android:showText="false" />
                 </LinearLayout>
 
-                <!-- 统计信息卡片 -->
+                <!-- Statistics card. -->
                 <LinearLayout
                     android:layout_width="match_parent"
                     android:layout_height="wrap_content"
@@ -355,7 +366,7 @@
                             android:layout_width="20dp"
                             android:layout_height="20dp"
                             android:src="@drawable/ic_chart"
-                            android:tint="@color/accent" />
+                            app:tint="@color/accent" />
 
                         <TextView
                             android:layout_width="0dp"
@@ -380,7 +391,7 @@
                         android:text="---" />
                 </LinearLayout>
 
-                <!-- 摄像头控制卡片 -->
+                <!-- Camera controls card. -->
                 <LinearLayout
                     android:id="@+id/layout_controls"
                     android:layout_width="match_parent"
@@ -400,7 +411,7 @@
                             android:layout_width="20dp"
                             android:layout_height="20dp"
                             android:src="@drawable/ic_tune"
-                            android:tint="@color/accent" />
+                            app:tint="@color/accent" />
 
                         <TextView
                             android:layout_width="0dp"
@@ -479,6 +490,15 @@
                             android:thumbTint="@color/accent"
                             android:progressTint="@color/accent"
                             android:progressBackgroundTint="@color/seekbar_background" />
+
+                        <Spinner
+                            android:id="@+id/spinner_control_mode"
+                            android:layout_width="match_parent"
+                            android:layout_height="44dp"
+                            android:layout_marginTop="8dp"
+                            android:background="@drawable/spinner_background"
+                            android:paddingHorizontal="12dp"
+                            android:visibility="gone" />
                     </LinearLayout>
                 </LinearLayout>
 

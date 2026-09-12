@@ -42,6 +42,16 @@ public final class BackendInstrumentedTest {
         if (values != null) for (int candidate : values) if (candidate == value) return true;
         return false;
     }
+    private static JSONArray devicesWithHotplugRetry(String backend) throws Exception {
+        int attempts = backend.equals("uvc") ? 1 : 40;
+        JSONArray devices = new JSONArray();
+        for (int attempt = 0; attempt < attempts; attempt++) {
+            devices = new JSONArray(MedivhCameraBridge.nativeDevices(backend));
+            if (devices.length() > 0 || attempt + 1 == attempts) return devices;
+            SystemClock.sleep(250);
+        }
+        return devices;
+    }
     private static void validateCamera2Controls(Context context, String id, long handle, JSONArray descriptors) throws Exception {
         CameraCharacteristics c = ((CameraManager)context.getSystemService(Context.CAMERA_SERVICE)).getCameraCharacteristics(id);
         JSONObject ae = findControl(descriptors, "ExposureMode");
@@ -90,6 +100,7 @@ public final class BackendInstrumentedTest {
         Intent intent = context.getPackageManager().getLaunchIntentForPackage(context.getPackageName());
         assertNotNull(intent);
         intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+        intent.putExtra("skipAutoScan", true);
         Activity activity = InstrumentationRegistry.getInstrumentation().startActivitySync(intent);
         MedivhCameraBridge.nativeInitWithContext(context);
         int baselineFds = -1;
@@ -126,7 +137,7 @@ public final class BackendInstrumentedTest {
         boolean nativeOutput = Boolean.parseBoolean(args.getString("native", "false"));
         long handle = 0;
         try {
-            int frameworkBefore = new JSONArray(MedivhCameraBridge.nativeDevices("camera2")).length();
+            int frameworkBefore = devicesWithHotplugRetry("camera2").length();
             if (Boolean.parseBoolean(args.getString("expectPermissionDenied", "false"))) {
                 assertEquals("v4l2", backend);
                 try { MedivhCameraBridge.nativeDevices(backend); fail("Expected denied V4L2 nodes"); }
@@ -136,7 +147,7 @@ public final class BackendInstrumentedTest {
                 }
                 return;
             }
-            JSONArray devices = new JSONArray(MedivhCameraBridge.nativeDevices(backend));
+            JSONArray devices = devicesWithHotplugRetry(backend);
             record(new JSONObject().put("backend", backend).put("devices", devices));
             assertTrue("No " + backend + " camera", devices.length() > 0);
             String id = args.getString("deviceId", devices.getJSONObject(0).getString("id"));
@@ -147,13 +158,19 @@ public final class BackendInstrumentedTest {
                     SystemClock.sleep(250);
                 assertTrue("USB permission was not granted", MedivhCameraBridge.nativeHasPermission(id));
             }
+            JSONObject capabilities = new JSONObject(MedivhCameraBridge.nativeCapabilities(backend, id));
+            JSONArray modes = capabilities.getJSONArray("modes");
+            assertTrue("No advertised capture modes for " + backend, modes.length() > 0);
+            record(new JSONObject().put("backend", backend).put("capabilities", capabilities));
             handle = MedivhCameraBridge.nativeOpen(backend, id);
             assertTrue(handle > 0);
             final long activeHandle = handle;
             long lastSession = -1;
             int warmFds = -1;
             for (int round = 0; round < rounds; round++) {
-                JSONObject config = new JSONObject(MedivhCameraBridge.nativeStart(handle, width, height, fps, 1, nativeOutput));
+                JSONObject selected = modes.getJSONObject(0);
+                String format = args.getString("format", selected.getString("format"));
+                JSONObject config = new JSONObject(MedivhCameraBridge.nativeStartWithFormat(handle, width, height, fps, 1, format, nativeOutput));
                 int w = config.getInt("width"), h = config.getInt("height");
                 assertEquals(width, w);
                 assertEquals(height, h);
@@ -165,6 +182,7 @@ public final class BackendInstrumentedTest {
                 Set<Long> hashes = new HashSet<>();
                 long sequence = -1, currentSession = -1;
                 long begin = SystemClock.elapsedRealtimeNanos();
+                long captureEnd = begin;
                 for (int frame = 0; frame < count; frame++) {
                     JSONObject metadata = new JSONObject(MedivhCameraBridge.nativeNextFrame(handle, bytes, 3000));
                     long session = metadata.getLong("session"), nextSequence = metadata.getLong("sequence");
@@ -179,6 +197,7 @@ public final class BackendInstrumentedTest {
                     long hash = 1;
                     for (int i = 0; i < length; i += Math.max(1, length / 4096)) hash = hash * 31 + (bytes.get(i) & 255);
                     hashes.add(hash);
+                    captureEnd = SystemClock.elapsedRealtimeNanos();
                     if (frame == 0) {
                         record(new JSONObject().put("backend",backend).put("round",round).put("config",config).put("firstFrame",metadata));
                     }
@@ -198,7 +217,7 @@ public final class BackendInstrumentedTest {
                 assertNotEquals("Restart reused an old capture epoch", lastSession, currentSession);
                 lastSession = currentSession;
                 JSONObject metrics = new JSONObject(MedivhCameraBridge.nativeMetrics(handle));
-                double elapsed = (SystemClock.elapsedRealtimeNanos() - begin) / 1e9;
+                double elapsed = (captureEnd - begin) / 1e9;
                 JSONArray controls = new JSONArray(MedivhCameraBridge.nativeControls(handle));
                 if (backend.equals("camera2")) validateCamera2Controls(context,id,handle,controls);
                 if (backend.equals("uvc") || backend.equals("v4l2")) validateBrightness(handle,controls);

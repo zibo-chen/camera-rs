@@ -15,7 +15,7 @@ public class MedivhCameraApp extends Application {
     public void onCreate() {
         super.onCreate();
         
-        // 初始化 Medivh Camera（使用带 Context 的新方法）
+        // Initialize Medivh Camera with the Context-aware entry point.
         try {
             MedivhCamera.initWithContext(this);
             Log.i(TAG, "Medivh Camera library initialized with context");
