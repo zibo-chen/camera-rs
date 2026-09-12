@@ -2,7 +2,8 @@
 fn package_identity_is_safe_for_publication() {
     assert_eq!(env!("CARGO_PKG_NAME"), "camera-rs");
     let manifest = include_str!("../Cargo.toml");
-    assert!(manifest.contains("[lib]\nname = \"camera\""));
+    assert!(manifest.lines().any(|line| line == "[lib]"));
+    assert!(manifest.lines().any(|line| line == "name = \"camera\""));
     assert!(manifest.contains("authors = [\"ChenZibo <qw.54@163.com>\"]"));
     assert!(manifest.contains("license = \"MIT OR Apache-2.0\""));
     assert!(!manifest.contains("ssh://"));
