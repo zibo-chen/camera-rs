@@ -2008,7 +2008,9 @@ mod x86 {
             let green_chroma = -gu * u - gv * v + GREEN_ROUNDING;
             let blue_chroma = cb * u + ROUNDING;
             let destination = &mut rgb[pair * 6..pair * 6 + 6];
-            for (y, output) in [y0, y1].into_iter().zip(destination.chunks_exact_mut(3)) {
+            let (pixels, remainder) = destination.as_chunks_mut::<3>();
+            debug_assert!(remainder.is_empty());
+            for (y, output) in [y0, y1].into_iter().zip(pixels) {
                 output.copy_from_slice(&[
                     ((y + red_chroma) >> SHIFT).clamp(0, 255) as u8,
                     ((y + green_chroma) >> SHIFT).clamp(0, 255) as u8,
