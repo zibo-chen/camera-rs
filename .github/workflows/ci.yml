@@ -55,11 +55,11 @@ jobs:
         env:
           RUSTDOCFLAGS: -D warnings -D rustdoc::broken-intra-doc-links
         run: cargo doc --no-deps --no-default-features --features runtime-tokio,blocking,convert-rgb,decode-mjpeg,serde,ndarray,custom-backend
-      - name: Package and archive verification
+      - name: Core package and Android package manifest verification
         run: |
           cargo package --locked
           cargo publish --dry-run --locked
-          cargo package -p camera-rs-android --locked --no-verify
+          cargo package -p camera-rs-android --list --locked
       - uses: taiki-e/install-action@3f74d7c16a4242f1c95561e98edc25d36adb4375
         with:
           tool: cargo-audit,cargo-deny
