@@ -27,3 +27,8 @@ Example payload:
 ```json
 {"code":"permission_denied","recovery":"request_permission","backend":"uvc","stage":"open","nativeCode":-3,"message":"Permission denied: USB camera"}
 ```
+
+## License
+
+Copyright (c) 2026 ChenZibo. Licensed under either the MIT License or the
+Apache License, Version 2.0, at your option.

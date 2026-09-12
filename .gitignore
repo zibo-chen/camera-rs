@@ -15,3 +15,10 @@ output/
 outputs/
 /Android-ndk-camera-zh/
 /android_example/src/main/jniLibs/
+**/local.properties
+*.log
+/android_example/log
+*.apk
+*.aab
+*.jks
+*.keystore

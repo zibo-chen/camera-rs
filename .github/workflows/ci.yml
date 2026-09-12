@@ -8,9 +8,10 @@ jobs:
         os: [ubuntu-latest, macos-latest, windows-latest]
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de
         with:
+          toolchain: stable
           components: rustfmt, clippy
       - name: Linux native prerequisites
         if: runner.os == 'Linux'
@@ -20,7 +21,7 @@ jobs:
         run: brew install nasm
       - name: Windows native prerequisites
         if: runner.os == 'Windows'
-        uses: ilammy/setup-nasm@v1
+        uses: ilammy/setup-nasm@e77cc62a22a374a4d0668286007cc3e3b4c17760 # v1
       - run: cargo fmt --all -- --check
       - name: Native metadata and lifecycle regressions
         if: runner.os != 'Windows'
@@ -29,7 +30,7 @@ jobs:
         run: cargo test --no-default-features --lib
       - name: Public async and blocking contracts
         run: |
-          cargo test --no-default-features --features runtime-tokio,convert-rgb --tests
+          cargo test --no-default-features --features runtime-tokio,convert-rgb,custom-backend --tests
           cargo test --no-default-features --features runtime-tokio,serde --test session_api frame_rate_deserialization_validates_and_normalizes
           cargo test --no-default-features --features blocking --test blocking_api
           cargo run --manifest-path tests/consumer/Cargo.toml
@@ -44,29 +45,42 @@ jobs:
       - name: Conversion performance regression guard
         if: runner.os == 'Linux'
         run: CAMERA_BENCH_QUICK=1 CAMERA_BENCH_ASSERT=1 cargo bench --bench color_convert --no-default-features --features benchmark-internals
-      - run: cargo test --features ndarray
+      - run: cargo test --features ndarray,convert-rgb,decode-mjpeg,custom-backend
       - run: cargo check --all-targets --all-features
-      - run: cargo clippy --all-targets --features ndarray -- -D warnings
+      - run: cargo clippy --all-targets --all-features -- -D warnings
       - name: UVC contracts
         if: runner.os != 'Windows'
-        run: cargo test --features backend-uvc,ndarray
-      - run: cargo doc --no-deps
-      - run: cargo package --allow-dirty
+        run: cargo test --features backend-uvc,ndarray,convert-rgb,decode-mjpeg,custom-backend
+      - name: Public documentation
+        run: RUSTDOCFLAGS="-D warnings -D rustdoc::broken-intra-doc-links" cargo doc --no-deps --no-default-features --features runtime-tokio,blocking,convert-rgb,decode-mjpeg,serde,ndarray,custom-backend
+      - name: Package and archive verification
+        run: |
+          cargo package --locked
+          cargo publish --dry-run --locked
+          cargo package -p camera-rs-android --locked --no-verify
+      - uses: taiki-e/install-action@3f74d7c16a4242f1c95561e98edc25d36adb4375
+        with:
+          tool: cargo-audit,cargo-deny
+      - run: cargo audit --deny warnings
+      - run: cargo deny check
   msrv:
     runs-on: macos-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.88.0
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de
+        with:
+          toolchain: 1.88.0
       - run: brew install nasm
       - run: cargo check --lib --features ndarray,backend-uvc
   android:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de
         with:
+          toolchain: stable
           targets: aarch64-linux-android, armv7-linux-androideabi
-      - uses: android-actions/setup-android@v3
+      - uses: android-actions/setup-android@9fc6c4e9069bf8d3d10b2204b1fb8f6ef7065407 # v3
       - run: sdkmanager 'ndk;27.0.12077973' 'platforms;android-34' 'build-tools;34.0.0'
       - name: Android adapters and example
         run: |
@@ -78,9 +92,10 @@ jobs:
   ios:
     runs-on: macos-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de
         with:
+          toolchain: stable
           targets: aarch64-apple-ios, aarch64-apple-ios-sim
       - run: cargo check --target aarch64-apple-ios --no-default-features --features backend-avfoundation
       - run: cargo check --target aarch64-apple-ios-sim --no-default-features --features backend-avfoundation

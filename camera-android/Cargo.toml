@@ -2,6 +2,7 @@
 name = "camera-rs-android"
 version = "0.5.0"
 edition = "2021"
+authors = ["ChenZibo <qw.54@163.com>"]
 rust-version = "1.88"
 license = "MIT OR Apache-2.0"
 readme = "README.md"

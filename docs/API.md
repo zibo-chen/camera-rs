@@ -1,6 +1,6 @@
-# Camera API 0.4
+# Camera API 0.5
 
-0.4 intentionally removes the pre-0.4 public request, backend enum and session call shapes. There is one capture implementation exposed at three levels: a convenient owning `Capture`, a complete `Device`/`Session` API, and stable external-backend traits.
+0.5 keeps the 0.4 capture model and replaces its public error enum with a stable structured error contract. There is one capture implementation exposed at three levels: a convenient owning `Capture`, a complete `Device`/`Session` API, and stable external-backend traits.
 
 ## Simple capture
 
@@ -62,6 +62,12 @@ let inference = SubscriptionOptions::latest()
 
 `state()` is the current value. `watch_state()` is a coalescing state watch. `events()` is a bounded event stream; lag is returned as `SessionEvent::Missed { count }`. Lifecycle changes, negotiated adjustments and resource pressure use explicit event variants.
 
+All operations use the single `CameraError` type. Its private struct representation can gain diagnostics without breaking downstream pattern matches; callers branch on the non-exhaustive `CameraErrorKind` returned by `kind()`. `RecoveryHint` provides a conservative action independent of backend prose. `code()` is the direct machine-code shortcut. Both enums and `OperationStage` expose stable snake-case codes through `Display`, `FromStr`, and—when enabled—Serde.
+
+Backend, device, stage, operation, and native status are available separately. `BackendPolicy::Prefer` retains each `BackendAttempt` with its original typed `CameraError`, control batches retain typed `causes()`, device-watcher snapshots retain an `Arc<CameraError>`, and failed session state retains the original error. Aggregate errors choose the highest-priority actionable recovery hint and put their first typed cause on the standard source chain. `source_error()` gives direct access to that source after an error is cloned.
+
+The display message is intended for diagnostics only. Callers must not compare or parse it. Typical decisions use `kind()` for product-specific behavior and `recovery_hint()` for retry, permission, re-enumeration, configuration, frame-drop, or resource-pressure handling.
+
 Frame metadata includes plane offsets/lengths/strides, color metadata, orientation, host capture time, optional source timestamp with clock domain, and source/publication sequence distinction. Nominal FPS is not measured throughput. Compare CPU, allocations, copies and frame age/P95/P99 under the same hardware, input and build flags.
 
 When a reconnect policy is enabled, an explicit backend disconnect wakes recovery immediately; a silent source still uses `stall_timeout`. The first soft recovery restarts the existing stream, then failed attempts reopen the native device. Retry delays use 100/200/400 ms fast probes before returning to the configured `delay`. Existing receivers remain attached across the inactive/recovering window and only become terminal when the session is closed or recovery exhausts `max_attempts`. A recovery is not reported as `Streaming` until the new epoch publishes and validates its first frame.
@@ -84,4 +90,6 @@ Without default features, format/request/capability/identity contracts compile w
 
 ## Migration boundary
 
-There is no compatibility layer for `BackendType`, `StreamRequest`, `OutputFormat`, `SelectionPolicy`, `Camera`, `CaptureSession`, parameterless `subscribe()`, `negotiated_config()` or `stop()`. Update applications, examples and adapters to the 0.4 types in one change.
+There is no compatibility layer for the pre-0.5 public `CameraError` variants. Replace variant construction with constructors such as `device_not_found`, `timeout`, and `backend_failure`; replace enum pattern matching with `kind()` or `recovery_hint()`. Do not convert a camera error to `String` when wrapping it in an application error—use a transparent `#[from] camera::CameraError` variant so metadata and sources remain available.
+
+The 0.4 capture migration boundary remains: there is no compatibility layer for `BackendType`, `StreamRequest`, `OutputFormat`, `SelectionPolicy`, `Camera`, `CaptureSession`, parameterless `subscribe()`, `negotiated_config()` or `stop()`.

@@ -7,12 +7,13 @@ cargo test --no-default-features
 cargo test --features ndarray,backend-uvc
 cargo clippy --all-targets --features ndarray,backend-uvc -- -D warnings
 cargo doc --no-deps
-cargo package --allow-dirty
+cargo package --locked
+cargo publish --dry-run --locked
 cargo bench --bench color_convert
 cargo run --example shared_frame_probe -- --synthetic
 ```
 
-Native MJPEG support uses the `turbojpeg` Rust package, whose build needs CMake and a C compiler; x86 SIMD builds need NASM. Linux default capture is V4L2 with MMAP. UVC is opt-in and builds bundled libusb/libuvc; missing sources or native build errors fail immediately, without an automatic system-library fallback; macOS uses IOKit. Bundled UVC is supported on Linux, macOS and Android; Windows uses Media Foundation and the Windows SDK/toolchain. Do not globally hardcode an Android linker or a developer's filesystem path in Cargo configuration.
+Native MJPEG support uses the `turbojpeg` Rust package, whose build needs CMake and a C compiler; x86 SIMD builds need NASM. Linux default capture is V4L2 with MMAP. UVC is opt-in and builds bundled libusb/libuvc; missing sources or native build errors fail immediately, without an automatic system-library fallback; macOS uses IOKit. Bundled UVC is supported on Linux, macOS and Android; Windows uses Media Foundation and the Windows SDK/toolchain. See `VENDORING.md` before distributing a statically linked UVC build. Do not globally hardcode an Android linker or a developer's filesystem path in Cargo configuration.
 
 For Apple applications provide camera usage strings and the appropriate sandbox entitlements. For Android Camera2 request CAMERA permission in the application; for USB request permission through UsbManager before passing an owned/borrowed descriptor. Camera2 requires Android API 24+.
 

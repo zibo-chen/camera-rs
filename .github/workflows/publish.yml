@@ -1,0 +1,37 @@
+name: Publish crates
+
+on:
+  workflow_dispatch:
+    inputs:
+      package:
+        description: Crate to publish after release-environment approval
+        required: true
+        type: choice
+        options:
+          - camera-rs
+          - camera-rs-android
+
+permissions:
+  contents: read
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    environment: release
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de
+        with:
+          toolchain: stable
+      - name: Verify selected crate
+        run: cargo publish --dry-run --locked -p "${{ inputs.package }}"
+      - name: Obtain a short-lived crates.io token
+        id: auth
+        uses: rust-lang/crates-io-auth-action@63a7064947ceca9989005e118db3a5fecdc9259f # v1.0.0
+      - name: Publish selected crate
+        run: cargo publish --locked -p "${{ inputs.package }}"
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
