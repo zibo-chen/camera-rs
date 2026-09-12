@@ -32,7 +32,7 @@ impl StartupDeadline {
     ) -> CameraResult<T> {
         tokio::time::timeout_at(self.0, future)
             .await
-            .map_err(|_| CameraError::Timeout { stage })?
+            .map_err(|_| CameraError::timeout(stage))?
     }
 
     fn remaining(self) -> Duration {
@@ -52,6 +52,7 @@ pub struct CameraSystem {
 }
 
 #[derive(Default)]
+/// Configures backend selection, backend-specific options, and custom providers.
 pub struct SystemBuilder {
     policy: BackendPolicy,
     registered: HashMap<BackendId, RegisteredBackend>,
@@ -69,11 +70,14 @@ impl std::fmt::Debug for SystemBuilder {
 }
 
 impl SystemBuilder {
+    /// Sets the backend selection and fallback policy.
     pub fn backend_policy(mut self, policy: BackendPolicy) -> Self {
         self.policy = policy;
         self
     }
 
+    #[cfg(feature = "custom-backend")]
+    /// Registers an application-provided backend under its stable identifier.
     pub fn register_backend(mut self, provider: impl crate::BackendProvider) -> Self {
         let id = provider.id();
         self.registered.insert(
@@ -86,11 +90,13 @@ impl SystemBuilder {
         self
     }
 
+    /// Adds backend-specific options, validated when the system is built.
     pub fn backend_options(mut self, options: impl Into<BackendOptions>) -> Self {
         self.backend_options.push(options.into());
         self
     }
 
+    /// Validates the configuration and builds an immutable camera system.
     pub fn build(self) -> CameraResult<CameraSystem> {
         for options in &self.backend_options {
             options.validate()?;
@@ -99,16 +105,16 @@ impl SystemBuilder {
             for options in &self.backend_options {
                 let option_backend = options.backend();
                 if &option_backend != selected {
-                    return Err(CameraError::BackendOptionMismatch {
+                    return Err(CameraError::backend_option_mismatch(
                         option_backend,
-                        selected_backend: selected.clone(),
-                    });
+                        selected.clone(),
+                    ));
                 }
             }
         }
         if let BackendPolicy::Prefer(backends) = &self.policy {
             if backends.is_empty() {
-                return Err(CameraError::InvalidConfig(
+                return Err(CameraError::invalid_config(
                     "Backend preference list cannot be empty".into(),
                 ));
             }
@@ -128,10 +134,12 @@ impl Default for CameraSystem {
     }
 }
 impl CameraSystem {
+    /// Starts building a camera system with platform-default selection.
     pub fn builder() -> SystemBuilder {
         SystemBuilder::default()
     }
 
+    /// Creates a camera system using the platform-default backend policy.
     pub fn new() -> Self {
         Self::default()
     }
@@ -146,10 +154,12 @@ impl CameraSystem {
         }
     }
 
+    /// Returns the configured backend selection policy.
     pub fn backend_policy(&self) -> &BackendPolicy {
         &self.policy
     }
 
+    /// Lists compiled backends that support this target, including custom providers.
     pub fn available_backends(&self) -> Vec<BackendId> {
         let mut available = backends::available_backends()
             .into_iter()
@@ -164,6 +174,7 @@ impl CameraSystem {
         available
     }
 
+    /// Reports why a backend is available or unavailable in this build.
     pub fn backend_availability(&self, backend: &BackendId) -> BackendAvailability {
         if (backend == &BackendId::SYNTHETIC && self.synthetic)
             || self.registered.contains_key(backend)
@@ -182,6 +193,7 @@ impl CameraSystem {
         }
     }
 
+    /// Queries the authorization state without opening a device.
     pub fn permission_status(&self, backend: &BackendId) -> CameraResult<crate::PermissionStatus> {
         if backend == &BackendId::AV_FOUNDATION {
             #[cfg(all(
@@ -197,10 +209,10 @@ impl CameraSystem {
                 feature = "backend-avfoundation",
                 any(target_os = "macos", target_os = "ios")
             )))]
-            return Err(CameraError::UnsupportedTarget {
-                backend: backend.clone(),
-                target: std::env::consts::OS,
-            });
+            return Err(CameraError::unsupported_target(
+                backend.clone(),
+                std::env::consts::OS,
+            ));
         }
         if backend == &BackendId::CAMERA2 || backend == &BackendId::UVC {
             Ok(crate::PermissionStatus::ManagedExternally)
@@ -223,14 +235,12 @@ impl CameraSystem {
                 feature = "backend-avfoundation",
                 any(target_os = "macos", target_os = "ios")
             )))]
-            return Err(CameraError::UnsupportedTarget {
-                backend: backend.clone(),
-                target: std::env::consts::OS,
-            });
+            return Err(CameraError::unsupported_target(
+                backend.clone(),
+                std::env::consts::OS,
+            ));
         }
-        Err(CameraError::PermissionManagedExternally {
-            backend: backend.clone(),
-        })
+        Err(CameraError::permission_managed_externally(backend.clone()))
     }
 
     fn policy_backends(&self) -> Vec<BackendId> {
@@ -281,10 +291,8 @@ impl CameraSystem {
                 })
                 .collect();
         }
-        let backend_type =
-            backends::backend_type(backend).ok_or_else(|| CameraError::BackendNotCompiled {
-                backend: backend.clone(),
-            })?;
+        let backend_type = backends::backend_type(backend)
+            .ok_or_else(|| CameraError::backend_not_compiled(backend.clone()))?;
         let backend_type = resolve_backend(backend_type)?;
         backends::list_devices(backend_type).map(|devices| {
             devices
@@ -310,15 +318,16 @@ impl CameraSystem {
         Ok(devices)
     }
 
+    /// Performs the `capabilities_blocking` operation.
     pub fn capabilities_blocking(&self, id: &DeviceId) -> CameraResult<DeviceCapabilities> {
         let devices = self.devices_for_backend(&id.backend)?;
         let matching: Vec<_> = devices.iter().filter(|d| d.id == *id).collect();
         if matching.len() > 1 {
-            return Err(CameraError::AmbiguousDevice(id.to_string()));
+            return Err(CameraError::ambiguous_device(id.to_string()));
         }
         let device = matching
             .first()
-            .ok_or_else(|| CameraError::DeviceNotFound(id.to_string()))?;
+            .ok_or_else(|| CameraError::device_not_found(id.to_string()))?;
         if id.backend == BackendId::SYNTHETIC {
             return Ok(DeviceCapabilities::single_native(
                 CaptureFormat::Rgb8,
@@ -330,13 +339,12 @@ impl CameraSystem {
         if let Some(registered) = self.registered.get(&id.backend) {
             return registered.provider.open(id.native_id())?.capabilities();
         }
-        let backend =
-            backends::backend_type(&id.backend).ok_or_else(|| CameraError::BackendNotCompiled {
-                backend: id.backend.clone(),
-            })?;
+        let backend = backends::backend_type(&id.backend)
+            .ok_or_else(|| CameraError::backend_not_compiled(id.backend.clone()))?;
         backends::get_device_capabilities(backend, device.index)
     }
 
+    /// Enumerates devices according to the configured backend policy.
     pub async fn devices(&self) -> CameraResult<Vec<DeviceInfo>> {
         let system = self.clone();
         tokio::task::spawn_blocking(move || system.devices_blocking())
@@ -344,6 +352,7 @@ impl CameraSystem {
             .map_err(join_error)?
     }
 
+    /// Queries formats, resolutions, frame rates, and controls for a device.
     pub async fn capabilities(&self, id: &DeviceId) -> CameraResult<DeviceCapabilities> {
         let system = self.clone();
         let id = id.clone();
@@ -352,21 +361,20 @@ impl CameraSystem {
             .map_err(join_error)?
     }
 
+    /// Performs the `capabilities_timeout` operation.
     pub async fn capabilities_timeout(
         &self,
         id: &DeviceId,
         timeout: Duration,
     ) -> CameraResult<DeviceCapabilities> {
         if timeout.is_zero() {
-            return Err(CameraError::InvalidConfig(
+            return Err(CameraError::invalid_config(
                 "Capability query timeout must be positive".into(),
             ));
         }
         tokio::time::timeout(timeout, self.capabilities(id))
             .await
-            .map_err(|_| CameraError::Timeout {
-                stage: crate::OperationStage::Capabilities,
-            })?
+            .map_err(|_| CameraError::timeout(crate::OperationStage::Capabilities))?
     }
 
     async fn resolve_selector(&self, selector: DeviceSelector) -> CameraResult<DeviceInfo> {
@@ -390,24 +398,26 @@ impl CameraSystem {
         });
         let selected = matches
             .next()
-            .ok_or_else(|| CameraError::DeviceNotFound(format!("{selector:?}")))?;
+            .ok_or_else(|| CameraError::device_not_found(format!("{selector:?}")))?;
         if !matches!(selector, DeviceSelector::Default) && matches.next().is_some() {
-            return Err(CameraError::AmbiguousDevice(format!("{selector:?}")));
+            return Err(CameraError::ambiguous_device(format!("{selector:?}")));
         }
         Ok(selected)
     }
 
+    /// Opens a selected device using the default startup deadline.
     pub async fn open(&self, selector: DeviceSelector) -> CameraResult<Device> {
         self.open_inner(selector).await
     }
 
+    /// Performs the `open_timeout` operation.
     pub async fn open_timeout(
         &self,
         selector: DeviceSelector,
         timeout: Duration,
     ) -> CameraResult<Device> {
         if timeout.is_zero() {
-            return Err(CameraError::InvalidConfig(
+            return Err(CameraError::invalid_config(
                 "Device open timeout must be positive".into(),
             ));
         }
@@ -437,11 +447,8 @@ impl CameraSystem {
                 .map_err(join_error)??;
             Source::custom(handle)
         } else {
-            let backend = backends::backend_type(&device.id.backend).ok_or_else(|| {
-                CameraError::BackendNotCompiled {
-                    backend: device.id.backend.clone(),
-                }
-            })?;
+            let backend = backends::backend_type(&device.id.backend)
+                .ok_or_else(|| CameraError::backend_not_compiled(device.id.backend.clone()))?;
             let index = device.index;
             let expected = device.id.native.clone();
             Source::native(
@@ -505,10 +512,12 @@ impl CameraSystem {
         })
     }
 
+    /// Creates a high-level capture builder that owns its session and receiver.
     pub fn capture(&self, selector: DeviceSelector) -> CaptureBuilder {
         CaptureBuilder::new(self.clone(), selector)
     }
 
+    /// Performs the `plan` operation.
     pub async fn plan(
         &self,
         selector: DeviceSelector,
@@ -637,18 +646,18 @@ fn resolve_backend(b: BackendType) -> CameraResult<BackendType> {
         b
     };
     if !b.is_compiled() {
-        Err(CameraError::BackendNotCompiled { backend: b.into() })
+        Err(CameraError::backend_not_compiled(b.into()))
     } else if !b.supports_target() {
-        Err(CameraError::UnsupportedTarget {
-            backend: b.into(),
-            target: std::env::consts::OS,
-        })
+        Err(CameraError::unsupported_target(
+            b.into(),
+            std::env::consts::OS,
+        ))
     } else {
         Ok(b)
     }
 }
 fn join_error(e: tokio::task::JoinError) -> CameraError {
-    CameraError::Other(format!("Camera worker: {e}"))
+    CameraError::worker_failure(format!("Camera worker: {e}")).with_source(e)
 }
 #[derive(Clone)]
 enum Source {
@@ -658,7 +667,7 @@ enum Source {
 }
 
 struct CustomSource {
-    device: parking_lot::Mutex<Box<dyn crate::BackendDevice>>,
+    device: parking_lot::Mutex<Box<dyn crate::extension::BackendDevice>>,
     hub: FrameHub,
     actual: parking_lot::Mutex<Option<CameraConfig>>,
 }
@@ -673,7 +682,7 @@ impl NativeSource {
         self.camera
             .lock()
             .clone()
-            .ok_or_else(|| CameraError::Disconnected("Device is reconnecting".into()))
+            .ok_or_else(|| CameraError::disconnected("Device is reconnecting".into()))
     }
     fn backend_type(&self) -> BackendType {
         self.id
@@ -699,26 +708,23 @@ impl NativeSource {
     }
     async fn reopen(self: &Arc<Self>) -> CameraResult<()> {
         let id = self.id.clone().ok_or_else(|| {
-            CameraError::Disconnected(
+            CameraError::disconnected(
                 "USB permission descriptor requires explicit reopening".into(),
             )
         })?;
         let this = self.clone();
         tokio::task::spawn_blocking(move || {
             let _ = this.camera.lock().take();
-            let backend = backends::backend_type(&id.backend).ok_or_else(|| {
-                CameraError::BackendNotCompiled {
-                    backend: id.backend.clone(),
-                }
-            })?;
+            let backend = backends::backend_type(&id.backend)
+                .ok_or_else(|| CameraError::backend_not_compiled(id.backend.clone()))?;
             let mut matches = backends::list_devices(backend)?
                 .into_iter()
                 .filter(|d| d.unique_id() == id.native);
             let device = matches
                 .next()
-                .ok_or_else(|| CameraError::Disconnected(id.to_string()))?;
+                .ok_or_else(|| CameraError::disconnected(id.to_string()))?;
             if matches.next().is_some() {
-                return Err(CameraError::AmbiguousDevice(id.to_string()));
+                return Err(CameraError::ambiguous_device(id.to_string()));
             }
             let camera = backends::create_selected_camera(
                 device.index,
@@ -738,7 +744,7 @@ impl Source {
         let hub = camera
             .frame_hub()
             .cloned()
-            .ok_or_else(|| CameraError::InvalidState("Backend has no frame source".into()))?;
+            .ok_or_else(|| CameraError::invalid_state("Backend has no frame source".into()))?;
         Ok(Self::Native(Arc::new(NativeSource {
             camera: parking_lot::Mutex::new(Some(camera)),
             id,
@@ -746,7 +752,7 @@ impl Source {
         })))
     }
 
-    fn custom(device: Box<dyn crate::BackendDevice>) -> Self {
+    fn custom(device: Box<dyn crate::extension::BackendDevice>) -> Self {
         Self::Custom(Arc::new(CustomSource {
             device: parking_lot::Mutex::new(device),
             hub: FrameHub::default(),
@@ -767,7 +773,7 @@ impl Source {
             Self::Custom(c) => {
                 let c = c.clone();
                 tokio::task::spawn_blocking(move || {
-                    let sink = crate::FrameSink::begin(c.hub.clone());
+                    let sink = crate::extension::FrameSink::begin(c.hub.clone());
                     let plan = CapturePlan {
                         selected: NegotiatedCapture {
                             capture: CaptureMode::from_config(&config)?,
@@ -846,11 +852,11 @@ impl Source {
     fn actual(&self, fallback: &CameraConfig) -> CameraResult<CameraConfig> {
         match self {
             Self::Native(c) => c.get_config().ok_or_else(|| {
-                CameraError::InvalidState("Backend did not report negotiated configuration".into())
+                CameraError::invalid_state("Backend did not report negotiated configuration".into())
             }),
             Self::Synthetic(_) => Ok(fallback.clone()),
             Self::Custom(c) => c.actual.lock().clone().ok_or_else(|| {
-                CameraError::InvalidState("External backend did not start a capture".into())
+                CameraError::invalid_state("External backend did not start a capture".into())
             }),
         }
     }
@@ -876,10 +882,10 @@ async fn apply_backend_options(
 ) -> CameraResult<()> {
     for option in options {
         if &option.backend() != selected_backend {
-            return Err(CameraError::BackendOptionMismatch {
-                option_backend: option.backend(),
-                selected_backend: selected_backend.clone(),
-            });
+            return Err(CameraError::backend_option_mismatch(
+                option.backend(),
+                selected_backend.clone(),
+            ));
         }
         let Source::Native(native) = source else {
             continue;
@@ -887,7 +893,7 @@ async fn apply_backend_options(
         match option {
             BackendOptions::V4l2(options) => {
                 if native.backend_type() != BackendType::V4l2 {
-                    return Err(CameraError::InvalidConfig(
+                    return Err(CameraError::invalid_config(
                         "Driver queue configuration is only supported by V4L2".into(),
                     ));
                 }
@@ -915,6 +921,7 @@ pub struct Camera {
     busy: Arc<AtomicBool>,
     backend_options: Arc<Vec<BackendOptions>>,
 }
+/// Convenient result type for `Device`.
 pub type Device = Camera;
 impl std::fmt::Debug for Camera {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -928,6 +935,45 @@ impl Camera {
     pub fn device(&self) -> &DeviceInfo {
         &self.device
     }
+
+    /// Query capabilities from this already-open device. This is required for
+    /// Android UVC handles, where USB discovery is owned by the Java permission
+    /// layer and the native backend receives only an authorized descriptor.
+    pub async fn capabilities(&self) -> CameraResult<DeviceCapabilities> {
+        match &self.source {
+            Source::Synthetic(_) => Ok(DeviceCapabilities::single_native(
+                CaptureFormat::Rgb8,
+                640,
+                480,
+                FrameRate::default(),
+            )),
+            Source::Custom(source) => {
+                let source = source.clone();
+                tokio::task::spawn_blocking(move || source.device.lock().capabilities())
+                    .await
+                    .map_err(join_error)?
+            }
+            Source::Native(source) if source.id.is_none() => {
+                let camera = source.current()?;
+                tokio::task::spawn_blocking(move || camera.opened_device_capabilities())
+                    .await
+                    .map_err(join_error)?
+            }
+            Source::Native(_) => {
+                let backend =
+                    backends::backend_type(self.device.id.backend()).ok_or_else(|| {
+                        CameraError::backend_not_compiled(self.device.id.backend().clone())
+                    })?;
+                let index = self.device.index;
+                tokio::task::spawn_blocking(move || {
+                    backends::get_device_capabilities(backend, index)
+                })
+                .await
+                .map_err(join_error)?
+            }
+        }
+    }
+
     pub async fn start(&mut self, request: CaptureRequest) -> CameraResult<Session> {
         let deadline = StartupDeadline::new(request.startup_timeout);
         self.start_until(request, deadline).await
@@ -948,10 +994,10 @@ impl Camera {
                 BackendOptions::AvFoundation(_)
                     if self.device.id.backend == BackendId::AV_FOUNDATION => {}
                 options if options.backend() != self.device.id.backend => {
-                    return Err(CameraError::BackendOptionMismatch {
-                        option_backend: options.backend(),
-                        selected_backend: self.device.id.backend.clone(),
-                    });
+                    return Err(CameraError::backend_option_mismatch(
+                        options.backend(),
+                        self.device.id.backend.clone(),
+                    ));
                 }
                 _ => {}
             }
@@ -977,9 +1023,7 @@ impl Camera {
                 capabilities.configurations()?
             } else {
                 let backend = backends::backend_type(&self.device.id.backend).ok_or_else(|| {
-                    CameraError::BackendNotCompiled {
-                        backend: self.device.id.backend.clone(),
-                    }
+                    CameraError::backend_not_compiled(self.device.id.backend.clone())
                 })?;
                 let index = self.device.index;
                 let requested = request.clone();
@@ -1027,26 +1071,26 @@ impl Camera {
     ) -> CameraResult<CaptureSession> {
         let startup_started = std::time::Instant::now();
         if request.output == OutputFormat::Rgb8 && request.format == Some(VideoFormat::H264) {
-            return Err(CameraError::UnsupportedFormat(
+            return Err(CameraError::unsupported_format(
                 "H264 requires native output and an external decoder".into(),
             ));
         }
         if matches!(self.source, Source::Synthetic(_))
             && request.format.is_some_and(|f| f != VideoFormat::RGB)
         {
-            return Err(CameraError::UnsupportedFormat(
+            return Err(CameraError::unsupported_format(
                 "Synthetic source produces RGB only".into(),
             ));
         }
         if request.reconnect.is_some()
             && self.device.stability == IdentityStability::EnumerationOnly
         {
-            return Err(CameraError::InvalidConfig(
+            return Err(CameraError::invalid_config(
                 "Automatic reconnect requires a stable native identity".into(),
             ));
         }
         if self.busy.swap(true, Ordering::AcqRel) {
-            return Err(CameraError::InvalidState(
+            return Err(CameraError::invalid_state(
                 "Camera is already starting, capturing, or closing".into(),
             ));
         }
@@ -1088,7 +1132,7 @@ impl Camera {
         let task_intent = intent.clone();
         tokio::spawn(async move {
             let _lock = task_inner.lifecycle.lock().await;
-            let mut result = Err(CameraError::UnsupportedFormat(
+            let mut result = Err(CameraError::unsupported_format(
                 "No usable capture configuration".into(),
             ));
             for config in candidates.drain(..) {
@@ -1100,7 +1144,7 @@ impl Camera {
                     task_inner.source.start(config.clone()).await?;
                     let session = task_inner.hub.session();
                     if session == previous_session {
-                        return Err(CameraError::InvalidState(
+                        return Err(CameraError::invalid_state(
                             "Backend did not begin a new frame session".into(),
                         ));
                     }
@@ -1135,10 +1179,8 @@ impl Camera {
         });
         let (actual, _first) = tokio::time::timeout_at(deadline.0, rx)
             .await
-            .map_err(|_| CameraError::Timeout {
-                stage: crate::OperationStage::FirstFrame,
-            })?
-            .map_err(|_| CameraError::StreamStopped)??;
+            .map_err(|_| CameraError::timeout(crate::OperationStage::FirstFrame))?
+            .map_err(|_| CameraError::stream_stopped())??;
         let frame_rate = actual.frame_rate()?;
         let mut adjustments = Vec::new();
         if (actual.width, actual.height) != (request.width, request.height) {
@@ -1182,6 +1224,7 @@ impl Camera {
 }
 
 #[derive(Clone, Debug)]
+/// Values for `CaptureBuilder`.
 pub struct CaptureBuilder {
     system: CameraSystem,
     selector: DeviceSelector,
@@ -1199,6 +1242,7 @@ impl CaptureBuilder {
         }
     }
 
+    /// Performs the `profile` operation.
     pub fn profile(mut self, profile: CaptureProfile) -> Self {
         let builder = match profile {
             CaptureProfile::Preview => CaptureRequest::builder()
@@ -1221,22 +1265,26 @@ impl CaptureBuilder {
         self
     }
 
+    /// Performs the `resolution` operation.
     pub fn resolution(mut self, width: u32, height: u32) -> Self {
         self.request.width = width;
         self.request.height = height;
         self
     }
 
+    /// Performs the `frame_rate` operation.
     pub fn frame_rate(mut self, frame_rate: FrameRate) -> Self {
         self.request.preferred_fps = frame_rate;
         self
     }
 
+    /// Performs the `request` operation.
     pub fn request(mut self, request: CaptureRequest) -> Self {
         self.request = request;
         self
     }
 
+    /// Performs the `start` operation.
     pub async fn start(self) -> CameraResult<Capture> {
         self.request.to_stream_request()?;
         let deadline = StartupDeadline::new(self.request.startup_timeout);
@@ -1245,7 +1293,7 @@ impl CaptureBuilder {
                 let mut attempts = Vec::new();
                 for backend in backends.clone() {
                     let system = self.system.requiring(backend.clone());
-                    let attempt = async {
+                    let attempt: CameraResult<Capture> = async {
                         let mut device =
                             system.open_until(DeviceSelector::Default, deadline).await?;
                         let session = device.start_until(self.request.clone(), deadline).await?;
@@ -1255,15 +1303,21 @@ impl CaptureBuilder {
                     .await;
                     match attempt {
                         Ok(capture) => return Ok(capture),
-                        Err(error @ CameraError::PermissionDenied(_))
-                        | Err(error @ CameraError::PermissionRequired(_)) => return Err(error),
-                        Err(error) => attempts.push(crate::BackendAttempt {
-                            backend,
-                            error: error.to_string(),
-                        }),
+                        Err(error)
+                            if matches!(
+                                error.kind(),
+                                crate::CameraErrorKind::PermissionDenied
+                                    | crate::CameraErrorKind::PermissionRequired
+                            ) =>
+                        {
+                            return Err(error)
+                        }
+                        Err(error) => {
+                            attempts.push(crate::BackendAttempt::new(backend, Arc::new(error)))
+                        }
                     }
                 }
-                return Err(CameraError::BackendAttemptsFailed(attempts));
+                return Err(CameraError::all_backends_failed(attempts));
             }
         }
         let mut device = self.system.open_until(self.selector, deadline).await?;
@@ -1274,24 +1328,29 @@ impl CaptureBuilder {
 }
 
 #[derive(Debug)]
+/// Values for `Capture`.
 pub struct Capture {
     session: Session,
     receiver: FrameReceiver,
 }
 
 impl Capture {
+    /// Performs the `next_frame` operation.
     pub async fn next_frame(&mut self) -> CameraResult<Frame> {
         self.receiver.next().await
     }
 
+    /// Performs the `negotiated` operation.
     pub fn negotiated(&self) -> &NegotiatedCapture {
         self.session.negotiated()
     }
 
+    /// Performs the `session` operation.
     pub fn session(&self) -> &Session {
         &self.session
     }
 
+    /// Performs the `close` operation.
     pub async fn close(&self) -> CameraResult<()> {
         self.session.close().await
     }
@@ -1308,7 +1367,7 @@ fn validate_requested_capture(
         .minimum_fps
         .is_some_and(|minimum| frame_rate < minimum)
     {
-        return Err(CameraError::UnsupportedFormat(format!(
+        return Err(CameraError::unsupported_format(format!(
             "Driver negotiated {} fps below required {} fps",
             frame_rate.as_f64(),
             request.minimum_fps.unwrap().as_f64()
@@ -1320,14 +1379,14 @@ fn validate_requested_capture(
             .iter()
             .any(|format| VideoFormat::from(*format) == actual.format)
     {
-        return Err(CameraError::UnsupportedFormat(format!(
+        return Err(CameraError::unsupported_format(format!(
             "Driver negotiated unaccepted format {:?}",
             actual.format
         )));
     }
     if request.exact_resolution && (actual.width, actual.height) != (request.width, request.height)
     {
-        return Err(CameraError::UnsupportedFormat(format!(
+        return Err(CameraError::unsupported_format(format!(
             "Driver negotiated {}x{} instead of the required {}x{} resolution",
             actual.width, actual.height, request.width, request.height
         )));
@@ -1339,13 +1398,13 @@ fn validate_requested_capture(
                 != u64::from(actual.height) * u64::from(width)
         })
     {
-        return Err(CameraError::UnsupportedFormat(format!(
+        return Err(CameraError::unsupported_format(format!(
             "Driver negotiated {}x{} outside the required aspect ratio",
             actual.width, actual.height
         )));
     }
     if first_layout.width != actual.width || first_layout.height != actual.height {
-        return Err(CameraError::InvalidFormat(
+        return Err(CameraError::invalid_frame(
             "First frame differs from negotiated dimensions".into(),
         ));
     }
@@ -1415,7 +1474,7 @@ fn rank_capture_configurations(
     });
     configurations.dedup();
     if configurations.is_empty() {
-        return Err(CameraError::UnsupportedFormat(
+        return Err(CameraError::unsupported_format(
             "No capture mode satisfies the required constraints".into(),
         ));
     }
@@ -1443,68 +1502,105 @@ fn direct_capture_candidates(request: &CaptureRequest) -> Vec<CameraConfig> {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+/// Possible values for `SessionState`.
 pub enum SessionState {
+    /// The `Starting` variant.
     Starting,
+    /// The `Streaming` variant.
     Streaming,
-    Recovering { attempt: u32 },
+    /// The `Recovering` struct field.
+    Recovering {
+        /// One-based recovery attempt number.
+        attempt: u32,
+    },
+    /// The `Stopping` variant.
     Stopping,
+    /// The `Stopped` variant.
     Stopped,
-    Failed(String),
+    /// The `Failed` variant.
+    Failed(Arc<CameraError>),
 }
 impl SessionState {
+    /// Performs the `is_streaming` operation.
     pub fn is_streaming(&self) -> bool {
         matches!(self, Self::Streaming)
     }
 
+    /// Performs the `is_terminal` operation.
     pub fn is_terminal(&self) -> bool {
         matches!(self, Self::Stopped | Self::Failed(_))
+    }
+
+    /// Performs the `error` operation.
+    pub fn error(&self) -> Option<&CameraError> {
+        match self {
+            Self::Failed(error) => Some(error),
+            _ => None,
+        }
     }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+/// Possible values for `SessionEvent`.
 pub enum SessionEvent {
+    /// The `Lifecycle` variant.
     Lifecycle(SessionState),
+    /// The `ConfigurationAdjusted` variant.
     ConfigurationAdjusted(String),
-    ResourcePressure { dropped_frames: u64 },
-    Missed { count: u64 },
+    /// The `ResourcePressure` struct field.
+    ResourcePressure {
+        /// Total frames dropped because bounded storage was unavailable.
+        dropped_frames: u64,
+    },
+    /// The `Missed` struct field.
+    Missed {
+        /// Number of events skipped because the receiver lagged.
+        count: u64,
+    },
 }
 
 impl SessionEvent {
+    /// Performs the `is_lifecycle` operation.
     pub fn is_lifecycle(&self) -> bool {
         matches!(self, Self::Lifecycle(_))
     }
 }
 
 #[derive(Debug)]
+/// Values for `StateWatcher`.
 pub struct StateWatcher {
     receiver: watch::Receiver<SessionState>,
 }
 
 impl StateWatcher {
+    /// Performs the `current` operation.
     pub fn current(&self) -> SessionState {
         self.receiver.borrow().clone()
     }
 
+    /// Performs the `changed` operation.
     pub async fn changed(&mut self) -> CameraResult<SessionState> {
         self.receiver
             .changed()
             .await
-            .map_err(|_| CameraError::StreamStopped)?;
+            .map_err(|_| CameraError::stream_stopped())?;
         Ok(self.current())
     }
 }
 
 #[derive(Debug)]
+/// Values for `EventReceiver`.
 pub struct EventReceiver {
     receiver: broadcast::Receiver<SessionEvent>,
 }
 
 impl EventReceiver {
+    /// Performs the `next` operation.
     pub async fn next(&mut self) -> CameraResult<SessionEvent> {
         match self.receiver.recv().await {
             Ok(event) => Ok(event),
             Err(broadcast::error::RecvError::Lagged(count)) => Ok(SessionEvent::Missed { count }),
-            Err(broadcast::error::RecvError::Closed) => Err(CameraError::StreamStopped),
+            Err(broadcast::error::RecvError::Closed) => Err(CameraError::stream_stopped()),
         }
     }
 }
@@ -1558,7 +1654,7 @@ impl SessionInner {
         let _guard = self.lifecycle.lock().await;
         if self.closed.load(Ordering::Acquire) {
             return match &*self.state.borrow() {
-                SessionState::Failed(error) => Err(CameraError::StreamError(error.clone())),
+                SessionState::Failed(error) => Err((**error).clone()),
                 _ => Ok(()),
             };
         }
@@ -1571,7 +1667,7 @@ impl SessionInner {
         self.closed.store(true, Ordering::Release);
         self.set_state(match &result {
             Ok(_) => SessionState::Stopped,
-            Err(e) => SessionState::Failed(e.to_string()),
+            Err(e) => SessionState::Failed(Arc::new(e.clone())),
         });
         self.busy.store(false, Ordering::Release);
         result
@@ -1597,6 +1693,7 @@ pub struct CaptureSession {
     negotiated: NegotiatedCapture,
     actual: CameraConfig,
 }
+/// Convenient result type for `Session`.
 pub type Session = CaptureSession;
 impl std::fmt::Debug for CaptureSession {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -1719,7 +1816,7 @@ impl CaptureSession {
                         stop_result?;
                     }
                     if inner.stopping.load(Ordering::Acquire) {
-                        return Err(CameraError::StreamStopped);
+                        return Err(CameraError::stream_stopped());
                     }
                     inner.source.start(config.clone()).await?;
                     let session = inner.hub.session();
@@ -1756,7 +1853,7 @@ impl CaptureSession {
                         inner.hub.stop();
                         pending_trigger = Some(trigger);
                         if policy.max_attempts.is_some_and(|n| attempt >= n) {
-                            inner.set_state(SessionState::Failed(e.to_string()));
+                            inner.set_state(SessionState::Failed(Arc::new(e)));
                             inner.stopping.store(true, Ordering::Release);
                             inner.hub.disable_recovery();
                             inner.hub.end_recovery();
@@ -1781,10 +1878,10 @@ impl CaptureSession {
         tokio::spawn(async move {
             let _guard = inner.lifecycle.lock().await;
             if inner.stopping.load(Ordering::Acquire) {
-                return Err(CameraError::StreamStopped);
+                return Err(CameraError::stream_stopped());
             }
             let Source::Native(camera) = &inner.source else {
-                return Err(CameraError::ControlNotSupported(
+                return Err(CameraError::control_not_supported(
                     "Synthetic source has no device controls".into(),
                 ));
             };
@@ -1840,12 +1937,12 @@ fn validate_recovered_capture(
         != (expected.width, expected.height, expected.format)
         || actual.frame_rate()? != expected.frame_rate()?
     {
-        return Err(CameraError::UnsupportedFormat(
+        return Err(CameraError::unsupported_format(
             "Recovered capture differs from the negotiated configuration".into(),
         ));
     }
     if (first.width, first.height) != (actual.width, actual.height) {
-        return Err(CameraError::InvalidFormat(
+        return Err(CameraError::invalid_frame(
             "Recovered first frame differs from negotiated dimensions".into(),
         ));
     }
@@ -1894,14 +1991,14 @@ mod recovery_tests {
         ] {
             assert!(matches!(
                 validate_recovered_capture(&config, &changed, first.layout()),
-                Err(CameraError::UnsupportedFormat(_))
+                Err(ref error) if error.kind() == crate::CameraErrorKind::UnsupportedFormat
             ));
         }
         let mut layout = first.layout().clone();
         layout.height = 16;
         assert!(matches!(
             validate_recovered_capture(&config, &config, &layout),
-            Err(CameraError::InvalidFormat(_))
+            Err(ref error) if error.kind() == crate::CameraErrorKind::InvalidFrame
         ));
     }
 

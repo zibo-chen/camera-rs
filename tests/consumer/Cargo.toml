@@ -7,4 +7,4 @@ publish = false
 [workspace]
 
 [dependencies]
-camera = { path = "../..", default-features = false, features = ["blocking", "convert-rgb"] }
+camera = { package = "camera-rs", path = "../..", default-features = false, features = ["blocking", "convert-rgb"] }

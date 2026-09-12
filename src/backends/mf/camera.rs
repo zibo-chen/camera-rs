@@ -115,15 +115,19 @@ fn two_dimensional_length(config: &CameraConfig, pitch: usize) -> CameraResult<u
         VideoFormat::YUYV | VideoFormat::UYVY => (height, width.saturating_mul(2)),
         VideoFormat::RGB => (height, width.saturating_mul(3)),
         VideoFormat::Gray => (height, width),
-        _ => return Err(CameraError::UnsupportedFormat("MF 2D buffer format".into())),
+        _ => {
+            return Err(CameraError::unsupported_format(
+                "MF 2D buffer format".into(),
+            ))
+        }
     };
     if rows == 0 || final_row_bytes == 0 || pitch < final_row_bytes {
-        return Err(CameraError::InvalidFormat("Invalid MF 2D pitch".into()));
+        return Err(CameraError::invalid_frame("Invalid MF 2D pitch".into()));
     }
     (rows - 1)
         .checked_mul(pitch)
         .and_then(|bytes| bytes.checked_add(final_row_bytes))
-        .ok_or_else(|| CameraError::InvalidFormat("MF 2D buffer size overflow".into()))
+        .ok_or_else(|| CameraError::invalid_frame("MF 2D buffer size overflow".into()))
 }
 
 unsafe fn lock_media_buffer(
@@ -184,7 +188,7 @@ impl Drop for Worker {
 }
 
 impl Worker {
-    /// 获取支持的格式列表
+    /// Returns the supported format list.
     fn get_compatible_formats(&self) -> CameraResult<Vec<CameraConfig>> {
         let mut formats = Vec::new();
         let mut index = 0u32;
@@ -196,12 +200,12 @@ impl Worker {
                     .GetNativeMediaType(MEDIA_FOUNDATION_FIRST_VIDEO_STREAM, index)
                 {
                     Ok(mt) => mt,
-                    Err(_) => break, // 没有更多格式
+                    Err(_) => break, // No more formats.
                 }
             };
             index += 1;
 
-            // 获取格式
+            // Read the format.
             let fourcc = unsafe {
                 match media_type.GetGUID(&MF_MT_SUBTYPE) {
                     Ok(guid) => guid,
@@ -214,7 +218,7 @@ impl Worker {
                 None => continue,
             };
 
-            // 获取分辨率
+            // Read the resolution.
             let (width, height) = unsafe {
                 match media_type.GetUINT64(&MF_MT_FRAME_SIZE) {
                     Ok(size) => {
@@ -226,7 +230,7 @@ impl Worker {
                 }
             };
 
-            // 获取帧率
+            // Read the frame rate.
             let frame_rates = self.get_frame_rates(&media_type);
 
             for rate in frame_rates {
@@ -240,7 +244,7 @@ impl Worker {
         Ok(formats)
     }
 
-    /// 从 MediaType 获取帧率列表
+    /// Returns frame rates represented by a MediaType.
     fn get_frame_rates(&self, media_type: &IMFMediaType) -> Vec<crate::FrameRate> {
         let mut rates = Vec::new();
         for key in [
@@ -261,7 +265,7 @@ impl Worker {
 
     fn set_media_format(&self, config: &CameraConfig) -> CameraResult<()> {
         let target_guid = convert::format_to_guid(config.format).ok_or_else(|| {
-            CameraError::UnsupportedFormat(format!("Unsupported format: {:?}", config.format))
+            CameraError::unsupported_format(format!("Unsupported format: {:?}", config.format))
         })?;
 
         let mut index = 0u32;
@@ -279,7 +283,7 @@ impl Worker {
             };
             index += 1;
 
-            // 检查格式
+            // Check the format.
             let fourcc = unsafe {
                 match media_type.GetGUID(&MF_MT_SUBTYPE) {
                     Ok(guid) => guid,
@@ -291,7 +295,7 @@ impl Worker {
                 continue;
             }
 
-            // 检查分辨率
+            // Check the resolution.
             let (width, height) = unsafe {
                 match media_type.GetUINT64(&MF_MT_FRAME_SIZE) {
                     Ok(size) => ((size >> 32) as u32, size as u32),
@@ -303,7 +307,7 @@ impl Worker {
                 continue;
             }
 
-            // 检查帧率
+            // Check the frame rate.
             let frame_rates = self.get_frame_rates(&media_type);
             if !frame_rates.contains(&config.frame_rate()?) {
                 continue;
@@ -316,7 +320,7 @@ impl Worker {
                 )
             }
             .map_err(mf_error)?;
-            // 找到匹配的格式，尝试设置
+            // Apply the matching format.
             match unsafe {
                 self.source_reader.SetCurrentMediaType(
                     MEDIA_FOUNDATION_FIRST_VIDEO_STREAM,
@@ -333,12 +337,12 @@ impl Worker {
         }
 
         if let Some(e) = last_error {
-            Err(CameraError::InvalidConfig(format!(
+            Err(CameraError::invalid_config(format!(
                 "Failed to set format: {}",
                 e
             )))
         } else {
-            Err(CameraError::InvalidConfig(format!(
+            Err(CameraError::invalid_config(format!(
                 "No matching format found for {:?}",
                 config
             )))
@@ -353,7 +357,7 @@ impl Worker {
         .map_err(mf_error)?;
         let size = unsafe { media.GetUINT64(&MF_MT_FRAME_SIZE) }.map_err(mf_error)?;
         let format = guid_to_format(unsafe { media.GetGUID(&MF_MT_SUBTYPE) }.map_err(mf_error)?)
-            .ok_or_else(|| CameraError::UnsupportedFormat("MF subtype".into()))?;
+            .ok_or_else(|| CameraError::unsupported_format("MF subtype".into()))?;
         let width = (size >> 32) as u32;
         let height = size as u32;
         let rate = unsafe { media.GetUINT64(&MF_MT_FRAME_RATE) }.map_err(mf_error)?;
@@ -386,7 +390,7 @@ impl Worker {
     }
     fn start(&mut self, config: CameraConfig) -> CameraResult<()> {
         if self.running || self.stopping.is_some() {
-            return Err(CameraError::StreamError(
+            return Err(CameraError::stream_error(
                 "MF stream running or flushing".into(),
             ));
         }
@@ -416,7 +420,7 @@ impl Worker {
             .lock()
             .unwrap()
             .clone()
-            .ok_or_else(|| CameraError::StreamError("Missing MF format".into()))?;
+            .ok_or_else(|| CameraError::stream_error("Missing MF format".into()))?;
         let buffer = if unsafe { sample.GetBufferCount() }.map_err(mf_error)? == 1 {
             unsafe { sample.GetBufferByIndex(0) }.map_err(mf_error)?
         } else {
@@ -425,11 +429,11 @@ impl Worker {
         let (pointer, length, stride, lock) =
             unsafe { lock_media_buffer(buffer, &config, self.stride) }?;
         if pointer.is_null() || length == 0 {
-            return Err(CameraError::BufferEmpty);
+            return Err(CameraError::buffer_exhausted());
         }
         if !self.hub.wants_native() && config.format == VideoFormat::MJPEG {
             #[cfg(not(feature = "decode-mjpeg"))]
-            return Err(CameraError::UnsupportedFormat(
+            return Err(CameraError::unsupported_format(
                 "MJPEG decoding requires the decode-mjpeg feature".into(),
             ));
             #[cfg(feature = "decode-mjpeg")]
@@ -470,7 +474,7 @@ impl Worker {
                     VideoFormat::NV12 => crate::PixelFormat::Nv12,
                     VideoFormat::RGB => crate::PixelFormat::Bgr8,
                     VideoFormat::Gray => crate::PixelFormat::Gray8,
-                    _ => return Err(CameraError::UnsupportedFormat("MF native layout".into())),
+                    _ => return Err(CameraError::unsupported_format("MF native layout".into())),
                 };
                 let mut layout = crate::FrameLayout::packed(
                     config.width,
@@ -484,7 +488,7 @@ impl Worker {
                     let y_len = (stride.unsigned_abs() as usize)
                         .checked_mul(config.height as usize)
                         .filter(|&n| n < data.len())
-                        .ok_or_else(|| CameraError::InvalidFormat("Truncated MF NV12".into()))?;
+                        .ok_or_else(|| CameraError::invalid_frame("Truncated MF NV12".into()))?;
                     layout.planes[0].length = y_len;
                     layout.planes.push(crate::PlaneLayout {
                         offset: y_len,
@@ -535,7 +539,7 @@ impl Worker {
                 Event::Stop(reply) => {
                     self.fail();
                     if self.stopping.is_some() {
-                        let _ = reply.send(Err(CameraError::StreamError(
+                        let _ = reply.send(Err(CameraError::stream_error(
                             "Flush already pending".into(),
                         )));
                         continue;
@@ -596,12 +600,15 @@ impl Worker {
 }
 
 fn mf_error(error: windows::core::Error) -> CameraError {
-    CameraError::Native {
-        backend: crate::BackendId::MEDIA_FOUNDATION,
-        operation: "capture worker".into(),
-        code: error.code().0 as i64,
-        message: error.to_string(),
-    }
+    CameraError::native(
+        crate::CameraErrorKind::BackendFailure,
+        crate::BackendId::MEDIA_FOUNDATION,
+        crate::OperationStage::Worker,
+        "capture worker".into(),
+        error.code().0 as i64,
+        error.to_string(),
+    )
+    .with_source(error)
 }
 
 fn decode_into(
@@ -615,7 +622,7 @@ fn decode_into(
     let height = config.height as usize;
     if config.format == VideoFormat::MJPEG {
         #[cfg(not(feature = "decode-mjpeg"))]
-        return Err(CameraError::UnsupportedFormat(
+        return Err(CameraError::unsupported_format(
             "MJPEG decoding requires the decode-mjpeg feature".into(),
         ));
         #[cfg(feature = "decode-mjpeg")]
@@ -623,9 +630,9 @@ fn decode_into(
             return crate::mjpeg::decode_with(_decoder, data, |decoder, data| {
                 let header = decoder
                     .read_header(data)
-                    .map_err(|e| CameraError::InvalidFormat(e.to_string()))?;
+                    .map_err(|e| CameraError::invalid_frame(e.to_string()))?;
                 if header.width != width || header.height != height {
-                    return Err(CameraError::InvalidFormat(
+                    return Err(CameraError::invalid_frame(
                         "MF MJPEG dimension mismatch".into(),
                     ));
                 }
@@ -640,18 +647,18 @@ fn decode_into(
                             format: PixelFormat::RGB,
                         },
                     )
-                    .map_err(|e| CameraError::InvalidFormat(e.to_string()))
+                    .map_err(|e| CameraError::invalid_frame(e.to_string()))
             });
         }
     }
     if config.format == VideoFormat::NV12 {
         if stride <= 0 {
-            return Err(CameraError::InvalidFormat("Negative NV12 stride".into()));
+            return Err(CameraError::invalid_frame("Negative NV12 stride".into()));
         }
         let y_length = (stride as usize)
             .checked_mul(height)
             .filter(|n| *n <= data.len())
-            .ok_or_else(|| CameraError::InvalidFormat("Truncated MF NV12 frame".into()))?;
+            .ok_or_else(|| CameraError::invalid_frame("Truncated MF NV12 frame".into()))?;
         return crate::utils::color_convert::yuv420sp_to_rgb_into(
             &data[..y_length],
             &data[y_length..],
@@ -667,7 +674,7 @@ fn decode_into(
         VideoFormat::RGB => 3,
         VideoFormat::Gray => 1,
         _ => {
-            return Err(CameraError::UnsupportedFormat(format!(
+            return Err(CameraError::unsupported_format(format!(
                 "{:?}",
                 config.format
             )))
@@ -676,7 +683,7 @@ fn decode_into(
     let row_bytes = width * pixel_bytes;
     let pitch = stride.unsigned_abs() as usize;
     if pitch < row_bytes {
-        return Err(CameraError::InvalidFormat(
+        return Err(CameraError::invalid_frame(
             "MF stride shorter than row".into(),
         ));
     }
@@ -696,10 +703,10 @@ fn decode_into(
         let source_row = if stride < 0 { height - row - 1 } else { row };
         let offset = source_row
             .checked_mul(pitch)
-            .ok_or_else(|| CameraError::InvalidFormat("MF row overflow".into()))?;
+            .ok_or_else(|| CameraError::invalid_frame("MF row overflow".into()))?;
         let source = data
             .get(offset..offset.saturating_add(row_bytes))
-            .ok_or_else(|| CameraError::InvalidFormat("Truncated MF row".into()))?;
+            .ok_or_else(|| CameraError::invalid_frame("Truncated MF row".into()))?;
         match config.format {
             VideoFormat::YUYV => {
                 converter.yuyv_to_rgb_into(source, config.width, 1, destination)?
@@ -781,7 +788,7 @@ impl MFCamera {
                             if activate_to_device_info(i as u32, activate)?.unique_id() == *expected
                             {
                                 if selected.is_some() {
-                                    return Err(CameraError::AmbiguousDevice(expected.clone()));
+                                    return Err(CameraError::ambiguous_device(expected.clone()));
                                 }
                                 selected = Some(activate);
                             }
@@ -791,7 +798,7 @@ impl MFCamera {
                         activates.get(device_index as usize)
                     };
                     let activate = selected.ok_or_else(|| {
-                        CameraError::DeviceNotFound(format!("Device index {}", device_index))
+                        CameraError::device_not_found(format!("Device index {}", device_index))
                     })?;
                     let info = activate_to_device_info(device_index, activate)?;
                     let callback: IMFSourceReaderCallback = ReaderCallback {
@@ -825,10 +832,10 @@ impl MFCamera {
                     }
                 }
             })
-            .map_err(CameraError::Io)?;
+            .map_err(|error| CameraError::io(crate::OperationStage::Worker, error))?;
         let ready = ready_rx
             .recv()
-            .map_err(|_| CameraError::StreamError("MF worker initialization failed".into()))?;
+            .map_err(|_| CameraError::stream_error("MF worker initialization failed".into()))?;
         match ready {
             Ok((device_info, formats)) => Ok(Self {
                 device_info,
@@ -860,11 +867,9 @@ impl MFCamera {
             .send(Event::Call(Box::new(move |worker| {
                 let _ = tx.send(f(worker));
             })))
-            .map_err(|_| CameraError::StreamError("MF worker stopped".into()))?;
+            .map_err(|_| CameraError::stream_error("MF worker stopped".into()))?;
         rx.recv_timeout(Duration::from_secs(5))
-            .map_err(|_| CameraError::Timeout {
-                stage: crate::OperationStage::BackendCommand,
-            })?
+            .map_err(|_| CameraError::timeout(crate::OperationStage::BackendCommand))?
     }
     fn start_sync(&self, config: CameraConfig) -> CameraResult<()> {
         let _lifecycle = self.lifecycle.lock().unwrap();
@@ -875,20 +880,19 @@ impl MFCamera {
         let worker_cancelled = cancelled.clone();
         let result = self.call(move |worker| {
             if worker_cancelled.load(std::sync::atomic::Ordering::Acquire) {
-                return Err(CameraError::Timeout {
-                    stage: crate::OperationStage::Startup,
-                });
+                return Err(CameraError::timeout(crate::OperationStage::Startup));
             }
             let result = worker.start(config);
             if worker_cancelled.load(std::sync::atomic::Ordering::Acquire) {
                 worker.fail();
-                return Err(CameraError::Timeout {
-                    stage: crate::OperationStage::Startup,
-                });
+                return Err(CameraError::timeout(crate::OperationStage::Startup));
             }
             result
         });
-        if matches!(result, Err(CameraError::Timeout { .. })) {
+        if matches!(
+            result,
+            Err(ref error) if error.kind() == crate::CameraErrorKind::Timeout
+        ) {
             cancelled.store(true, std::sync::atomic::Ordering::Release);
             self.hub.stop();
             // Complete native flushing even if the waiting caller timed out.
@@ -903,11 +907,9 @@ impl MFCamera {
         let (tx, rx) = mpsc::channel();
         self.sender
             .send(Event::Stop(tx))
-            .map_err(|_| CameraError::StreamError("MF worker stopped".into()))?;
+            .map_err(|_| CameraError::stream_error("MF worker stopped".into()))?;
         rx.recv_timeout(Duration::from_secs(5))
-            .map_err(|_| CameraError::Timeout {
-                stage: crate::OperationStage::Close,
-            })?
+            .map_err(|_| CameraError::timeout(crate::OperationStage::Close))?
     }
     pub fn cleanup(&self) {
         let _ = self.stop_sync();
@@ -916,13 +918,13 @@ impl MFCamera {
         let camera = self.clone();
         tokio::task::spawn_blocking(move || camera.start_sync(config))
             .await
-            .map_err(|e| CameraError::Other(e.to_string()))?
+            .map_err(|e| CameraError::worker_failure(e.to_string()).with_source(e))?
     }
     pub async fn stop_stream_arc(self: &Arc<Self>) -> CameraResult<()> {
         let camera = self.clone();
         tokio::task::spawn_blocking(move || camera.stop_sync())
             .await
-            .map_err(|e| CameraError::Other(e.to_string()))?
+            .map_err(|e| CameraError::worker_failure(e.to_string()).with_source(e))?
     }
 }
 impl Drop for MFCamera {
@@ -983,7 +985,7 @@ impl StreamingCamera for MFCamera {
         self.hub.stats()
     }
     async fn set_buffer_size(&self, _: usize) -> CameraResult<()> {
-        Err(CameraError::InvalidConfig(
+        Err(CameraError::invalid_config(
             "Fixed frame pool capacity".into(),
         ))
     }

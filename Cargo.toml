@@ -1,39 +1,37 @@
 [package]
-name = "camera"
-version = "0.4.0"
+name = "camera-rs"
+version = "0.5.0"
 edition = "2021"
 description = "Intent-driven cross-platform camera capture with bounded native frames"
 rust-version = "1.88"
 license = "MIT OR Apache-2.0"
 readme = "README.md"
-include = ["/src/**", "/Cargo.toml", "/build.rs", "/README.md", "/BUILD.md", "/docs/ARCHITECTURE.md", "/LICENSE-*", "/THIRD_PARTY.md", "/cpp/**", "/cmake/**", "/examples/**", "/benches/**", "/tests/**", "/scripts/**", "/docs/API.md", "/docs/V4L2.md", "/3rdparty/libuvc/src/**", "/3rdparty/libuvc/include/**", "/3rdparty/libuvc/LICENSE.txt", "/3rdparty/libusb/libusb/**", "/3rdparty/libusb/COPYING", "/3rdparty/libusb/android/**"]
+documentation = "https://docs.rs/camera-rs"
+homepage = "https://docs.rs/camera-rs"
+include = ["/src/**", "/Cargo.toml", "/build.rs", "/README.md", "/BUILD.md", "/CONTRIBUTING.md", "/SECURITY.md", "/CODE_OF_CONDUCT.md", "/docs/ARCHITECTURE.md", "/LICENSE-*", "/THIRD_PARTY.md", "/VENDORING.md", "/cpp/**", "/cmake/**", "/examples/**", "/benches/**", "/tests/**", "/scripts/**", "/docs/API.md", "/docs/V4L2.md", "/3rdparty/libuvc/src/**", "/3rdparty/libuvc/include/**", "/3rdparty/libuvc/LICENSE.txt", "/3rdparty/libusb/libusb/**", "/3rdparty/libusb/COPYING", "/3rdparty/libusb/android/**"]
 keywords = ["camera", "uvc", "video", "usb"]
 categories = ["multimedia::video", "hardware-support"]
 
 [dependencies]
-# 核心依赖
+# Core dependencies.
 libc = "0.2"
 thiserror = "1.0"
 log = "0.4"
 
-# 高性能锁
+# High-performance synchronization.
 parking_lot = "0.12"
 
-# 异步支持
+# Async support.
 tokio = { version = "1.0", features = ["sync", "time", "rt", "macros"], optional = true }
 
-# 数据处理
+# Data processing.
 ndarray = { version = "0.16", optional = true }
 serde = { version = "1", optional = true, features = ["derive"] }
 
-# JPEG 解码，用于 UVC/Media Foundation/V4L2 的 MJPEG 路径。
+# JPEG decoding for UVC, Media Foundation, and V4L2 MJPEG paths.
 turbojpeg = { version = "1.3", optional = true }
 
-# Optional GUI example dependencies
-eframe = { version = "0.29", optional = true }
-egui = { version = "0.29", optional = true }
-
-# Windows Media Foundation 支持
+# Windows Media Foundation support.
 [target.'cfg(target_os = "windows")'.dependencies]
 windows-core = { version = "0.58", optional = true }
 windows = { version = "0.58", optional = true, features = [
@@ -46,7 +44,7 @@ windows = { version = "0.58", optional = true, features = [
 ] }
 once_cell = { version = "1.19", optional = true }
 
-# macOS/iOS AVFoundation 支持
+# macOS/iOS AVFoundation support.
 [target.'cfg(any(target_os = "macos", target_os = "ios"))'.dependencies]
 objc2 = { version = "0.6", optional = true, features = ["exception"] }
 objc2-foundation = { version = "0.3", optional = true, default-features = false, features = [
@@ -107,11 +105,6 @@ serde_json = "1"
 
 
 
-# Example-specific configurations
-[[example]]
-name = "egui_viewer"
-required-features = ["viewer"]
-
 [[example]]
 name = "hotplug_monitor"
 
@@ -127,13 +120,18 @@ name = "color_convert"
 harness = false
 
 [lib]
+name = "camera"
 crate-type = ["lib"]
+
+[workspace]
+members = ["camera-android"]
+default-members = ["."]
+resolver = "2"
 
 [features]
 ndarray = ["runtime-tokio", "dep:ndarray"]
-viewer = ["runtime-tokio", "convert-rgb", "dep:eframe", "dep:egui"]
 # Convenience bundle. Features decide what is compiled; BackendPolicy decides runtime behavior.
-default = ["native", "runtime-tokio", "convert-rgb", "decode-mjpeg"]
+default = ["native", "runtime-tokio"]
 native = ["backend-v4l2", "backend-avfoundation", "backend-camera2", "backend-mf"]
 runtime-tokio = ["dep:tokio"]
 blocking = ["runtime-tokio", "tokio/rt-multi-thread"]
@@ -141,14 +139,27 @@ convert-rgb = []
 decode-mjpeg = ["dep:turbojpeg", "convert-rgb"]
 serde = ["dep:serde"]
 
-# 后端选择
-backend-uvc = ["runtime-tokio"] # UVC (libuvc) - 跨平台 USB 摄像头
-backend-v4l2 = ["runtime-tokio"] # Linux 内核 V4L2 (MMAP，无需 libuvc)
+# Backend selection.
+backend-uvc = ["runtime-tokio"] # UVC through libuvc for cross-platform USB cameras.
+backend-v4l2 = ["runtime-tokio"] # Linux kernel V4L2 with MMAP and no libuvc dependency.
 backend-avfoundation = ["runtime-tokio", "apple"] # AVFoundation - macOS/iOS
 backend-camera2 = ["runtime-tokio"]      # Camera2 - Android (NDK, no JNI required)
 native-debug-logs = []    # Verbose libusb diagnostics; keep disabled for capture benchmarks.
 benchmark-internals = ["runtime-tokio", "convert-rgb"]  # Exposes the frame publisher only to the repository benchmark.
+custom-backend = ["runtime-tokio"] # Experimental application-provided backend API.
 backend-mf = ["runtime-tokio", "windows-native"] # Media Foundation - Windows
 
 apple = ["dep:objc2", "dep:objc2-foundation", "dep:objc2-av-foundation", "dep:objc2-core-media", "dep:objc2-core-video", "dep:block2", "dep:dispatch2"]
 windows-native = ["dep:windows", "dep:windows-core", "dep:once_cell"]
+
+[package.metadata.docs.rs]
+features = [
+    "runtime-tokio",
+    "blocking",
+    "convert-rgb",
+    "decode-mjpeg",
+    "serde",
+    "ndarray",
+    "custom-backend",
+]
+rustdoc-args = ["--cfg", "docsrs"]

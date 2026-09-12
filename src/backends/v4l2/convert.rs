@@ -35,7 +35,7 @@ pub(super) fn to_fourcc(format: VideoFormat) -> CameraResult<u32> {
         VideoFormat::RGB => *b"RGB3",
         VideoFormat::Gray => *b"GREY",
         _ => {
-            return Err(CameraError::UnsupportedFormat(format!(
+            return Err(CameraError::unsupported_format(format!(
                 "V4L2 cannot decode {format:?}"
             )))
         }
@@ -43,7 +43,7 @@ pub(super) fn to_fourcc(format: VideoFormat) -> CameraResult<u32> {
 }
 
 fn invalid(message: &str) -> CameraError {
-    CameraError::InvalidFormat(message.into())
+    CameraError::invalid_frame(message.into())
 }
 
 fn check_rows(plane: &Plane<'_>, row_bytes: usize, height: usize) -> CameraResult<()> {
@@ -85,7 +85,7 @@ impl Converter {
             6 => ColorMatrix::Bt2020,
             8 => ColorMatrix::Smpte240M,
             _ => {
-                return Err(CameraError::UnsupportedFormat(format!(
+                return Err(CameraError::unsupported_format(format!(
                     "V4L2 YCbCr encoding {matrix}"
                 )))
             }
@@ -126,7 +126,7 @@ impl Converter {
         match config.format {
             VideoFormat::MJPEG => {
                 #[cfg(not(feature = "decode-mjpeg"))]
-                return Err(CameraError::UnsupportedFormat(
+                return Err(CameraError::unsupported_format(
                     "MJPEG decoding requires the decode-mjpeg feature".into(),
                 ));
                 #[cfg(feature = "decode-mjpeg")]
@@ -226,7 +226,7 @@ impl Converter {
                 }
             }
             other => {
-                return Err(CameraError::UnsupportedFormat(format!(
+                return Err(CameraError::unsupported_format(format!(
                     "V4L2 cannot decode {other:?}"
                 )))
             }

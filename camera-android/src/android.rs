@@ -1,9 +1,9 @@
-//! Android JNI 层直接调用 Java API
+//! Android JNI layer that invokes Java APIs directly.
 //!
-//! 通过 JNI 反射调用 Android USB API，减少 Java 端代码
+//! Uses JNI reflection for the Android USB APIs to keep the Java layer small.
 
 use std::os::fd::OwnedFd;
-use std::{ffi::c_void, sync::OnceLock};
+use std::sync::OnceLock;
 
 use jni::objects::{AutoLocal, GlobalRef, JObject, JString};
 use jni::{AttachGuard, JavaVM};
@@ -11,25 +11,22 @@ use jni::{AttachGuard, JavaVM};
 use crate::error::{CameraError, Result};
 use crate::UsbDeviceInfo as CameraDeviceInfo;
 
-// UVC 接口类和子类常量
+// UVC interface class and subclass constants.
 const INTERFACE_CLASS_VIDEO: u8 = 14; // CC_VIDEO
 const INTERFACE_SUBCLASS_VIDEO_CONTROL: u8 = 1; // SC_VIDEOCONTROL
 const INTERFACE_SUBCLASS_VIDEO_STREAMING: u8 = 2; // SC_VIDEOSTREAMING
 
-/// Android 上下文，存储 JavaVM 和 Android Context
+/// Android state containing the JavaVM and Android Context.
 static ANDROID_CONTEXT: OnceLock<AndroidContext> = OnceLock::new();
 
 pub(crate) struct AndroidContext {
-    java_vm: *mut c_void,
+    java_vm: JavaVM,
     context_jobject: GlobalRef,
 }
 
-unsafe impl Send for AndroidContext {}
-unsafe impl Sync for AndroidContext {}
-
 impl AndroidContext {
-    pub fn vm(&self) -> Result<JavaVM> {
-        java_vm_from_raw(self.java_vm)
+    pub fn vm(&self) -> &JavaVM {
+        &self.java_vm
     }
 
     pub fn context(&self) -> GlobalRef {
@@ -37,23 +34,10 @@ impl AndroidContext {
     }
 }
 
-fn java_vm_from_raw(java_vm: *mut c_void) -> Result<JavaVM> {
-    if java_vm.is_null() {
-        return Err(CameraError::Android(
-            "Android JavaVM pointer is null".into(),
-        ));
-    }
-
-    unsafe { JavaVM::from_raw(java_vm.cast()).map_err(CameraError::from) }
-}
-
-/// 初始化 Android 上下文
-///
-/// # Safety
-/// 必须在应用启动时调用一次
-pub unsafe fn init_android_context(vm: JavaVM, context: GlobalRef) {
+/// Initializes the Android context.
+pub fn init_android_context(vm: JavaVM, context: GlobalRef) {
     let android_context = AndroidContext {
-        java_vm: vm.get_java_vm_pointer().cast(),
+        java_vm: vm,
         context_jobject: context,
     };
 
@@ -64,19 +48,18 @@ pub unsafe fn init_android_context(vm: JavaVM, context: GlobalRef) {
     }
 }
 
-/// 获取 Android 上下文
-pub(crate) unsafe fn get_android_context() -> Result<&'static AndroidContext> {
-    ANDROID_CONTEXT.get().ok_or(CameraError::Android(
-        "Android context not initialized".into(),
-    ))
+/// Returns the Android context.
+pub(crate) fn get_android_context() -> Result<&'static AndroidContext> {
+    ANDROID_CONTEXT.get().ok_or_else(|| {
+        CameraError::adapter(
+            camera::CameraErrorKind::InvalidState,
+            "Android context not initialized",
+        )
+    })
 }
 
-/// 从 Java 对象获取字符串
-unsafe fn get_string(
-    env: &mut AttachGuard,
-    object: &JObject,
-    method: &str,
-) -> Result<Option<String>> {
+/// Extracts a string from a Java object.
+fn get_string(env: &mut AttachGuard, object: &JObject, method: &str) -> Result<Option<String>> {
     let string_ret = match env.call_method(object, method, "()Ljava/lang/String;", &[]) {
         Ok(ret) => ret,
         Err(e) => {
@@ -84,7 +67,10 @@ unsafe fn get_string(
             if env.exception_check()? {
                 env.exception_clear()?;
             }
-            return Err(CameraError::Android(format!("JNI call failed: {}", e)));
+            return Err(CameraError::adapter(
+                camera::CameraErrorKind::BackendFailure,
+                format!("JNI call failed: {e}"),
+            ));
         }
     };
 
@@ -94,18 +80,18 @@ unsafe fn get_string(
     if string.is_null() {
         Ok(None)
     } else {
-        Ok(Some(env.get_string_unchecked(&string)?.into()))
+        Ok(Some(env.get_string(&string)?.into()))
     }
 }
 
-/// 扫描 USB 摄像头设备列表
+/// Scans for USB camera devices.
 ///
-/// 通过 JNI 调用 Android UsbManager API 扫描设备
-pub unsafe fn usb_manager_scan() -> Result<Vec<CameraDeviceInfo>> {
+/// Invokes the Android UsbManager API through JNI.
+pub fn usb_manager_scan() -> Result<Vec<CameraDeviceInfo>> {
     let ctx = get_android_context()?;
 
     let context = ctx.context();
-    let vm = ctx.vm()?;
+    let vm = ctx.vm();
     let mut env = vm.attach_current_thread()?;
 
     let class_ctx = env.find_class("android/content/Context")?;
@@ -159,32 +145,32 @@ pub unsafe fn usb_manager_scan() -> Result<Vec<CameraDeviceInfo>> {
             .call_method(&device_next, "getProductId", "()I", &[])?
             .i()? as u16;
 
-        // 检查是否是 UVC 设备
+        // Check whether this is a UVC device.
         if !scan_uvc_interface(&mut env, &device_next)? {
             continue;
         }
 
-        // 获取设备详细信息
-        // getProductName - 产品名称（可能为 null）
+        // Read device details.
+        // getProductName may return null.
         let product_name = get_string(&mut env, &device_next, "getProductName")?;
 
-        // getManufacturerName - 制造商名称（可能为 null，需要 Android 5.0+）
+        // getManufacturerName may return null and requires Android 5.0 or newer.
         let manufacturer = get_string(&mut env, &device_next, "getManufacturerName")?;
 
-        // getSerialNumber - 序列号（可能为 null，需要权限）
+        // getSerialNumber may return null and requires USB permission.
         let serial_number = get_string(&mut env, &device_next, "getSerialNumber")
             .ok()
             .flatten();
 
-        // getDeviceName - 设备路径（如 /dev/bus/usb/001/002）
+        // getDeviceName returns a path such as /dev/bus/usb/001/002.
         let device_path = get_string(&mut env, &device_next, "getDeviceName")?.unwrap_or_default();
 
-        // getVersion - USB 版本（Android 13+）
+        // getVersion is available on Android 13 and newer.
         let usb_version = get_string(&mut env, &device_next, "getVersion")
             .ok()
             .flatten();
 
-        // 构建显示名称：优先使用产品名称，其次是制造商+VID:PID
+        // Prefer the product name, then manufacturer plus VID:PID.
         let display_name = if let Some(ref name) = product_name {
             if !name.is_empty() {
                 name.clone()
@@ -219,8 +205,8 @@ pub unsafe fn usb_manager_scan() -> Result<Vec<CameraDeviceInfo>> {
     Ok(result)
 }
 
-/// 扫描设备接口，检查是否是 UVC 摄像头
-unsafe fn scan_uvc_interface(env: &mut AttachGuard, device: &JObject) -> Result<bool> {
+/// Scans device interfaces to identify a UVC camera.
+fn scan_uvc_interface(env: &mut AttachGuard, device: &JObject) -> Result<bool> {
     let interface_count = env
         .call_method(device, "getInterfaceCount", "()I", &[])?
         .i()?;
@@ -258,12 +244,12 @@ unsafe fn scan_uvc_interface(env: &mut AttachGuard, device: &JObject) -> Result<
     Ok(false)
 }
 
-/// 检查设备是否已有权限
-pub unsafe fn usb_device_has_permission(device_path: &str) -> Result<bool> {
+/// Checks whether USB permission has already been granted.
+pub fn usb_device_has_permission(device_path: &str) -> Result<bool> {
     let ctx = get_android_context()?;
 
     let context = ctx.context();
-    let vm = ctx.vm()?;
+    let vm = ctx.vm();
     let mut env = vm.attach_current_thread()?;
 
     let class_ctx = env.find_class("android/content/Context")?;
@@ -298,7 +284,12 @@ pub unsafe fn usb_device_has_permission(device_path: &str) -> Result<bool> {
     let device = env.auto_local(device);
 
     if device.is_null() {
-        return Err(CameraError::DeviceNotFound(device_path.to_string()));
+        return Err(
+            camera::CameraError::device_not_found(device_path.to_string())
+                .with_backend(camera::BackendId::UVC)
+                .with_stage(camera::OperationStage::Enumeration)
+                .into(),
+        );
     }
 
     let has_permission = env
@@ -313,12 +304,12 @@ pub unsafe fn usb_device_has_permission(device_path: &str) -> Result<bool> {
     Ok(has_permission)
 }
 
-/// 请求 USB 设备权限
-pub unsafe fn usb_device_request_permission(device_path: &str) -> Result<()> {
+/// Requests permission for a USB device.
+pub fn usb_device_request_permission(device_path: &str) -> Result<()> {
     let ctx = get_android_context()?;
 
     let context = ctx.context();
-    let vm = ctx.vm()?;
+    let vm = ctx.vm();
     let mut env = vm.attach_current_thread()?;
 
     let class_ctx = env.find_class("android/content/Context")?;
@@ -353,10 +344,15 @@ pub unsafe fn usb_device_request_permission(device_path: &str) -> Result<()> {
     let device = env.auto_local(device);
 
     if device.is_null() {
-        return Err(CameraError::DeviceNotFound(device_path.to_string()));
+        return Err(
+            camera::CameraError::device_not_found(device_path.to_string())
+                .with_backend(camera::BackendId::UVC)
+                .with_stage(camera::OperationStage::Enumeration)
+                .into(),
+        );
     }
 
-    // 创建 PendingIntent
+    // Create the PendingIntent.
     let permission = "com.medivh.camera.USB_PERMISSION";
     let permission_str: JObject = env.new_string(permission)?.into();
     let permission_str = env.auto_local(permission_str);
@@ -368,7 +364,7 @@ pub unsafe fn usb_device_request_permission(device_path: &str) -> Result<()> {
         &[(&permission_str).into()],
     )?;
 
-    // Android 12+ 需要为 Intent 设置 package 才能正确接收广播
+    // Android 12 and newer require the Intent package for broadcast delivery.
     let package_name = env
         .call_method(
             context.as_obj(),
@@ -387,7 +383,7 @@ pub unsafe fn usb_device_request_permission(device_path: &str) -> Result<()> {
 
     let class_pending_intent = env.find_class("android/app/PendingIntent")?;
 
-    // Android 12+ 需要指定 FLAG_MUTABLE 或 FLAG_IMMUTABLE
+    // Android 12 and newer require FLAG_MUTABLE or FLAG_IMMUTABLE.
     // FLAG_MUTABLE = 0x02000000
     let flags = 0x02000000i32; // FLAG_MUTABLE
 
@@ -417,16 +413,16 @@ pub unsafe fn usb_device_request_permission(device_path: &str) -> Result<()> {
     Ok(())
 }
 
-/// 打开 USB 设备并获取文件描述符
+/// Opens a USB device and returns its file descriptor.
 ///
-/// 这是 Android 上打开 UVC 摄像头的核心方法
+/// This is the primary Android entry point for opening a UVC camera.
 /// Returns an owned duplicate of the USB fd. The caller must close it.
 /// The temporary Java UsbDeviceConnection is closed before returning.
-pub unsafe fn usb_device_open(device_path: &str) -> Result<OwnedFd> {
+pub fn usb_device_open(device_path: &str) -> Result<OwnedFd> {
     let ctx = get_android_context()?;
 
     let context = ctx.context();
-    let vm = ctx.vm()?;
+    let vm = ctx.vm();
     let mut env = vm.attach_current_thread()?;
 
     let class_ctx = env.find_class("android/content/Context")?;
@@ -461,10 +457,15 @@ pub unsafe fn usb_device_open(device_path: &str) -> Result<OwnedFd> {
     let device = env.auto_local(device);
 
     if device.is_null() {
-        return Err(CameraError::DeviceNotFound(device_path.to_string()));
+        return Err(
+            camera::CameraError::device_not_found(device_path.to_string())
+                .with_backend(camera::BackendId::UVC)
+                .with_stage(camera::OperationStage::Open)
+                .into(),
+        );
     }
 
-    // 检查权限
+    // Check USB permission.
     let has_permission = env
         .call_method(
             &usb_manager,
@@ -476,12 +477,17 @@ pub unsafe fn usb_device_open(device_path: &str) -> Result<OwnedFd> {
 
     if !has_permission {
         log::warn!("No permission for USB device: {}", device_path);
-        // 请求权限
+        // Request permission.
         usb_device_request_permission_internal(&mut env, &usb_manager, &device, ctx)?;
-        return Err(CameraError::PermissionDenied(device_path.to_string()));
+        return Err(
+            camera::CameraError::permission_denied(device_path.to_string())
+                .with_backend(camera::BackendId::UVC)
+                .with_stage(camera::OperationStage::Open)
+                .into(),
+        );
     }
 
-    // 打开设备
+    // Open the device.
     let usb_connection = env
         .call_method(
             &usb_manager,
@@ -493,7 +499,12 @@ pub unsafe fn usb_device_open(device_path: &str) -> Result<OwnedFd> {
     let usb_connection = env.auto_local(usb_connection);
 
     if usb_connection.is_null() {
-        return Err(CameraError::Android("Failed to open USB device".into()));
+        return Err(
+            camera::CameraError::device_open_failed("Failed to open USB device".into())
+                .with_backend(camera::BackendId::UVC)
+                .with_stage(camera::OperationStage::Open)
+                .into(),
+        );
     }
 
     // Duplicate while Java still owns the original descriptor. Always close
@@ -509,8 +520,8 @@ pub unsafe fn usb_device_open(device_path: &str) -> Result<OwnedFd> {
     Ok(owned)
 }
 
-/// 内部函数：请求权限
-unsafe fn usb_device_request_permission_internal<'a>(
+/// Internal permission request helper.
+fn usb_device_request_permission_internal<'a>(
     env: &mut AttachGuard<'a>,
     usb_manager: &JObject<'a>,
     device: &JObject<'a>,
@@ -527,7 +538,7 @@ unsafe fn usb_device_request_permission_internal<'a>(
         &[(&permission_str).into()],
     )?;
 
-    // Android 12+ 需要为 Intent 设置 package 才能正确接收广播
+    // Android 12 and newer require the Intent package for broadcast delivery.
     let package_name = env
         .call_method(
             ctx.context().as_obj(),
@@ -572,8 +583,8 @@ unsafe fn usb_device_request_permission_internal<'a>(
     Ok(())
 }
 
-/// 通过 VID/PID 打开设备
-pub unsafe fn usb_device_open_by_vid_pid(vid: u16, pid: u16) -> Result<OwnedFd> {
+/// Opens a device by VID and PID.
+pub fn usb_device_open_by_vid_pid(vid: u16, pid: u16) -> Result<OwnedFd> {
     let devices = usb_manager_scan()?;
 
     for device in devices {
@@ -584,14 +595,16 @@ pub unsafe fn usb_device_open_by_vid_pid(vid: u16, pid: u16) -> Result<OwnedFd> 
         }
     }
 
-    Err(CameraError::DeviceNotFound(format!(
-        "VID:{:04x} PID:{:04x}",
-        vid, pid
-    )))
+    Err(
+        camera::CameraError::device_not_found(format!("VID:{vid:04x} PID:{pid:04x}"))
+            .with_backend(camera::BackendId::UVC)
+            .with_stage(camera::OperationStage::Open)
+            .into(),
+    )
 }
 
-/// 通过设备索引打开设备
-pub unsafe fn usb_device_open_by_index(index: u32) -> Result<OwnedFd> {
+/// Opens a device by index.
+pub fn usb_device_open_by_index(index: u32) -> Result<OwnedFd> {
     let devices = usb_manager_scan()?;
 
     if let Some(device) = devices.get(index as usize) {
@@ -600,10 +613,12 @@ pub unsafe fn usb_device_open_by_index(index: u32) -> Result<OwnedFd> {
         }
     }
 
-    Err(CameraError::DeviceNotFound(format!(
-        "Device index {}",
-        index
-    )))
+    Err(
+        camera::CameraError::device_not_found(format!("Device index {index}"))
+            .with_backend(camera::BackendId::UVC)
+            .with_stage(camera::OperationStage::Open)
+            .into(),
+    )
 }
 
 #[cfg(test)]
@@ -611,22 +626,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn java_vm_from_raw_rejects_null_pointer_without_panicking() {
-        let result = java_vm_from_raw(std::ptr::null_mut());
-
-        assert!(matches!(
-            result,
-            Err(CameraError::Android(message)) if message.contains("JavaVM pointer is null")
-        ));
-    }
-
-    #[test]
     fn get_android_context_returns_error_before_init() {
-        let result = unsafe { get_android_context() };
+        let result = get_android_context();
 
         assert!(matches!(
             result,
-            Err(CameraError::Android(message)) if message.contains("not initialized")
+            Err(error) if error.kind() == camera::CameraErrorKind::InvalidState
+                && error.to_string().contains("not initialized")
         ));
     }
 }

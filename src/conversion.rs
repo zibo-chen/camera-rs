@@ -12,11 +12,15 @@ use crate::{
 /// DCT scaling for MJPEG when a supported factor can reduce the decode work.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ConversionRequest {
+    /// Frame width in pixels.
     pub width: u32,
+    /// Frame height in pixels.
     pub height: u32,
+    /// The color override value.
     pub color_override: Option<ColorInfo>,
 }
 impl ConversionRequest {
+    /// Performs the `new` operation.
     pub fn new(width: u32, height: u32) -> CameraResult<Self> {
         let request = Self {
             width,
@@ -26,6 +30,7 @@ impl ConversionRequest {
         request.output_len()?;
         Ok(request)
     }
+    /// Performs the `for_layout` operation.
     pub fn for_layout(layout: &FrameLayout) -> Self {
         Self {
             width: layout.width,
@@ -33,16 +38,18 @@ impl ConversionRequest {
             color_override: None,
         }
     }
+    /// Performs the `with_color` operation.
     pub fn with_color(mut self, color: ColorInfo) -> Self {
         self.color_override = Some(color);
         self
     }
+    /// Performs the `output_len` operation.
     pub fn output_len(self) -> CameraResult<usize> {
         (self.width as usize)
             .checked_mul(self.height as usize)
             .and_then(|pixels| pixels.checked_mul(3))
             .filter(|&bytes| bytes > 0)
-            .ok_or_else(|| CameraError::InvalidFormat("Invalid RGB output dimensions".into()))
+            .ok_or_else(|| CameraError::invalid_frame("Invalid RGB output dimensions".into()))
     }
 }
 
@@ -203,6 +210,7 @@ impl NearestMap {
 }
 
 #[derive(Default)]
+/// Values for `RgbConverter`.
 pub struct RgbConverter {
     #[cfg(feature = "decode-mjpeg")]
     jpeg: Option<turbojpeg::Decompressor>,
@@ -212,6 +220,7 @@ pub struct RgbConverter {
     rgb_row_scratch: Vec<u8>,
 }
 impl RgbConverter {
+    /// Performs the `new` operation.
     pub fn new() -> Self {
         Self::default()
     }
@@ -226,6 +235,7 @@ impl RgbConverter {
     ) -> CameraResult<()> {
         self.convert_layout_into(frame.layout(), frame.bytes(), request, output)
     }
+    /// Performs the `convert_layout_into` operation.
     pub fn convert_layout_into(
         &mut self,
         layout: &FrameLayout,
@@ -237,7 +247,7 @@ impl RgbConverter {
         let (w, h) = (layout.width as usize, layout.height as usize);
         let (out_w, out_h) = (request.width as usize, request.height as usize);
         if request.output_len()? != out.len() {
-            return Err(CameraError::InvalidFormat(
+            return Err(CameraError::invalid_frame(
                 "RGB destination size mismatch".into(),
             ));
         }
@@ -249,16 +259,16 @@ impl RgbConverter {
                 return crate::mjpeg::decode_with(decoder, data, |decoder, data| {
                     let header = decoder
                         .read_header(data)
-                        .map_err(|e| CameraError::InvalidFormat(e.to_string()))?;
+                        .map_err(|e| CameraError::invalid_frame(e.to_string()))?;
                     if (header.width, header.height) != (w, h) {
-                        return Err(CameraError::InvalidFormat(
+                        return Err(CameraError::invalid_frame(
                             "JPEG dimensions differ from layout".into(),
                         ));
                     }
                     let scaling = jpeg_scaling(&header, out_w, out_h);
                     decoder
                         .set_scaling_factor(scaling)
-                        .map_err(|e| CameraError::InvalidFormat(e.to_string()))?;
+                        .map_err(|e| CameraError::invalid_frame(e.to_string()))?;
                     let scaled = header.scaled(scaling);
                     if (scaled.width, scaled.height) == (out_w, out_h) {
                         return decoder
@@ -272,14 +282,14 @@ impl RgbConverter {
                                     format: turbojpeg::PixelFormat::RGB,
                                 },
                             )
-                            .map_err(|e| CameraError::InvalidFormat(e.to_string()));
+                            .map_err(|e| CameraError::invalid_frame(e.to_string()));
                     }
                     let scratch_len = scaled
                         .width
                         .checked_mul(scaled.height)
                         .and_then(|pixels| pixels.checked_mul(3))
                         .ok_or_else(|| {
-                            CameraError::InvalidFormat("JPEG output size overflow".into())
+                            CameraError::invalid_frame("JPEG output size overflow".into())
                         })?;
                     scratch.resize(scratch_len, 0);
                     decoder
@@ -293,19 +303,19 @@ impl RgbConverter {
                                 format: turbojpeg::PixelFormat::RGB,
                             },
                         )
-                        .map_err(|e| CameraError::InvalidFormat(e.to_string()))?;
+                        .map_err(|e| CameraError::invalid_frame(e.to_string()))?;
                     nearest.update(scaled.width, scaled.height, out_w, out_h, false);
                     resize_rgb_nearest(scratch, scaled.width, out, out_w, &nearest.x, &nearest.y);
                     Ok(())
                 });
             }
             #[cfg(not(feature = "decode-mjpeg"))]
-            return Err(CameraError::UnsupportedFormat(
+            return Err(CameraError::unsupported_format(
                 "Enable jpeg for MJPEG decoding".into(),
             ));
         }
         if layout.format == PixelFormat::H264 {
-            return Err(CameraError::UnsupportedFormat(
+            return Err(CameraError::unsupported_format(
                 "H264 decoding requires an external video decoder".into(),
             ));
         }

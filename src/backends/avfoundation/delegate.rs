@@ -1,7 +1,7 @@
-//! AVFoundation 帧回调委托
+//! AVFoundation frame callback delegate.
 //!
-//! 实现 AVCaptureVideoDataOutputSampleBufferDelegate 协议，
-//! 接收视频帧并转换为 RGB 格式。
+//! Implements `AVCaptureVideoDataOutputSampleBufferDelegate`, receives video
+//! frames, and converts them to RGB when requested.
 
 use std::sync::Arc;
 
@@ -29,7 +29,7 @@ pub struct DelegateState {
 }
 
 define_class!(
-    /// AVCaptureVideoDataOutputSampleBufferDelegate 实现
+    /// `AVCaptureVideoDataOutputSampleBufferDelegate` implementation.
     #[unsafe(super(NSObject))]
     #[ivars = DelegateState]
     pub struct CaptureDelegate;
@@ -60,7 +60,7 @@ define_class!(
 );
 
 impl CaptureDelegate {
-    /// 创建新的委托
+    /// Creates a frame delegate.
     pub fn new(hub: Arc<FrameBuffer>) -> Retained<Self> {
         let session = hub.session();
         let this = Self::alloc().set_ivars(DelegateState { hub, session });
@@ -68,12 +68,10 @@ impl CaptureDelegate {
     }
 }
 
-/// 处理采样缓冲区
+/// Processes a sample buffer.
 fn handle_sample_buffer(sample_buffer: &CMSampleBuffer, state: &DelegateState) {
-    // SAFETY: 这个函数需要 unsafe 因为：
-    // 1. CMSampleBuffer 操作需要正确的内存管理
-    // 2. CVPixelBuffer Lock/Unlock 操作需要正确配对
-    // 3. 指针操作需要确保内存有效
+    // SAFETY: CMSampleBuffer ownership must remain valid, CVPixelBuffer locks
+    // must be paired, and all raw pointers must remain valid for this call.
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
         handle_sample_buffer_unsafe(sample_buffer, state);
     }));
@@ -82,14 +80,14 @@ fn handle_sample_buffer(sample_buffer: &CMSampleBuffer, state: &DelegateState) {
     }
 }
 
-/// 处理采样缓冲区 (unsafe 实现)
+/// Unsafe implementation of sample-buffer processing.
 unsafe fn handle_sample_buffer_unsafe(sample_buffer: &CMSampleBuffer, state: &DelegateState) {
     let frame_buffer = &state.hub;
     if !frame_buffer.is_streaming() {
         return;
     }
 
-    // 获取像素缓冲区
+    // Obtain the pixel buffer.
     let pixel_buffer = match unsafe { sample_buffer.image_buffer() } {
         Some(pb) => pb,
         None => {
@@ -138,7 +136,7 @@ unsafe fn handle_sample_buffer_unsafe(sample_buffer: &CMSampleBuffer, state: &De
                             if code == 0 {
                                 Ok(())
                             } else {
-                                Err(crate::CameraError::InvalidFormat(format!(
+                                Err(crate::CameraError::invalid_frame(format!(
                                     "CMBlockBuffer copy: {code}"
                                 )))
                             }
@@ -152,10 +150,10 @@ unsafe fn handle_sample_buffer_unsafe(sample_buffer: &CMSampleBuffer, state: &De
         }
     };
 
-    // CVImageBuffer 和 CVPixelBuffer 是相同的类型
+    // CVImageBuffer and CVPixelBuffer are aliases for the same underlying type.
     let pixel_buffer: &CVPixelBuffer = &pixel_buffer;
 
-    // 锁定像素缓冲区
+    // Lock the pixel buffer.
     let lock_result = CVPixelBufferLockBaseAddress(pixel_buffer, CVPixelBufferLockFlags::ReadOnly);
 
     if lock_result != 0 {
@@ -172,7 +170,7 @@ unsafe fn handle_sample_buffer_unsafe(sample_buffer: &CMSampleBuffer, state: &De
         }
     }
     let _lock = PixelLock(pixel_buffer);
-    // 获取像素数据
+    // Access pixel data.
     let width = CVPixelBufferGetWidth(pixel_buffer) as u32;
     let height = CVPixelBufferGetHeight(pixel_buffer) as u32;
     let bytes_per_row = CVPixelBufferGetBytesPerRow(pixel_buffer);
@@ -350,7 +348,7 @@ unsafe fn handle_sample_buffer_unsafe(sample_buffer: &CMSampleBuffer, state: &De
                 0x42475241 | 0x00000020 => 4,
                 0x79757673 | 0x32767579 => 2,
                 _ => {
-                    return Err(crate::CameraError::UnsupportedFormat(format!(
+                    return Err(crate::CameraError::unsupported_format(format!(
                         "AVFoundation pixel format {pixel_format:08x}"
                     )))
                 }
@@ -358,7 +356,7 @@ unsafe fn handle_sample_buffer_unsafe(sample_buffer: &CMSampleBuffer, state: &De
             if bytes_per_row < width as usize * bytes_per_pixel
                 || (bytes_per_pixel == 2 && !width.is_multiple_of(2))
             {
-                return Err(crate::CameraError::InvalidFormat(
+                return Err(crate::CameraError::invalid_frame(
                     "Invalid AVFoundation row stride/dimensions".into(),
                 ));
             }
@@ -368,7 +366,7 @@ unsafe fn handle_sample_buffer_unsafe(sample_buffer: &CMSampleBuffer, state: &De
                         .checked_mul(bytes_per_row)
                         .and_then(|bytes| bytes.checked_add(width as usize * 4))
                         .ok_or_else(|| {
-                            crate::CameraError::InvalidFormat(
+                            crate::CameraError::invalid_frame(
                                 "AVFoundation packed frame size overflow".into(),
                             )
                         })?;
@@ -407,7 +405,7 @@ unsafe fn handle_sample_buffer_unsafe(sample_buffer: &CMSampleBuffer, state: &De
     }
 }
 
-/// YUYV 转 RGB
+/// Converts YUYV to RGB.
 fn yuyv_to_rgb(src: *const u8, dst: &mut [u8], width: u32, height: u32, bytes_per_row: usize) {
     for y in 0..height as usize {
         for x in (0..width as usize).step_by(2) {
@@ -420,13 +418,13 @@ fn yuyv_to_rgb(src: *const u8, dst: &mut [u8], width: u32, height: u32, bytes_pe
                 let y1 = *src.add(src_offset + 2) as i32;
                 let v = *src.add(src_offset + 3) as i32;
 
-                // 第一个像素
+                // First pixel.
                 let (r, g, b) = yuv_to_rgb(y0, u, v);
                 dst[dst_offset] = r;
                 dst[dst_offset + 1] = g;
                 dst[dst_offset + 2] = b;
 
-                // 第二个像素
+                // Second pixel.
                 if x + 1 < width as usize {
                     let (r, g, b) = yuv_to_rgb(y1, u, v);
                     dst[dst_offset + 3] = r;
@@ -438,7 +436,7 @@ fn yuyv_to_rgb(src: *const u8, dst: &mut [u8], width: u32, height: u32, bytes_pe
     }
 }
 
-/// UYVY 转 RGB
+/// Converts UYVY to RGB.
 fn uyvy_to_rgb(src: *const u8, dst: &mut [u8], width: u32, height: u32, bytes_per_row: usize) {
     for y in 0..height as usize {
         for x in (0..width as usize).step_by(2) {
@@ -451,13 +449,13 @@ fn uyvy_to_rgb(src: *const u8, dst: &mut [u8], width: u32, height: u32, bytes_pe
                 let v = *src.add(src_offset + 2) as i32;
                 let y1 = *src.add(src_offset + 3) as i32;
 
-                // 第一个像素
+                // First pixel.
                 let (r, g, b) = yuv_to_rgb(y0, u, v);
                 dst[dst_offset] = r;
                 dst[dst_offset + 1] = g;
                 dst[dst_offset + 2] = b;
 
-                // 第二个像素
+                // Second pixel.
                 if x + 1 < width as usize {
                     let (r, g, b) = yuv_to_rgb(y1, u, v);
                     dst[dst_offset + 3] = r;
@@ -469,7 +467,7 @@ fn uyvy_to_rgb(src: *const u8, dst: &mut [u8], width: u32, height: u32, bytes_pe
     }
 }
 
-/// YUV 转 RGB
+/// Converts one YUV pixel to RGB.
 #[inline]
 fn yuv_to_rgb(y: i32, u: i32, v: i32) -> (u8, u8, u8) {
     let c = y - 16;
@@ -489,16 +487,16 @@ unsafe fn publish_encoded(
 ) -> crate::CameraResult<()> {
     let block = sample
         .data_buffer()
-        .ok_or(crate::CameraError::BufferEmpty)?;
+        .ok_or(crate::CameraError::buffer_exhausted())?;
     let desc = sample
         .format_description()
-        .ok_or(crate::CameraError::BufferEmpty)?;
+        .ok_or(crate::CameraError::buffer_exhausted())?;
     let dimensions = objc2_core_media::CMVideoFormatDescriptionGetDimensions(&desc);
     let format = match desc.media_sub_type() {
         0x6a706567 => crate::PixelFormat::Mjpeg,
         0x61766331 => crate::PixelFormat::H264,
         _ => {
-            return Err(crate::CameraError::UnsupportedFormat(
+            return Err(crate::CameraError::unsupported_format(
                 "Encoded AVFoundation subtype".into(),
             ))
         }
@@ -526,10 +524,10 @@ unsafe fn publish_encoded(
         .hub
         .publish_native_into(state.session, layout, timestamp, |bytes| {
             let ptr = std::ptr::NonNull::new(bytes.as_mut_ptr().cast())
-                .ok_or(crate::CameraError::BufferEmpty)?;
+                .ok_or(crate::CameraError::buffer_exhausted())?;
             let status = block.copy_data_bytes(0, bytes.len(), ptr);
             if status != 0 {
-                return Err(crate::CameraError::InvalidFormat(format!(
+                return Err(crate::CameraError::invalid_frame(format!(
                     "CMBlockBuffer copy: {status}"
                 )));
             }

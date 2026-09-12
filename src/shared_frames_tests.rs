@@ -49,7 +49,7 @@ async fn wait_after_none_waits_for_a_frame_newer_than_the_current_snapshot() {
 
     assert!(matches!(
         hub.wait_after(None, Duration::from_millis(2)).await,
-        Err(crate::CameraError::Timeout { .. })
+        Err(ref error) if error.kind() == crate::CameraErrorKind::Timeout
     ));
 
     let waiter = {
@@ -71,11 +71,11 @@ async fn first_frame_wait_accepts_current_session_only() {
 
     assert!(matches!(
         hub.wait_first_in(old, Duration::from_millis(2)).await,
-        Err(crate::CameraError::StreamStopped)
+        Err(ref error) if error.kind() == crate::CameraErrorKind::StreamStopped
     ));
     assert!(matches!(
         hub.wait_first_in(current, Duration::from_millis(2)).await,
-        Err(crate::CameraError::Timeout { .. })
+        Err(ref error) if error.kind() == crate::CameraErrorKind::Timeout
     ));
     assert!(!publish(&hub, old, 2));
     assert!(publish(&hub, current, 3));
@@ -156,7 +156,7 @@ async fn recovery_enabled_receiver_survives_the_disconnect_race_and_next_epoch()
     hub.stop();
     assert!(matches!(
         receiver.next_timeout(Duration::from_millis(2)).await,
-        Err(crate::CameraError::Timeout { .. })
+        Err(ref error) if error.kind() == crate::CameraErrorKind::Timeout
     ));
 
     let next_epoch = hub.start();
@@ -172,7 +172,7 @@ async fn recovery_enabled_receiver_survives_the_disconnect_race_and_next_epoch()
     hub.stop();
     assert!(matches!(
         receiver.next().await,
-        Err(crate::CameraError::StreamStopped)
+        Err(ref error) if error.kind() == crate::CameraErrorKind::StreamStopped
     ));
 }
 
@@ -185,7 +185,7 @@ fn a_bad_frame_burst_triggers_recovery_and_a_good_frame_clears_it() {
     for expected in 1..FRAME_ERROR_RECOVERY_THRESHOLD {
         assert!(hub
             .publish_rgb(epoch, 2, 2, None, |_| {
-                Err(crate::CameraError::InvalidFormat(
+                Err(crate::CameraError::invalid_frame(
                     "damaged test frame".into(),
                 ))
             })
@@ -200,7 +200,7 @@ fn a_bad_frame_burst_triggers_recovery_and_a_good_frame_clears_it() {
 
     assert!(hub
         .publish_rgb(epoch, 2, 2, None, |_| {
-            Err(crate::CameraError::InvalidFormat(
+            Err(crate::CameraError::invalid_frame(
                 "damaged test frame".into(),
             ))
         })
@@ -268,7 +268,9 @@ fn failed_conversion_preserves_latest_and_instances_are_isolated() {
     publish(&a, ae, 1);
     publish(&b, be, 2);
     assert!(a
-        .publish_rgb(ae, 2, 2, None, |_| Err(crate::CameraError::BufferEmpty))
+        .publish_rgb(ae, 2, 2, None, |_| Err(
+            crate::CameraError::buffer_exhausted()
+        ))
         .is_err());
     assert_eq!(a.latest().unwrap().bytes()[0], 1);
     assert_eq!(b.latest().unwrap().bytes()[0], 2);
@@ -316,7 +318,7 @@ async fn delivery_policies_bound_each_queue_and_report_drops() {
         }
         assert!(matches!(
             receiver.next_timeout(Duration::from_millis(1)).await,
-            Err(crate::CameraError::Timeout { .. })
+            Err(ref error) if error.kind() == crate::CameraErrorKind::Timeout
         ));
         assert!(publish(&hub, epoch, 5));
         assert_eq!(receiver.next().await.unwrap().bytes()[0], 5);

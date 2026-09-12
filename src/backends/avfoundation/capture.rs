@@ -1,4 +1,4 @@
-//! AVFoundation 捕获会话管理
+//! AVFoundation capture session management.
 
 use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
@@ -54,7 +54,11 @@ fn objc_exception_error(
 ) -> CameraError {
     let message = objc_exception_message(exception);
     log::error!("{context} raised Objective-C exception: {message}");
-    CameraError::Other(format!("{context}: {message}"))
+    CameraError::backend_failure(
+        crate::BackendId::AV_FOUNDATION,
+        crate::OperationStage::BackendCommand,
+        format!("{context}: {message}"),
+    )
 }
 
 fn catch_objc<T, F>(context: &str, f: F) -> CameraResult<T>
@@ -83,7 +87,7 @@ impl Drop for DeviceConfigurationLock {
     }
 }
 
-/// 捕获会话
+/// Capture session.
 pub struct CaptureSession {
     /// AVCaptureSession
     session: Retained<AVCaptureSession>,
@@ -96,21 +100,21 @@ pub struct CaptureSession {
     /// AVCaptureVideoDataOutput
     #[allow(dead_code)]
     output: Retained<AVCaptureVideoDataOutput>,
-    /// 帧委托 - 需要保持存活
+    /// Frame delegate retained for the session lifetime.
     #[allow(dead_code)]
     delegate: Retained<CaptureDelegate>,
-    /// 帧缓冲区
+    /// Frame buffer.
     frame_buffer: Arc<FrameBuffer>,
-    /// 回调队列 - 需要保持存活
+    /// Callback queue retained for the session lifetime.
     #[allow(dead_code)]
     callback_queue: DispatchRetained<DispatchQueue>,
-    /// 当前配置
+    /// Current configuration.
     config: CameraConfig,
     configuration_lock: Option<DeviceConfigurationLock>,
 }
 
 impl CaptureSession {
-    /// 创建新的捕获会话
+    /// Creates a capture session.
     pub fn new(
         device_id: &str,
         config: CameraConfig,
@@ -134,56 +138,56 @@ impl CaptureSession {
             config
         );
 
-        // 获取设备
+        // Resolve the capture device.
         let device = get_device_by_id(device_id)?;
 
         unsafe {
             log::debug!("Got device: {}", device.localizedName());
         }
 
-        // 查找最佳格式
+        // Find the best matching format.
         log::debug!("Finding best format...");
         let best_format = find_best_format(&device, &config)?;
         log::debug!("Best format found");
 
-        // 创建会话
+        // Create the session.
         log::debug!("Creating AVCaptureSession...");
         let session = unsafe { AVCaptureSession::new() };
         log::debug!("AVCaptureSession created");
 
-        // 开始配置
+        // Begin session configuration.
         log::debug!("Beginning configuration...");
         unsafe {
             session.beginConfiguration();
         }
         log::debug!("Configuration begun");
 
-        // 创建输入
+        // Create the capture input.
         let input = unsafe {
             AVCaptureDeviceInput::deviceInputWithDevice_error(&device).map_err(|e| {
-                CameraError::DeviceOpenFailed(format!("Failed to create input: {:?}", e))
+                CameraError::device_open_failed(format!("Failed to create input: {:?}", e))
             })?
         };
 
-        // 添加输入到会话
+        // Add the input to the session.
         let can_add = unsafe { session.canAddInput(&input) };
         if can_add {
             unsafe { session.addInput(&input) };
             log::debug!("Input added to session");
         } else {
-            return Err(CameraError::DeviceOpenFailed(
+            return Err(CameraError::device_open_failed(
                 "Cannot add input to session".into(),
             ));
         }
 
-        // 创建输出
+        // Create the video output.
         let output = unsafe { AVCaptureVideoDataOutput::new() };
 
         // Keep native output untouched. RGB output asks Core Video for NV12 so
         // camera-rs can use its direct two-row SIMD conversion instead of paying
         // for AVFoundation YUV->BGRA followed by another BGRA->RGB pass.
-        // 分辨率由 activeFormat 控制，避免向 setVideoSettings 传入容易触发
-        // NSInvalidArgumentException 的 width/height 约束。
+        // activeFormat controls resolution. Avoid width/height constraints in
+        // setVideoSettings because some devices raise NSInvalidArgumentException.
         unsafe {
             // An empty dictionary requests device-native samples (Apple videoSettings contract).
             let dict = if frame_buffer.wants_native() {
@@ -194,19 +198,19 @@ impl CaptureSession {
             output.setVideoSettings(Some(&dict));
         }
 
-        // 设置丢帧策略
+        // Configure late-frame dropping.
         unsafe {
             output.setAlwaysDiscardsLateVideoFrames(discard_late_frames);
         }
 
-        // 添加输出到会话
+        // Add the output to the session.
         let output_ref: &AVCaptureOutput = &output;
         let can_add_output = unsafe { session.canAddOutput(output_ref) };
         if can_add_output {
             unsafe { session.addOutput(output_ref) };
             log::debug!("Output added to session");
         } else {
-            return Err(CameraError::DeviceOpenFailed(
+            return Err(CameraError::device_open_failed(
                 "Cannot add output to session".into(),
             ));
         }
@@ -235,26 +239,26 @@ impl CaptureSession {
             }
         }
 
-        // 在输入输出都添加后，设置设备格式
-        // 这是正确的顺序，因为某些格式可能在添加输出后才能正确应用
+        // Set the device format after adding input and output because some
+        // formats can only be applied correctly at that point.
         log::debug!("Locking device for format configuration...");
         unsafe {
             device.lockForConfiguration().map_err(|e| {
-                CameraError::DeviceOpenFailed(format!("Failed to lock device: {:?}", e))
+                CameraError::device_open_failed(format!("Failed to lock device: {:?}", e))
             })?;
         }
         let configuration_lock = DeviceConfigurationLock(device.clone());
         log::debug!("Device locked");
 
-        // 设置格式
+        // Apply the format.
         log::debug!("Setting active format...");
         unsafe {
             device.setActiveFormat(&best_format);
         }
         log::debug!("Active format set");
 
-        // 设置帧率。不要手写 1/fps 的 CMTime，部分设备只接受
-        // AVFrameRateRange 暴露的精确 duration。
+        // Set the frame rate using the exact duration exposed by
+        // AVFrameRateRange; some devices reject a synthesized 1/fps CMTime.
         let selected_frame_duration = unsafe {
             let frame_rate_ranges = best_format.videoSupportedFrameRateRanges();
             let range_count = frame_rate_ranges.len();
@@ -280,7 +284,7 @@ impl CaptureSession {
                             CMTime {
                                 value: config.fps_denominator as i64,
                                 timescale: i32::try_from(config.fps).map_err(|_| {
-                                    CameraError::InvalidConfig(
+                                    CameraError::invalid_config(
                                         "Frame rate exceeds CMTime range".into(),
                                     )
                                 })?,
@@ -329,27 +333,27 @@ impl CaptureSession {
             config.height = size.height as u32;
             config.format =
                 super::device::fourcc_to_format(desc.media_sub_type()).ok_or_else(|| {
-                    CameraError::UnsupportedFormat("Selected AVFoundation subtype".into())
+                    CameraError::unsupported_format("Selected AVFoundation subtype".into())
                 })?;
             let duration = device.activeVideoMinFrameDuration();
             if duration.value > 0 {
                 config = config.with_frame_rate(crate::FrameRate::new(
                     duration.timescale as u32,
                     u32::try_from(duration.value).map_err(|_| {
-                        CameraError::InvalidFormat("CMTime duration overflow".into())
+                        CameraError::invalid_frame("CMTime duration overflow".into())
                     })?,
                 )?);
             }
         }
 
-        // 创建帧缓冲区
+        // Create the frame buffer.
         let delegate = CaptureDelegate::new(frame_buffer.clone());
 
-        // 创建回调队列
+        // Create the callback queue.
         let callback_queue =
             DispatchQueue::new("com.medivh.camera.callback", DispatchQueueAttr::SERIAL);
 
-        // 设置委托
+        // Install the delegate.
         unsafe {
             output.setSampleBufferDelegate_queue(
                 Some(ProtocolObject::from_ref(&*delegate)),
@@ -357,7 +361,7 @@ impl CaptureSession {
             );
         }
 
-        // 提交配置
+        // Commit session configuration.
         unsafe {
             session.commitConfiguration();
             log::debug!(
@@ -383,7 +387,7 @@ impl CaptureSession {
         })
     }
 
-    /// 启动捕获
+    /// Starts capture.
     pub fn start(&mut self) -> CameraResult<()> {
         catch_objc_result("AVFoundation start capture session", || {
             self.start_uncaught()
@@ -408,14 +412,14 @@ impl CaptureSession {
             self.config.height = size.height as u32;
             self.config.format = super::device::fourcc_to_format(desc.media_sub_type())
                 .ok_or_else(|| {
-                    CameraError::UnsupportedFormat("Native AVFoundation subtype".into())
+                    CameraError::unsupported_format("Native AVFoundation subtype".into())
                 })?;
             let duration = self.device.activeVideoMinFrameDuration();
             if duration.value > 0 {
                 self.config = self.config.clone().with_frame_rate(crate::FrameRate::new(
                     duration.timescale as u32,
                     u32::try_from(duration.value).map_err(|_| {
-                        CameraError::InvalidFormat("CMTime duration overflow".into())
+                        CameraError::invalid_frame("CMTime duration overflow".into())
                     })?,
                 )?);
             }
@@ -431,12 +435,12 @@ impl CaptureSession {
                 Ok(())
             } else {
                 self.frame_buffer.stop();
-                Err(CameraError::StreamError("Failed to start session".into()))
+                Err(CameraError::stream_error("Failed to start session".into()))
             }
         }
     }
 
-    /// 停止捕获
+    /// Stops capture.
     pub fn stop(&self) -> CameraResult<()> {
         catch_objc_result("AVFoundation stop capture session", || self.stop_uncaught())
     }
@@ -454,7 +458,7 @@ impl CaptureSession {
         Ok(())
     }
 
-    /// 检查是否正在运行
+    /// Returns whether capture is active.
     pub fn is_running(&self) -> bool {
         catch_objc("AVFoundation check capture session running", || unsafe {
             self.session.isRunning()
@@ -462,23 +466,23 @@ impl CaptureSession {
         .unwrap_or(false)
     }
 
-    /// 获取帧缓冲区
+    /// Returns the frame buffer.
     pub fn frame_buffer(&self) -> &Arc<FrameBuffer> {
         &self.frame_buffer
     }
 
-    /// 获取当前配置
+    /// Returns the current configuration.
     pub fn config(&self) -> &CameraConfig {
         &self.config
     }
 
-    /// 获取设备
+    /// Returns the capture device.
     pub fn device(&self) -> &AVCaptureDevice {
         &self.device
     }
 
     fn drop_uncaught(&mut self) {
-        // 停止会话
+        // Stop the session.
         self.frame_buffer.stop();
 
         unsafe {
@@ -491,7 +495,7 @@ impl CaptureSession {
             self.output.setSampleBufferDelegate_queue(None, None);
             self.callback_queue.exec_sync(|| {});
 
-            // 移除输入和输出
+            // Remove all inputs and outputs.
             self.session.removeInput(&self.input);
             let output_ref: &AVCaptureOutput = &self.output;
             self.session.removeOutput(output_ref);

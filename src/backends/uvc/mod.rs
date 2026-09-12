@@ -1,4 +1,4 @@
-//! UVC 摄像头后端实现
+//! UVC camera backend implementation.
 
 pub mod camera;
 pub mod context;

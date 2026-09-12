@@ -1,21 +1,21 @@
-//! Windows Media Foundation 摄像头后端
+//! Windows Media Foundation camera backend.
 //!
-//! 该模块提供 Windows 平台的原生摄像头支持。
+//! Provides native camera support on Windows.
 //!
-//! # 平台支持
+//! # Platform support
 //!
-//! - Windows Vista 及以上 (推荐 Windows 10+)
+//! - Windows Vista and newer (Windows 10 or newer recommended).
 //!
-//! # 功能特点
+//! # Features
 //!
-//! Media Foundation 后端相比 DirectShow/UVC 有以下优势：
+//! Compared with DirectShow/UVC, Media Foundation provides:
 //!
-//! - 现代 Windows 媒体 API
-//! - 更好的硬件加速支持
-//! - 支持 Windows Hello 相机
-//! - 与 Windows 相机权限集成 (Windows 10+)
+//! - A modern Windows media API.
+//! - Better hardware acceleration support.
+//! - Windows Hello camera support.
+//! - Windows camera permission integration on Windows 10 and newer.
 //!
-//! # 架构
+//! # Architecture
 //!
 //! ```text
 //! ┌─────────────────────────────────────────────────────────────┐
@@ -44,7 +44,25 @@ mod device;
 
 #[cfg(all(target_os = "windows", any(feature = "native", feature = "backend-mf")))]
 pub use camera::MFCamera;
-// 非 Windows 平台的占位实现
+
+#[cfg(all(target_os = "windows", any(feature = "native", feature = "backend-mf")))]
+fn native_error(
+    kind: crate::CameraErrorKind,
+    stage: crate::OperationStage,
+    operation: &'static str,
+    error: windows::core::Error,
+) -> crate::CameraError {
+    crate::CameraError::native(
+        kind,
+        crate::BackendId::MEDIA_FOUNDATION,
+        stage,
+        operation.into(),
+        i64::from(error.code().0),
+        error.to_string(),
+    )
+    .with_source(error)
+}
+// Stub implementation for non-Windows platforms.
 #[cfg(not(all(target_os = "windows", any(feature = "native", feature = "backend-mf"))))]
 mod camera_stub;
 #[cfg(not(all(target_os = "windows", any(feature = "native", feature = "backend-mf"))))]

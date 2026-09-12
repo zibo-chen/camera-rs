@@ -1,8 +1,7 @@
-//! 高性能颜色空间转换模块
+//! High-performance color-space conversion.
 //!
-//! 提供 YUYV/UYVY 到 RGB 的高效转换，支持：
-//! - 标量实现（fallback）
-//! - SIMD 优化实现（使用 portable_simd 或平台特定 intrinsics）
+//! Provides efficient YUYV/UYVY-to-RGB conversion with scalar fallbacks and
+//! SIMD implementations using platform-specific intrinsics.
 //!
 //! ARM64 uses checked NEON conversion with scalar-equivalent rounding. x86_64
 //! runtime-dispatches packed 4:2:2, planar YUV420 and NV12/NV21 full/half-size
@@ -50,7 +49,7 @@ impl YuvPlane<'_> {
             || row_bytes.is_none_or(|n| self.row_stride < n)
             || required.is_none_or(|n| self.data.len() < n)
         {
-            return Err(CameraError::InvalidFormat(
+            return Err(CameraError::invalid_frame(
                 "Invalid YUV plane stride or truncated data".into(),
             ));
         }
@@ -68,7 +67,7 @@ pub(crate) fn color_coefficients(color: ColorInfo) -> Result<[i32; 6]> {
         ColorMatrix::Bt2020 => (0.2627, 0.0593),
         ColorMatrix::Smpte240M => (0.212, 0.087),
         ColorMatrix::Unknown => {
-            return Err(CameraError::UnsupportedFormat(
+            return Err(CameraError::unsupported_format(
                 "YUV color matrix is unknown; supply a color override".into(),
             ));
         }
@@ -77,7 +76,7 @@ pub(crate) fn color_coefficients(color: ColorInfo) -> Result<[i32; 6]> {
         ColorRange::Full => (1.0, 1.0, 0),
         ColorRange::Limited => (255.0 / 219.0, 255.0 / 224.0, 16),
         ColorRange::Unknown => {
-            return Err(CameraError::UnsupportedFormat(
+            return Err(CameraError::unsupported_format(
                 "YUV quantization range is unknown; supply a color override".into(),
             ));
         }
@@ -124,9 +123,9 @@ pub(crate) fn yuv420_to_rgb_with_coefficients_into(
     let length = width
         .checked_mul(height)
         .and_then(|pixels| pixels.checked_mul(3))
-        .ok_or_else(|| CameraError::InvalidFormat("RGB size overflow".into()))?;
+        .ok_or_else(|| CameraError::invalid_frame("RGB size overflow".into()))?;
     if rgb.len() < length {
-        return Err(CameraError::InvalidFormat("RGB buffer too short".into()));
+        return Err(CameraError::invalid_frame("RGB buffer too short".into()));
     }
     #[cfg(any(
         all(target_arch = "aarch64", target_feature = "neon"),
@@ -382,18 +381,18 @@ pub(crate) fn yuv420sp_to_rgb_with_coefficients_into(
     let chroma_row_bytes = width
         .div_ceil(2)
         .checked_mul(2)
-        .ok_or_else(|| CameraError::InvalidFormat("YUV420 size overflow".into()))?;
+        .ok_or_else(|| CameraError::invalid_frame("YUV420 size overflow".into()))?;
     let chroma_rows = height.div_ceil(2);
     let required_uv = (chroma_rows - 1)
         .checked_mul(uv_stride)
         .and_then(|bytes| bytes.checked_add(chroma_row_bytes))
-        .ok_or_else(|| CameraError::InvalidFormat("YUV420 size overflow".into()))?;
+        .ok_or_else(|| CameraError::invalid_frame("YUV420 size overflow".into()))?;
     let required_rgb = width
         .checked_mul(height)
         .and_then(|pixels| pixels.checked_mul(3))
-        .ok_or_else(|| CameraError::InvalidFormat("RGB size overflow".into()))?;
+        .ok_or_else(|| CameraError::invalid_frame("RGB size overflow".into()))?;
     if uv_stride < chroma_row_bytes || uv_plane.len() < required_uv || rgb.len() < required_rgb {
-        return Err(CameraError::InvalidFormat(
+        return Err(CameraError::invalid_frame(
             "invalid YUV420 UV stride or buffer size".into(),
         ));
     }
@@ -607,7 +606,7 @@ pub(crate) fn yuv420sp_to_rgb_half_with_coefficients_into(
     rgb: &mut [u8],
 ) -> Result<()> {
     if width == 0 || height == 0 || !width.is_multiple_of(2) || !height.is_multiple_of(2) {
-        return Err(CameraError::InvalidFormat(
+        return Err(CameraError::invalid_frame(
             "half-size YUV420 conversion requires positive even dimensions".into(),
         ));
     }
@@ -621,15 +620,15 @@ pub(crate) fn yuv420sp_to_rgb_half_with_coefficients_into(
     let required_uv = (chroma_rows - 1)
         .checked_mul(planes.uv_stride)
         .and_then(|bytes| bytes.checked_add(width))
-        .ok_or_else(|| CameraError::InvalidFormat("YUV420 size overflow".into()))?;
+        .ok_or_else(|| CameraError::invalid_frame("YUV420 size overflow".into()))?;
     let output_width = width / 2;
     let output_height = height / 2;
     let required_rgb = output_width
         .checked_mul(output_height)
         .and_then(|pixels| pixels.checked_mul(3))
-        .ok_or_else(|| CameraError::InvalidFormat("RGB size overflow".into()))?;
+        .ok_or_else(|| CameraError::invalid_frame("RGB size overflow".into()))?;
     if planes.uv_stride < width || planes.uv.len() < required_uv || rgb.len() < required_rgb {
-        return Err(CameraError::InvalidFormat(
+        return Err(CameraError::invalid_frame(
             "invalid YUV420 UV stride or half-size RGB buffer".into(),
         ));
     }
@@ -716,7 +715,7 @@ pub(crate) fn yuv420_to_rgb_half_with_coefficients_into(
     rgb: &mut [u8],
 ) -> Result<()> {
     if width == 0 || height == 0 || !width.is_multiple_of(2) || !height.is_multiple_of(2) {
-        return Err(CameraError::InvalidFormat(
+        return Err(CameraError::invalid_frame(
             "half-size YUV420 conversion requires positive even dimensions".into(),
         ));
     }
@@ -724,7 +723,7 @@ pub(crate) fn yuv420_to_rgb_half_with_coefficients_into(
     u.validate(width / 2, height / 2)?;
     v.validate(width / 2, height / 2)?;
     if y.pixel_stride != 1 || u.pixel_stride != 1 || v.pixel_stride != 1 {
-        return Err(CameraError::InvalidFormat(
+        return Err(CameraError::invalid_frame(
             "direct half-size planar YUV requires contiguous pixels".into(),
         ));
     }
@@ -733,9 +732,9 @@ pub(crate) fn yuv420_to_rgb_half_with_coefficients_into(
     let required_rgb = output_width
         .checked_mul(output_height)
         .and_then(|pixels| pixels.checked_mul(3))
-        .ok_or_else(|| CameraError::InvalidFormat("RGB size overflow".into()))?;
+        .ok_or_else(|| CameraError::invalid_frame("RGB size overflow".into()))?;
     if rgb.len() < required_rgb {
-        return Err(CameraError::InvalidFormat(
+        return Err(CameraError::invalid_frame(
             "half-size RGB buffer is too small".into(),
         ));
     }
@@ -797,31 +796,31 @@ pub(crate) fn yuv422_to_rgb_half_with_coefficients_into(
 ) -> Result<()> {
     let source_row_bytes = width
         .checked_mul(2)
-        .ok_or_else(|| CameraError::InvalidFormat("YUV422 size overflow".into()))?;
+        .ok_or_else(|| CameraError::invalid_frame("YUV422 size overflow".into()))?;
     let output_width = width / 2;
     let output_height = height / 2;
     let rgb_row_bytes = output_width
         .checked_mul(3)
-        .ok_or_else(|| CameraError::InvalidFormat("RGB size overflow".into()))?;
+        .ok_or_else(|| CameraError::invalid_frame("RGB size overflow".into()))?;
     if width == 0
         || height == 0
         || !width.is_multiple_of(2)
         || !height.is_multiple_of(2)
         || stride < source_row_bytes
     {
-        return Err(CameraError::InvalidFormat(
+        return Err(CameraError::invalid_frame(
             "invalid half-size YUV422 dimensions or stride".into(),
         ));
     }
     let required_source = (height - 1)
         .checked_mul(stride)
         .and_then(|bytes| bytes.checked_add(source_row_bytes))
-        .ok_or_else(|| CameraError::InvalidFormat("YUV422 size overflow".into()))?;
+        .ok_or_else(|| CameraError::invalid_frame("YUV422 size overflow".into()))?;
     let required_rgb = output_height
         .checked_mul(rgb_row_bytes)
-        .ok_or_else(|| CameraError::InvalidFormat("RGB size overflow".into()))?;
+        .ok_or_else(|| CameraError::invalid_frame("RGB size overflow".into()))?;
     if source.len() < required_source || rgb.len() < required_rgb {
-        return Err(CameraError::InvalidFormat(
+        return Err(CameraError::invalid_frame(
             "YUV422 or half-size RGB buffer is too small".into(),
         ));
     }
@@ -901,24 +900,24 @@ pub(crate) fn yuv422_to_rgb_with_coefficients_into(
 ) -> Result<()> {
     let source_row_bytes = width
         .checked_mul(2)
-        .ok_or_else(|| CameraError::InvalidFormat("YUV422 size overflow".into()))?;
+        .ok_or_else(|| CameraError::invalid_frame("YUV422 size overflow".into()))?;
     let rgb_row_bytes = width
         .checked_mul(3)
-        .ok_or_else(|| CameraError::InvalidFormat("RGB size overflow".into()))?;
+        .ok_or_else(|| CameraError::invalid_frame("RGB size overflow".into()))?;
     if width == 0 || height == 0 || !width.is_multiple_of(2) || stride < source_row_bytes {
-        return Err(CameraError::InvalidFormat(
+        return Err(CameraError::invalid_frame(
             "invalid YUV422 dimensions or stride".into(),
         ));
     }
     let required_source = (height - 1)
         .checked_mul(stride)
         .and_then(|bytes| bytes.checked_add(source_row_bytes))
-        .ok_or_else(|| CameraError::InvalidFormat("YUV422 size overflow".into()))?;
+        .ok_or_else(|| CameraError::invalid_frame("YUV422 size overflow".into()))?;
     let required_rgb = height
         .checked_mul(rgb_row_bytes)
-        .ok_or_else(|| CameraError::InvalidFormat("RGB size overflow".into()))?;
+        .ok_or_else(|| CameraError::invalid_frame("RGB size overflow".into()))?;
     if source.len() < required_source || rgb.len() < required_rgb {
-        return Err(CameraError::InvalidFormat(
+        return Err(CameraError::invalid_frame(
             "YUV422 or RGB buffer is too small".into(),
         ));
     }
@@ -998,18 +997,18 @@ pub fn yuv420_to_rgb_into(
 }
 
 // ============================================================================
-// 常量定义
+// Constants.
 // ============================================================================
 
-/// YUV 到 RGB 转换系数（BT.601 标准）
-/// 使用定点数运算，精度为 8 位小数
+/// BT.601 YUV-to-RGB conversion coefficients.
+/// Uses fixed-point arithmetic with eight fractional bits.
 mod yuv_coefficients {
-    // 原始公式：
+    // Source formula:
     // R = Y + 1.402 * (V - 128)
     // G = Y - 0.344136 * (U - 128) - 0.714136 * (V - 128)
     // B = Y + 1.772 * (U - 128)
     //
-    // 转换为定点数（乘以 256）：
+    // Fixed-point representation scaled by 256:
     pub const V_TO_R: i32 = 359; // 1.402 * 256 ≈ 359
     pub const U_TO_G: i32 = 88; // 0.344136 * 256 ≈ 88
     pub const V_TO_G: i32 = 183; // 0.714136 * 256 ≈ 183
@@ -1017,13 +1016,13 @@ mod yuv_coefficients {
 }
 
 // ============================================================================
-// 颜色转换器配置
+// Color converter configuration.
 // ============================================================================
 
-/// 颜色转换选项
+/// Color conversion options.
 #[derive(Debug, Clone, Copy)]
 pub struct ColorConvertOptions {
-    /// 是否使用 SIMD 加速（如果可用）
+    /// Enables SIMD acceleration when available.
     pub use_simd: bool,
 }
 
@@ -1033,7 +1032,7 @@ impl Default for ColorConvertOptions {
     }
 }
 
-/// 颜色转换器
+/// Color converter.
 #[derive(Debug, Clone)]
 pub struct ColorConverter {
     options: ColorConvertOptions,
@@ -1046,21 +1045,21 @@ impl Default for ColorConverter {
 }
 
 impl ColorConverter {
-    /// 创建默认配置的转换器
+    /// Creates a converter with default options.
     pub fn new() -> Self {
         Self {
             options: ColorConvertOptions::default(),
         }
     }
 
-    /// 使用自定义选项创建转换器
+    /// Creates a converter with custom options.
     pub fn with_options(options: ColorConvertOptions) -> Self {
         Self { options }
     }
 
-    /// YUYV 转 RGB
+    /// Converts YUYV to RGB.
     ///
-    /// YUYV 格式（也称为 YUY2）：每 4 字节表示 2 个像素
+    /// YUYV, also known as YUY2, stores two pixels in every four bytes.
     /// [Y0, U, Y1, V] -> [R0, G0, B0], [R1, G1, B1]
     pub fn yuyv_to_rgb(&self, yuyv_data: &[u8], width: u32, height: u32) -> Result<Vec<u8>> {
         let pixel_count = checked_packed_422_pixel_count(width, height, "YUYV")?;
@@ -1068,7 +1067,7 @@ impl ColorConverter {
         let expected_rgb_size = checked_frame_size(pixel_count, 3, "RGB")?;
 
         if yuyv_data.len() < expected_yuyv_size {
-            return Err(CameraError::InvalidFormat(format!(
+            return Err(CameraError::invalid_frame(format!(
                 "YUYV data size mismatch: expected {}, got {}",
                 expected_yuyv_size,
                 yuyv_data.len()
@@ -1085,9 +1084,9 @@ impl ColorConverter {
         Ok(rgb)
     }
 
-    /// UYVY 转 RGB
+    /// Converts UYVY to RGB.
     ///
-    /// UYVY 格式：每 4 字节表示 2 个像素
+    /// UYVY stores two pixels in every four bytes.
     /// [U, Y0, V, Y1] -> [R0, G0, B0], [R1, G1, B1]
     pub fn uyvy_to_rgb(&self, uyvy_data: &[u8], width: u32, height: u32) -> Result<Vec<u8>> {
         let pixel_count = checked_packed_422_pixel_count(width, height, "UYVY")?;
@@ -1095,7 +1094,7 @@ impl ColorConverter {
         let expected_rgb_size = checked_frame_size(pixel_count, 3, "RGB")?;
 
         if uyvy_data.len() < expected_uyvy_size {
-            return Err(CameraError::InvalidFormat(format!(
+            return Err(CameraError::invalid_frame(format!(
                 "UYVY data size mismatch: expected {}, got {}",
                 expected_uyvy_size,
                 uyvy_data.len()
@@ -1112,9 +1111,9 @@ impl ColorConverter {
         Ok(rgb)
     }
 
-    /// YUYV 转 RGB（使用预分配缓冲区）
+    /// Converts YUYV to RGB in a caller-provided buffer.
     ///
-    /// 这个方法避免了内存分配，适合高性能场景
+    /// Avoids allocation in performance-sensitive paths.
     pub fn yuyv_to_rgb_into(
         &self,
         yuyv_data: &[u8],
@@ -1127,7 +1126,7 @@ impl ColorConverter {
         let expected_rgb_size = checked_frame_size(pixel_count, 3, "RGB")?;
 
         if yuyv_data.len() < expected_yuyv_size {
-            return Err(CameraError::InvalidFormat(format!(
+            return Err(CameraError::invalid_frame(format!(
                 "YUYV data size mismatch: expected {}, got {}",
                 expected_yuyv_size,
                 yuyv_data.len()
@@ -1135,7 +1134,7 @@ impl ColorConverter {
         }
 
         if rgb_buffer.len() < expected_rgb_size {
-            return Err(CameraError::InvalidFormat(format!(
+            return Err(CameraError::invalid_frame(format!(
                 "RGB buffer too small: expected {}, got {}",
                 expected_rgb_size,
                 rgb_buffer.len()
@@ -1151,7 +1150,7 @@ impl ColorConverter {
         }
     }
 
-    /// UYVY 转 RGB（使用预分配缓冲区）
+    /// Converts UYVY to RGB in a caller-provided buffer.
     pub fn uyvy_to_rgb_into(
         &self,
         uyvy_data: &[u8],
@@ -1164,7 +1163,7 @@ impl ColorConverter {
         let expected_rgb_size = checked_frame_size(pixel_count, 3, "RGB")?;
 
         if uyvy_data.len() < expected_uyvy_size {
-            return Err(CameraError::InvalidFormat(format!(
+            return Err(CameraError::invalid_frame(format!(
                 "UYVY data size mismatch: expected {}, got {}",
                 expected_uyvy_size,
                 uyvy_data.len()
@@ -1172,7 +1171,7 @@ impl ColorConverter {
         }
 
         if rgb_buffer.len() < expected_rgb_size {
-            return Err(CameraError::InvalidFormat(format!(
+            return Err(CameraError::invalid_frame(format!(
                 "RGB buffer too small: expected {}, got {}",
                 expected_rgb_size,
                 rgb_buffer.len()
@@ -1190,10 +1189,10 @@ impl ColorConverter {
 }
 
 // ============================================================================
-// 标量实现（Fallback）
+// Scalar fallback implementation.
 // ============================================================================
 
-/// 标量 YUYV 转 RGB
+/// Scalar YUYV-to-RGB conversion.
 #[cfg(test)]
 fn yuyv_to_rgb_scalar(yuyv_data: &[u8], width: u32, height: u32) -> Result<Vec<u8>> {
     let pixel_count = checked_packed_422_pixel_count(width, height, "YUYV")?;
@@ -1203,7 +1202,7 @@ fn yuyv_to_rgb_scalar(yuyv_data: &[u8], width: u32, height: u32) -> Result<Vec<u
     Ok(rgb)
 }
 
-/// 标量 YUYV 转 RGB（使用预分配缓冲区）
+/// Scalar YUYV-to-RGB conversion into a preallocated buffer.
 fn yuyv_to_rgb_scalar_into(yuyv_data: &[u8], rgb_buffer: &mut [u8]) -> Result<()> {
     use yuv_coefficients::*;
 
@@ -1216,17 +1215,17 @@ fn yuyv_to_rgb_scalar_into(yuyv_data: &[u8], rgb_buffer: &mut [u8]) -> Result<()
         let y1 = yuyv_data[yuyv_idx + 2] as i32;
         let v = yuyv_data[yuyv_idx + 3] as i32 - 128;
 
-        // 预计算共享的 UV 分量
+        // Precompute the shared chroma components.
         let v_r = (V_TO_R * v) >> 8;
         let uv_g = (U_TO_G * u + V_TO_G * v) >> 8;
         let u_b = (U_TO_B * u) >> 8;
 
-        // 第一个像素
+        // First pixel.
         rgb_buffer[rgb_idx] = (y0 + v_r).clamp(0, 255) as u8;
         rgb_buffer[rgb_idx + 1] = (y0 - uv_g).clamp(0, 255) as u8;
         rgb_buffer[rgb_idx + 2] = (y0 + u_b).clamp(0, 255) as u8;
 
-        // 第二个像素
+        // Second pixel.
         rgb_buffer[rgb_idx + 3] = (y1 + v_r).clamp(0, 255) as u8;
         rgb_buffer[rgb_idx + 4] = (y1 - uv_g).clamp(0, 255) as u8;
         rgb_buffer[rgb_idx + 5] = (y1 + u_b).clamp(0, 255) as u8;
@@ -1238,7 +1237,7 @@ fn yuyv_to_rgb_scalar_into(yuyv_data: &[u8], rgb_buffer: &mut [u8]) -> Result<()
     Ok(())
 }
 
-/// 标量 UYVY 转 RGB（使用预分配缓冲区）
+/// Scalar UYVY-to-RGB conversion into a preallocated buffer.
 fn uyvy_to_rgb_scalar_into(uyvy_data: &[u8], rgb_buffer: &mut [u8]) -> Result<()> {
     use yuv_coefficients::*;
 
@@ -1251,17 +1250,17 @@ fn uyvy_to_rgb_scalar_into(uyvy_data: &[u8], rgb_buffer: &mut [u8]) -> Result<()
         let v = uyvy_data[uyvy_idx + 2] as i32 - 128;
         let y1 = uyvy_data[uyvy_idx + 3] as i32;
 
-        // 预计算共享的 UV 分量
+        // Precompute the shared chroma components.
         let v_r = (V_TO_R * v) >> 8;
         let uv_g = (U_TO_G * u + V_TO_G * v) >> 8;
         let u_b = (U_TO_B * u) >> 8;
 
-        // 第一个像素
+        // First pixel.
         rgb_buffer[rgb_idx] = (y0 + v_r).clamp(0, 255) as u8;
         rgb_buffer[rgb_idx + 1] = (y0 - uv_g).clamp(0, 255) as u8;
         rgb_buffer[rgb_idx + 2] = (y0 + u_b).clamp(0, 255) as u8;
 
-        // 第二个像素
+        // Second pixel.
         rgb_buffer[rgb_idx + 3] = (y1 + v_r).clamp(0, 255) as u8;
         rgb_buffer[rgb_idx + 4] = (y1 - uv_g).clamp(0, 255) as u8;
         rgb_buffer[rgb_idx + 5] = (y1 + u_b).clamp(0, 255) as u8;
@@ -1274,17 +1273,17 @@ fn uyvy_to_rgb_scalar_into(uyvy_data: &[u8], rgb_buffer: &mut [u8]) -> Result<()
 }
 
 // ============================================================================
-// SIMD 优化实现
+// SIMD implementations.
 // ============================================================================
 
-// 根据目标架构选择最优实现：
-// - ARM64 (aarch64): 使用 NEON intrinsics
-// - x86_64: 运行时检测 AVX2，未支持路径回退到通用实现
-// - 其他: 使用标量实现
+// Select the best implementation for the target architecture:
+// - ARM64 (aarch64): NEON intrinsics.
+// - x86_64: Runtime AVX2 detection with a portable fallback.
+// - Other targets: Scalar implementation.
 
-/// SIMD 优化的 YUYV 转 RGB
+/// SIMD-optimized YUYV-to-RGB conversion.
 ///
-/// 使用批量处理和循环展开来帮助编译器自动向量化
+/// Uses batching and loop unrolling to help compiler auto-vectorization.
 #[cfg(test)]
 fn yuyv_to_rgb_simd(yuyv_data: &[u8], width: u32, height: u32) -> Result<Vec<u8>> {
     let pixel_count = checked_packed_422_pixel_count(width, height, "YUYV")?;
@@ -2447,7 +2446,7 @@ mod x86 {
 }
 
 fn yuyv_to_rgb_simd_into(yuyv_data: &[u8], rgb_buffer: &mut [u8]) -> Result<()> {
-    // ARM64 NEON 优化路径
+    // ARM64 NEON path.
     #[cfg(any(
         all(target_arch = "aarch64", target_feature = "neon"),
         all(target_arch = "arm", target_feature = "neon")
@@ -2471,7 +2470,7 @@ fn yuyv_to_rgb_simd_into(yuyv_data: &[u8], rgb_buffer: &mut [u8]) -> Result<()> 
         return Ok(());
     }
 
-    // 通用 SIMD 优化路径（循环展开 + 编译器自动向量化）
+    // Portable optimized path using unrolling and compiler auto-vectorization.
     #[cfg(not(any(
         all(target_arch = "aarch64", target_feature = "neon"),
         all(target_arch = "arm", target_feature = "neon")
@@ -2481,7 +2480,7 @@ fn yuyv_to_rgb_simd_into(yuyv_data: &[u8], rgb_buffer: &mut [u8]) -> Result<()> 
     }
 }
 
-/// 通用 SIMD 优化实现（使用循环展开帮助编译器自动向量化）
+/// Portable optimized implementation using unrolling for auto-vectorization.
 #[cfg(not(any(
     all(target_arch = "aarch64", target_feature = "neon"),
     all(target_arch = "arm", target_feature = "neon")
@@ -2493,22 +2492,22 @@ fn yuyv_to_rgb_simd_generic(yuyv_data: &[u8], rgb_buffer: &mut [u8]) -> Result<(
     let yuyv_len = yuyv_data.len();
     let rgb_len = rgb_buffer.len();
 
-    // 计算可以批量处理的部分（8 像素 = 16 字节 YUYV = 24 字节 RGB）
-    let batch_size = 16; // 8 像素对应 16 字节 YUYV
-    let rgb_batch_size = 24; // 8 像素对应 24 字节 RGB
+    // Process eight pixels per batch: 16 YUYV bytes become 24 RGB bytes.
+    let batch_size = 16; // Eight pixels in YUYV.
+    let rgb_batch_size = 24; // Eight pixels in RGB.
     let num_batches = yuyv_len / batch_size;
 
     let mut yuyv_idx = 0;
     let mut rgb_idx = 0;
 
-    // 批量处理主循环
+    // Main batched loop.
     for _ in 0..num_batches {
         if rgb_idx + rgb_batch_size > rgb_len {
             break;
         }
 
-        // 展开处理 4 对像素（8 像素总计）
-        // 每对像素：4 字节 YUYV -> 6 字节 RGB
+        // Unroll four pixel pairs, for eight pixels total.
+        // Each pair converts four YUYV bytes into six RGB bytes.
         macro_rules! process_pair {
             ($yuyv_off:expr, $rgb_off:expr) => {
                 let y0 = yuyv_data[yuyv_idx + $yuyv_off] as i32;
@@ -2538,7 +2537,7 @@ fn yuyv_to_rgb_simd_generic(yuyv_data: &[u8], rgb_buffer: &mut [u8]) -> Result<(
         rgb_idx += rgb_batch_size;
     }
 
-    // 处理剩余数据
+    // Process the remaining data.
     while yuyv_idx + 3 < yuyv_len && rgb_idx + 5 < rgb_len {
         let y0 = yuyv_data[yuyv_idx] as i32;
         let u = yuyv_data[yuyv_idx + 1] as i32 - 128;
@@ -2565,20 +2564,20 @@ fn yuyv_to_rgb_simd_generic(yuyv_data: &[u8], rgb_buffer: &mut [u8]) -> Result<(
 
 fn checked_pixel_count(width: u32, height: u32) -> Result<usize> {
     if width == 0 || height == 0 {
-        return Err(CameraError::InvalidFormat(format!(
+        return Err(CameraError::invalid_frame(format!(
             "Frame dimensions must be non-zero: {}x{}",
             width, height
         )));
     }
 
     let width = usize::try_from(width)
-        .map_err(|_| CameraError::InvalidFormat(format!("Frame width is too large: {}", width)))?;
+        .map_err(|_| CameraError::invalid_frame(format!("Frame width is too large: {}", width)))?;
     let height = usize::try_from(height).map_err(|_| {
-        CameraError::InvalidFormat(format!("Frame height is too large: {}", height))
+        CameraError::invalid_frame(format!("Frame height is too large: {}", height))
     })?;
 
     width.checked_mul(height).ok_or_else(|| {
-        CameraError::InvalidFormat(format!(
+        CameraError::invalid_frame(format!(
             "Frame dimensions are too large: {}x{}",
             width, height
         ))
@@ -2587,7 +2586,7 @@ fn checked_pixel_count(width: u32, height: u32) -> Result<usize> {
 
 fn checked_packed_422_pixel_count(width: u32, height: u32, format: &str) -> Result<usize> {
     if !width.is_multiple_of(2) {
-        return Err(CameraError::InvalidFormat(format!(
+        return Err(CameraError::invalid_frame(format!(
             "{} frame width must be even for packed 4:2:2 data: {}",
             format, width
         )));
@@ -2598,14 +2597,14 @@ fn checked_packed_422_pixel_count(width: u32, height: u32, format: &str) -> Resu
 
 fn checked_frame_size(pixel_count: usize, bytes_per_pixel: usize, format: &str) -> Result<usize> {
     pixel_count.checked_mul(bytes_per_pixel).ok_or_else(|| {
-        CameraError::InvalidFormat(format!(
+        CameraError::invalid_frame(format!(
             "{} frame size is too large: {} pixels * {} bytes",
             format, pixel_count, bytes_per_pixel
         ))
     })
 }
 
-/// SIMD 优化的 UYVY 转 RGB（使用预分配缓冲区）
+/// SIMD-optimized UYVY-to-RGB conversion into a preallocated buffer.
 #[inline(always)]
 fn uyvy_to_rgb_simd_into(uyvy_data: &[u8], rgb_buffer: &mut [u8]) -> Result<()> {
     #[cfg(any(
@@ -2686,7 +2685,7 @@ fn uyvy_to_rgb_simd_generic(uyvy_data: &[u8], rgb_buffer: &mut [u8]) -> Result<(
         rgb_idx += rgb_batch_size;
     }
 
-    // 处理剩余数据
+    // Process the remaining data.
     while uyvy_idx + 3 < uyvy_len && rgb_idx + 5 < rgb_len {
         let u = uyvy_data[uyvy_idx] as i32 - 128;
         let y0 = uyvy_data[uyvy_idx + 1] as i32;
@@ -2720,12 +2719,12 @@ fn packed_8888_to_rgb_into<const R: usize, const G: usize, const B: usize>(
 ) -> Result<()> {
     let packed_row_bytes = width
         .checked_mul(4)
-        .ok_or_else(|| CameraError::InvalidFormat("packed 8888 size overflow".to_string()))?;
+        .ok_or_else(|| CameraError::invalid_frame("packed 8888 size overflow".to_string()))?;
     let rgb_row_bytes = width
         .checked_mul(3)
-        .ok_or_else(|| CameraError::InvalidFormat("RGB size overflow".to_string()))?;
+        .ok_or_else(|| CameraError::invalid_frame("RGB size overflow".to_string()))?;
     if width == 0 || height == 0 || packed_stride < packed_row_bytes {
-        return Err(CameraError::InvalidFormat(
+        return Err(CameraError::invalid_frame(
             "invalid packed 8888 dimensions or stride".to_string(),
         ));
     }
@@ -2733,12 +2732,12 @@ fn packed_8888_to_rgb_into<const R: usize, const G: usize, const B: usize>(
     let required_packed = (height - 1)
         .checked_mul(packed_stride)
         .and_then(|size| size.checked_add(packed_row_bytes))
-        .ok_or_else(|| CameraError::InvalidFormat("packed 8888 size overflow".to_string()))?;
+        .ok_or_else(|| CameraError::invalid_frame("packed 8888 size overflow".to_string()))?;
     let required_rgb = height
         .checked_mul(rgb_row_bytes)
-        .ok_or_else(|| CameraError::InvalidFormat("RGB size overflow".to_string()))?;
+        .ok_or_else(|| CameraError::invalid_frame("RGB size overflow".to_string()))?;
     if packed.len() < required_packed || rgb.len() < required_rgb {
-        return Err(CameraError::InvalidFormat(
+        return Err(CameraError::invalid_frame(
             "packed 8888 or RGB buffer is too small".to_string(),
         ));
     }
@@ -2781,7 +2780,7 @@ fn packed_8888_to_rgb_into<const R: usize, const G: usize, const B: usize>(
     Ok(())
 }
 
-/// 将带行跨度的 RGBA8888 缓冲区压缩成紧凑 RGB。
+/// Packs a strided RGBA8888 buffer into tightly packed RGB.
 pub fn rgba8888_to_rgb_into(
     rgba: &[u8],
     width: usize,
@@ -2792,7 +2791,7 @@ pub fn rgba8888_to_rgb_into(
     packed_8888_to_rgb_into::<0, 1, 2>(rgba, width, height, rgba_stride, rgb)
 }
 
-/// 将带行跨度的 BGRA8888 缓冲区压缩成紧凑 RGB。
+/// Packs a strided BGRA8888 buffer into tightly packed RGB.
 pub fn bgra8888_to_rgb_into(
     bgra: &[u8],
     width: usize,
@@ -2803,7 +2802,7 @@ pub fn bgra8888_to_rgb_into(
     packed_8888_to_rgb_into::<2, 1, 0>(bgra, width, height, bgra_stride, rgb)
 }
 
-/// 将带行跨度的 ARGB8888 缓冲区压缩成紧凑 RGB。
+/// Packs a strided ARGB8888 buffer into tightly packed RGB.
 pub fn argb8888_to_rgb_into(
     argb: &[u8],
     width: usize,
@@ -2814,9 +2813,9 @@ pub fn argb8888_to_rgb_into(
     packed_8888_to_rgb_into::<1, 2, 3>(argb, width, height, argb_stride, rgb)
 }
 
-/// 将双平面 YUV420SP（UV 交错）转换为紧凑 RGB。
+/// Converts bi-planar YUV420SP with interleaved UV into tightly packed RGB.
 ///
-/// 每个 UV 对服务同一行中的两个像素，避免逐像素重复读取色度和执行除法。
+/// Each UV pair serves two pixels in a row, avoiding duplicate chroma loads and division.
 #[cfg(not(any(
     all(target_arch = "aarch64", target_feature = "neon"),
     all(target_arch = "arm", target_feature = "neon")
@@ -2831,7 +2830,7 @@ fn yuv420sp_bt601_full_to_rgb_into(
     rgb: &mut [u8],
 ) -> Result<()> {
     if width == 0 || height == 0 || y_stride < width {
-        return Err(CameraError::InvalidFormat(
+        return Err(CameraError::invalid_frame(
             "invalid YUV420 dimensions or Y stride".to_string(),
         ));
     }
@@ -2839,9 +2838,9 @@ fn yuv420sp_bt601_full_to_rgb_into(
     let chroma_row_bytes = width
         .div_ceil(2)
         .checked_mul(2)
-        .ok_or_else(|| CameraError::InvalidFormat("YUV420 size overflow".to_string()))?;
+        .ok_or_else(|| CameraError::invalid_frame("YUV420 size overflow".to_string()))?;
     if uv_stride < chroma_row_bytes {
-        return Err(CameraError::InvalidFormat(
+        return Err(CameraError::invalid_frame(
             "invalid YUV420 UV stride".to_string(),
         ));
     }
@@ -2849,19 +2848,19 @@ fn yuv420sp_bt601_full_to_rgb_into(
     let required_y = (height - 1)
         .checked_mul(y_stride)
         .and_then(|size| size.checked_add(width))
-        .ok_or_else(|| CameraError::InvalidFormat("YUV420 Y size overflow".to_string()))?;
+        .ok_or_else(|| CameraError::invalid_frame("YUV420 Y size overflow".to_string()))?;
     let chroma_rows = height.div_ceil(2);
     let required_uv = (chroma_rows - 1)
         .checked_mul(uv_stride)
         .and_then(|size| size.checked_add(chroma_row_bytes))
-        .ok_or_else(|| CameraError::InvalidFormat("YUV420 UV size overflow".to_string()))?;
+        .ok_or_else(|| CameraError::invalid_frame("YUV420 UV size overflow".to_string()))?;
     let required_rgb = width
         .checked_mul(height)
         .and_then(|pixels| pixels.checked_mul(3))
-        .ok_or_else(|| CameraError::InvalidFormat("RGB size overflow".to_string()))?;
+        .ok_or_else(|| CameraError::invalid_frame("RGB size overflow".to_string()))?;
 
     if y_plane.len() < required_y || uv_plane.len() < required_uv || rgb.len() < required_rgb {
-        return Err(CameraError::InvalidFormat(
+        return Err(CameraError::invalid_frame(
             "YUV420 or RGB buffer is too small".to_string(),
         ));
     }
@@ -2924,20 +2923,20 @@ pub fn yuv420sp_to_rgb_into(
 }
 
 // ============================================================================
-// 便捷函数
+// Convenience functions.
 // ============================================================================
 
-/// YUYV 转 RGB（使用默认配置）
+/// Converts YUYV to RGB with default options.
 pub fn yuyv_to_rgb(yuyv_data: &[u8], width: u32, height: u32) -> Result<Vec<u8>> {
     ColorConverter::new().yuyv_to_rgb(yuyv_data, width, height)
 }
 
-/// UYVY 转 RGB（使用默认配置）
+/// Converts UYVY to RGB with default options.
 pub fn uyvy_to_rgb(uyvy_data: &[u8], width: u32, height: u32) -> Result<Vec<u8>> {
     ColorConverter::new().uyvy_to_rgb(uyvy_data, width, height)
 }
 
-/// YUYV 转 RGB（使用预分配缓冲区）
+/// Converts YUYV to RGB in a preallocated buffer.
 pub fn yuyv_to_rgb_into(
     yuyv_data: &[u8],
     width: u32,
@@ -2947,7 +2946,7 @@ pub fn yuyv_to_rgb_into(
     ColorConverter::new().yuyv_to_rgb_into(yuyv_data, width, height, rgb_buffer)
 }
 
-/// UYVY 转 RGB（使用预分配缓冲区）
+/// Converts UYVY to RGB in a preallocated buffer.
 pub fn uyvy_to_rgb_into(
     uyvy_data: &[u8],
     width: u32,
@@ -2958,7 +2957,7 @@ pub fn uyvy_to_rgb_into(
 }
 
 // ============================================================================
-// 测试
+// Tests.
 // ============================================================================
 
 #[cfg(test)]
@@ -2967,15 +2966,15 @@ mod tests {
 
     #[test]
     fn test_yuyv_to_rgb_basic() {
-        // 创建一个简单的 YUYV 测试数据（2x2 像素，白色）
-        // 白色: Y=255, U=128, V=128
+        // Create a simple white 2x2 YUYV fixture.
+        // White: Y=255, U=128, V=128.
         let yuyv_data = vec![255, 128, 255, 128, 255, 128, 255, 128];
         let result = yuyv_to_rgb(&yuyv_data, 2, 2).unwrap();
 
-        // 验证结果是接近白色的
-        assert_eq!(result.len(), 12); // 4 像素 * 3 字节
+        // Verify that the result is close to white.
+        assert_eq!(result.len(), 12); // Four pixels, three bytes each.
         for chunk in result.chunks(3) {
-            // 允许一定的误差
+            // Allow a small conversion tolerance.
             assert!(chunk[0] >= 250, "R should be ~255, got {}", chunk[0]);
             assert!(chunk[1] >= 250, "G should be ~255, got {}", chunk[1]);
             assert!(chunk[2] >= 250, "B should be ~255, got {}", chunk[2]);
@@ -2984,7 +2983,7 @@ mod tests {
 
     #[test]
     fn test_yuyv_to_rgb_black() {
-        // 黑色: Y=0, U=128, V=128
+        // Black: Y=0, U=128, V=128.
         let yuyv_data = vec![0, 128, 0, 128, 0, 128, 0, 128];
         let result = yuyv_to_rgb(&yuyv_data, 2, 2).unwrap();
 
@@ -2998,7 +2997,7 @@ mod tests {
 
     #[test]
     fn test_uyvy_to_rgb_basic() {
-        // UYVY 格式的白色
+        // White in UYVY format.
         let uyvy_data = vec![128, 255, 128, 255, 128, 255, 128, 255];
         let result = uyvy_to_rgb(&uyvy_data, 2, 2).unwrap();
 
@@ -3017,7 +3016,7 @@ mod tests {
 
         yuyv_to_rgb_into(&yuyv_data, 2, 1, &mut rgb_buffer).unwrap();
 
-        // 验证缓冲区被正确填充
+        // Verify that the output buffer was populated.
         for chunk in rgb_buffer.chunks(3) {
             assert!(chunk[0] >= 250);
             assert!(chunk[1] >= 250);
@@ -3676,18 +3675,18 @@ mod tests {
 
     #[test]
     fn test_scalar_vs_simd_consistency() {
-        // 创建随机测试数据
+        // Create deterministic pseudo-random test data.
         let width = 64;
         let height = 48;
         let yuyv_data: Vec<u8> = (0..(width * height * 2)).map(|i| (i % 256) as u8).collect();
 
-        // 使用标量实现
+        // Run the scalar implementation.
         let scalar_result = yuyv_to_rgb_scalar(&yuyv_data, width, height).unwrap();
 
-        // 使用 SIMD 实现
+        // Run the SIMD implementation.
         let simd_result = yuyv_to_rgb_simd(&yuyv_data, width, height).unwrap();
 
-        // 验证结果一致
+        // Verify identical results.
         assert_eq!(scalar_result.len(), simd_result.len());
         for (i, (s, m)) in scalar_result.iter().zip(simd_result.iter()).enumerate() {
             assert_eq!(s, m, "Mismatch at index {}", i);
@@ -3984,7 +3983,7 @@ mod tests {
 
     #[test]
     fn test_invalid_input_size() {
-        let yuyv_data = vec![255, 128, 255]; // 太短
+        let yuyv_data = vec![255, 128, 255]; // Too short.
         let result = yuyv_to_rgb(&yuyv_data, 2, 2);
         assert!(result.is_err());
     }
@@ -3992,7 +3991,7 @@ mod tests {
     #[test]
     fn test_buffer_too_small() {
         let yuyv_data = vec![255, 128, 255, 128];
-        let mut rgb_buffer = vec![0u8; 3]; // 太小
+        let mut rgb_buffer = vec![0u8; 3]; // Too small.
 
         let result = yuyv_to_rgb_into(&yuyv_data, 2, 1, &mut rgb_buffer);
         assert!(result.is_err());
@@ -4002,11 +4001,15 @@ mod tests {
     fn rejects_dimensions_that_overflow_frame_size_calculation() {
         let converter = ColorConverter::with_options(ColorConvertOptions { use_simd: false });
         let result = converter.yuyv_to_rgb(&[], u32::MAX, u32::MAX);
-        assert!(matches!(result, Err(CameraError::InvalidFormat(_))));
+        assert!(
+            matches!(result, Err(ref error) if error.kind() == crate::CameraErrorKind::InvalidFrame)
+        );
 
         let mut rgb = [];
         let result = converter.uyvy_to_rgb_into(&[], u32::MAX, u32::MAX, &mut rgb);
-        assert!(matches!(result, Err(CameraError::InvalidFormat(_))));
+        assert!(
+            matches!(result, Err(ref error) if error.kind() == crate::CameraErrorKind::InvalidFrame)
+        );
     }
 
     #[test]
@@ -4014,11 +4017,15 @@ mod tests {
         let converter = ColorConverter::with_options(ColorConvertOptions { use_simd: false });
 
         let result = converter.yuyv_to_rgb(&[16, 128, 16, 128, 16, 128], 3, 1);
-        assert!(matches!(result, Err(CameraError::InvalidFormat(_))));
+        assert!(
+            matches!(result, Err(ref error) if error.kind() == crate::CameraErrorKind::InvalidFrame)
+        );
 
         let mut rgb = [0u8; 9];
         let result = converter.uyvy_to_rgb_into(&[128, 16, 128, 16, 128, 16], 3, 1, &mut rgb);
-        assert!(matches!(result, Err(CameraError::InvalidFormat(_))));
+        assert!(
+            matches!(result, Err(ref error) if error.kind() == crate::CameraErrorKind::InvalidFrame)
+        );
     }
 
     #[test]
@@ -4027,13 +4034,13 @@ mod tests {
 
         assert!(matches!(
             converter.yuyv_to_rgb(&[], 0, 2),
-            Err(CameraError::InvalidFormat(_))
+            Err(ref error) if error.kind() == crate::CameraErrorKind::InvalidFrame
         ));
 
         let mut rgb = [];
         assert!(matches!(
             converter.uyvy_to_rgb_into(&[], 2, 0, &mut rgb),
-            Err(CameraError::InvalidFormat(_))
+            Err(ref error) if error.kind() == crate::CameraErrorKind::InvalidFrame
         ));
     }
 }

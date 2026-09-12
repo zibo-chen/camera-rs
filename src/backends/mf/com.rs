@@ -37,7 +37,14 @@ impl MFGuard {
         // performed here, including a successful S_FALSE result.
         let owns_com = hr.is_ok();
         if hr.is_err() && hr != RPC_E_CHANGED_MODE {
-            return Err(CameraError::Other(format!("COM initialization: {hr:?}")));
+            return Err(CameraError::native(
+                crate::CameraErrorKind::BackendFailure,
+                crate::BackendId::MEDIA_FOUNDATION,
+                crate::OperationStage::Startup,
+                "CoInitializeEx".into(),
+                i64::from(hr.0),
+                format!("{hr:?}"),
+            ));
         }
         let mut users = MF_USERS.lock().unwrap();
         if *users == 0 {
@@ -47,7 +54,12 @@ impl MFGuard {
                         CoUninitialize();
                     }
                 }
-                return Err(CameraError::Other(format!("MF startup: {error}")));
+                return Err(super::native_error(
+                    crate::CameraErrorKind::BackendFailure,
+                    crate::OperationStage::Startup,
+                    "MFStartup",
+                    error,
+                ));
             }
         }
         *users += 1;

@@ -6,14 +6,21 @@ use crate::{
 use std::{borrow::Cow, fmt, str::FromStr, time::Duration};
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+/// Stable identifier for a built-in or application-provided camera backend.
 pub struct BackendId(Cow<'static, str>);
 
 impl BackendId {
+    /// USB Video Class backend backed by bundled libuvc/libusb.
     pub const UVC: Self = Self::builtin("uvc");
+    /// Linux Video4Linux2 backend.
     pub const V4L2: Self = Self::builtin("v4l2");
+    /// Apple AVFoundation backend.
     pub const AV_FOUNDATION: Self = Self::builtin("avfoundation");
+    /// Android NDK Camera2 backend.
     pub const CAMERA2: Self = Self::builtin("camera2");
+    /// Windows Media Foundation backend.
     pub const MEDIA_FOUNDATION: Self = Self::builtin("media-foundation");
+    /// Deterministic in-process backend intended for examples and tests.
     pub const SYNTHETIC: Self = Self::builtin("synthetic");
 
     const fn builtin(value: &'static str) -> Self {
@@ -21,6 +28,9 @@ impl BackendId {
         Self(Cow::Borrowed(value))
     }
 
+    /// Creates a namespaced identifier for an application-provided backend.
+    ///
+    /// Each component must be a non-empty ASCII identifier of at most 96 bytes.
     pub fn custom(namespace: &str, name: &str) -> CameraResult<Self> {
         fn valid(part: &str) -> bool {
             !part.is_empty()
@@ -30,13 +40,14 @@ impl BackendId {
                     .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b'_'))
         }
         if !valid(namespace) || !valid(name) {
-            return Err(CameraError::InvalidConfig(
+            return Err(CameraError::invalid_config(
                 "Backend namespace and name must be non-empty ASCII identifiers".into(),
             ));
         }
         Ok(Self(Cow::Owned(format!("{namespace}/{name}"))))
     }
 
+    /// Returns the stable serialized backend identifier.
     pub fn as_str(&self) -> &str {
         &self.0
     }
@@ -66,7 +77,7 @@ impl FromStr for BackendId {
             "synthetic" => Ok(Self::SYNTHETIC),
             _ => {
                 let (namespace, name) = value.split_once('/').ok_or_else(|| {
-                    CameraError::InvalidConfig("Invalid backend identifier".into())
+                    CameraError::invalid_config("Invalid backend identifier".into())
                 })?;
                 Self::custom(namespace, name)
             }
@@ -97,46 +108,142 @@ impl<'de> serde::Deserialize<'de> for BackendId {
 
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
+/// Policy used to select which compiled backend may satisfy an operation.
 pub enum BackendPolicy {
     #[default]
+    /// Use the platform's preferred native backend without unrelated fallback.
     PlatformDefault,
+    /// Require exactly the specified backend.
     Require(BackendId),
+    /// Try the listed backends in order and retain each typed failure.
     Prefer(Vec<BackendId>),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// Compile-time and target support status for a backend.
 pub enum BackendAvailability {
+    /// The backend is compiled and supports the current target.
     Available,
+    /// The corresponding Cargo feature was not enabled.
     NotCompiled,
+    /// The backend feature is enabled but cannot run on this target.
     UnsupportedTarget,
 }
 
+#[non_exhaustive]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serde", serde(rename_all = "snake_case"))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// Possible values for `OperationStage`.
 pub enum OperationStage {
+    /// The `Enumeration` variant.
     Enumeration,
+    /// The `Open` variant.
     Open,
+    /// The `Capabilities` variant.
     Capabilities,
+    /// The `Startup` variant.
     Startup,
+    /// The `FirstFrame` variant.
     FirstFrame,
+    /// The `FrameWait` variant.
     FrameWait,
+    /// The `BackendCommand` variant.
     BackendCommand,
+    /// The `Worker` variant.
+    Worker,
+    /// The `Close` variant.
     Close,
 }
 
+impl OperationStage {
+    /// Stable machine-readable operation stage.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Enumeration => "enumeration",
+            Self::Open => "open",
+            Self::Capabilities => "capabilities",
+            Self::Startup => "startup",
+            Self::FirstFrame => "first_frame",
+            Self::FrameWait => "frame_wait",
+            Self::BackendCommand => "backend_command",
+            Self::Worker => "worker",
+            Self::Close => "close",
+        }
+    }
+}
+
+impl fmt::Display for OperationStage {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+impl FromStr for OperationStage {
+    type Err = CameraError;
+
+    fn from_str(code: &str) -> Result<Self, Self::Err> {
+        match code {
+            "enumeration" => Ok(Self::Enumeration),
+            "open" => Ok(Self::Open),
+            "capabilities" => Ok(Self::Capabilities),
+            "startup" => Ok(Self::Startup),
+            "first_frame" => Ok(Self::FirstFrame),
+            "frame_wait" => Ok(Self::FrameWait),
+            "backend_command" => Ok(Self::BackendCommand),
+            "worker" => Ok(Self::Worker),
+            "close" => Ok(Self::Close),
+            _ => Err(CameraError::invalid_argument(
+                "camera operation stage",
+                code.to_owned(),
+            )),
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// Current camera authorization state as reported by the selected platform.
 pub enum PermissionStatus {
+    /// The `NotDetermined` variant.
     NotDetermined,
+    /// The `Restricted` variant.
     Restricted,
+    /// The `Denied` variant.
     Denied,
+    /// The `Authorized` variant.
     Authorized,
+    /// The `ManagedExternally` variant.
     ManagedExternally,
+    /// The `NotRequired` variant.
     NotRequired,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+/// One typed failure captured while evaluating a fallback backend policy.
 pub struct BackendAttempt {
-    pub backend: BackendId,
-    pub error: String,
+    backend: BackendId,
+    error: std::sync::Arc<CameraError>,
+}
+
+impl BackendAttempt {
+    /// Creates an attempt record from its backend and original shared error.
+    pub fn new(backend: BackendId, error: std::sync::Arc<CameraError>) -> Self {
+        Self { backend, error }
+    }
+
+    /// Returns the backend that produced the failure.
+    pub fn backend(&self) -> &BackendId {
+        &self.backend
+    }
+
+    /// Returns the original structured camera error.
+    pub fn error(&self) -> &CameraError {
+        &self.error
+    }
+
+    pub(crate) fn shared_error(&self) -> &std::sync::Arc<CameraError> {
+        &self.error
+    }
 }
 
 /// Backend-scoped device identity. Persistence preserves the backend namespace;
@@ -149,24 +256,28 @@ pub struct DeviceId {
 }
 
 impl DeviceId {
+    /// Performs the `new` operation.
     pub fn new(backend: BackendId, native_id: impl Into<String>) -> CameraResult<Self> {
         let native = native_id.into();
         if native.is_empty() || native.len() > 4096 || native.contains('\0') {
-            return Err(CameraError::InvalidConfig(
+            return Err(CameraError::invalid_config(
                 "Device native identifier is empty or invalid".into(),
             ));
         }
         Ok(Self { backend, native })
     }
 
+    /// Performs the `backend` operation.
     pub fn backend(&self) -> &BackendId {
         &self.backend
     }
 
+    /// Performs the `native_id` operation.
     pub fn native_id(&self) -> &str {
         &self.native
     }
 
+    /// Performs the `to_persistent_string` operation.
     pub fn to_persistent_string(&self) -> String {
         let encoded = self
             .native
@@ -177,15 +288,16 @@ impl DeviceId {
         format!("{}|{encoded}", self.backend)
     }
 
+    /// Performs the `parse` operation.
     pub fn parse(value: &str) -> CameraResult<Self> {
         let (backend, encoded) = value
             .split_once('|')
-            .ok_or_else(|| CameraError::InvalidConfig("Invalid persisted device ID".into()))?;
+            .ok_or_else(|| CameraError::invalid_config("Invalid persisted device ID".into()))?;
         if encoded.len() > 4096 * 2
             || encoded.len() % 2 != 0
             || !encoded.as_bytes().iter().all(u8::is_ascii_hexdigit)
         {
-            return Err(CameraError::InvalidConfig(
+            return Err(CameraError::invalid_config(
                 "Invalid persisted device ID payload".into(),
             ));
         }
@@ -204,10 +316,10 @@ impl DeviceId {
             })
             .collect::<std::result::Result<Vec<_>, _>>()
             .map_err(|_: std::convert::Infallible| {
-                CameraError::InvalidConfig("Invalid persisted device ID payload".into())
+                CameraError::invalid_config("Invalid persisted device ID payload".into())
             })?;
         let native = String::from_utf8(bytes)
-            .map_err(|_| CameraError::InvalidConfig("Device ID payload is not UTF-8".into()))?;
+            .map_err(|_| CameraError::invalid_config("Device ID payload is not UTF-8".into()))?;
         Self::new(backend.parse()?, native)
     }
 }
@@ -241,64 +353,101 @@ impl<'de> serde::Deserialize<'de> for DeviceId {
 
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// Possible values for `IdentityStability`.
 pub enum IdentityStability {
+    /// The `Native` variant.
     Native,
+    /// The `EnumerationOnly` variant.
     EnumerationOnly,
 }
 
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+/// Possible values for `CameraFacing`.
 pub enum CameraFacing {
+    /// The `Front` variant.
     Front,
+    /// The `Back` variant.
     Back,
+    /// The `External` variant.
     External,
     #[default]
+    /// The `Unknown` variant.
     Unknown,
 }
 
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[derive(Clone, Debug, PartialEq, Eq)]
+/// Values for `UsbIdentity`.
 pub struct UsbIdentity {
+    /// USB vendor identifier.
     pub vendor_id: u16,
+    /// USB product identifier.
     pub product_id: u16,
+    /// USB serial number when available.
     pub serial_number: Option<String>,
 }
 
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[derive(Clone, Debug)]
+/// Values for `DeviceInfo`.
 pub struct DeviceInfo {
+    /// The id value.
     pub id: DeviceId,
+    /// Human-readable name.
     pub name: String,
+    /// Human-readable description.
     pub description: String,
+    /// Persistence guarantee for the identifier.
     pub stability: IdentityStability,
+    /// Enumeration index for the current snapshot.
     pub index: u32,
+    /// Physical camera facing.
     pub facing: CameraFacing,
+    /// USB identity when available.
     pub usb: Option<UsbIdentity>,
 }
 
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[derive(Clone, Debug)]
+/// Possible values for `DeviceSelector`.
 pub enum DeviceSelector {
+    /// The `Default` variant.
     Default,
+    /// The `Id` variant.
     Id(DeviceId),
+    /// The `Facing` variant.
     Facing(CameraFacing),
+    /// The `Usb` variant.
     Usb {
+        /// The `vendor_id` struct field.
         vendor_id: u16,
+        /// The `product_id` struct field.
         product_id: u16,
+        /// The `serial_number` struct field.
         serial_number: Option<String>,
     },
+    /// The `Name` variant.
     Name(String),
 }
 
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+/// Possible values for `CaptureFormat`.
 pub enum CaptureFormat {
+    /// The `Mjpeg` variant.
     Mjpeg,
+    /// The `Yuyv` variant.
     Yuyv,
+    /// The `Uyvy` variant.
     Uyvy,
+    /// The `Nv12` variant.
     Nv12,
+    /// The `Rgb8` variant.
     Rgb8,
+    /// The `H264` variant.
     H264,
+    /// The `Gray8` variant.
     Gray8,
 }
 
@@ -343,7 +492,7 @@ impl TryFrom<PixelFormat> for CaptureFormat {
             PixelFormat::H264 => Self::H264,
             PixelFormat::Gray8 => Self::Gray8,
             _ => {
-                return Err(CameraError::UnsupportedFormat(format!(
+                return Err(CameraError::unsupported_format(format!(
                     "{value:?} has no capture-format equivalent"
                 )))
             }
@@ -353,26 +502,37 @@ impl TryFrom<PixelFormat> for CaptureFormat {
 
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+/// Possible values for `NegotiationPriority`.
 pub enum NegotiationPriority {
+    /// The `LowLatency` variant.
     LowLatency,
     #[default]
+    /// The `LowCpu` variant.
     LowCpu,
+    /// The `LowBandwidth` variant.
     LowBandwidth,
+    /// The `Fidelity` variant.
     Fidelity,
 }
 
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+/// Possible values for `CaptureProfile`.
 pub enum CaptureProfile {
     #[default]
+    /// The `Preview` variant.
     Preview,
+    /// The `Recognition` variant.
     Recognition,
+    /// The `Recording` variant.
     Recording,
+    /// The `NativeRelay` variant.
     NativeRelay,
 }
 
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[derive(Clone, Debug)]
+/// Values for `CaptureRequest`.
 pub struct CaptureRequest {
     pub(crate) width: u32,
     pub(crate) height: u32,
@@ -388,6 +548,7 @@ pub struct CaptureRequest {
 }
 
 impl CaptureRequest {
+    /// Performs the `builder` operation.
     pub fn builder() -> CaptureRequestBuilder {
         CaptureRequestBuilder(Self {
             width: 640,
@@ -404,30 +565,37 @@ impl CaptureRequest {
         })
     }
 
+    /// Performs the `preferred_resolution` operation.
     pub fn preferred_resolution(&self) -> (u32, u32) {
         (self.width, self.height)
     }
 
+    /// Performs the `preferred_frame_rate` operation.
     pub fn preferred_frame_rate(&self) -> FrameRate {
         self.preferred_fps
     }
 
+    /// Performs the `minimum_frame_rate` operation.
     pub fn minimum_frame_rate(&self) -> Option<FrameRate> {
         self.minimum_fps
     }
 
+    /// Performs the `preferred_formats` operation.
     pub fn preferred_formats(&self) -> &[CaptureFormat] {
         &self.preferred_formats
     }
 
+    /// Performs the `priority` operation.
     pub fn priority(&self) -> NegotiationPriority {
         self.priority
     }
 
+    /// Performs the `required_aspect_ratio` operation.
     pub fn required_aspect_ratio(&self) -> Option<(u32, u32)> {
         self.required_aspect_ratio
     }
 
+    /// The `fn` constant.
     pub const fn delivers_native_frames(&self) -> bool {
         true
     }
@@ -451,15 +619,18 @@ impl CaptureRequest {
 }
 
 #[derive(Clone, Debug)]
+/// Values for `CaptureRequestBuilder`.
 pub struct CaptureRequestBuilder(CaptureRequest);
 
 impl CaptureRequestBuilder {
+    /// Performs the `preferred_resolution` operation.
     pub fn preferred_resolution(mut self, width: u32, height: u32) -> Self {
         self.0.width = width;
         self.0.height = height;
         self
     }
 
+    /// Performs the `exact_resolution` operation.
     pub fn exact_resolution(mut self, width: u32, height: u32) -> Self {
         self.0.width = width;
         self.0.height = height;
@@ -474,41 +645,49 @@ impl CaptureRequestBuilder {
         self
     }
 
+    /// Performs the `preferred_frame_rate` operation.
     pub fn preferred_frame_rate(mut self, rate: FrameRate) -> Self {
         self.0.preferred_fps = rate;
         self
     }
 
+    /// Performs the `minimum_frame_rate` operation.
     pub fn minimum_frame_rate(mut self, rate: FrameRate) -> Self {
         self.0.minimum_fps = Some(rate);
         self
     }
 
+    /// Performs the `preferred_formats` operation.
     pub fn preferred_formats(mut self, formats: impl IntoIterator<Item = CaptureFormat>) -> Self {
         self.0.preferred_formats = formats.into_iter().collect();
         self
     }
 
+    /// Performs the `priority` operation.
     pub fn priority(mut self, priority: NegotiationPriority) -> Self {
         self.0.priority = priority;
         self
     }
 
+    /// Performs the `memory_budget` operation.
     pub fn memory_budget(mut self, budget: MemoryBudget) -> Self {
         self.0.memory = budget;
         self
     }
 
+    /// Performs the `startup_timeout` operation.
     pub fn startup_timeout(mut self, timeout: Duration) -> Self {
         self.0.startup_timeout = timeout;
         self
     }
 
+    /// Performs the `reconnect` operation.
     pub fn reconnect(mut self, policy: crate::ReconnectPolicy) -> Self {
         self.0.reconnect = Some(policy);
         self
     }
 
+    /// Performs the `build` operation.
     pub fn build(self) -> CameraResult<CaptureRequest> {
         let request = self.0;
         request.to_stream_request()?;
@@ -516,7 +695,7 @@ impl CaptureRequestBuilder {
             .minimum_fps
             .is_some_and(|minimum| minimum > request.preferred_fps)
         {
-            return Err(CameraError::InvalidConfig(
+            return Err(CameraError::invalid_config(
                 "Minimum frame rate exceeds preferred frame rate".into(),
             ));
         }
@@ -524,7 +703,7 @@ impl CaptureRequestBuilder {
             .required_aspect_ratio
             .is_some_and(|(width, height)| width == 0 || height == 0)
         {
-            return Err(CameraError::InvalidConfig(
+            return Err(CameraError::invalid_config(
                 "Required aspect ratio must be positive".into(),
             ));
         }
@@ -533,7 +712,7 @@ impl CaptureRequestBuilder {
             dedup.sort_by_key(|format| *format as u8);
             dedup.dedup();
             if dedup.len() != request.preferred_formats.len() {
-                return Err(CameraError::InvalidConfig(
+                return Err(CameraError::invalid_config(
                     "Preferred capture formats contain duplicates".into(),
                 ));
             }
@@ -543,10 +722,15 @@ impl CaptureRequestBuilder {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+/// Values for `CaptureMode`.
 pub struct CaptureMode {
+    /// Pixel or capture format.
     pub format: CaptureFormat,
+    /// Frame width in pixels.
     pub width: u32,
+    /// Frame height in pixels.
     pub height: u32,
+    /// Capture frame rate.
     pub frame_rate: FrameRate,
 }
 
@@ -575,78 +759,117 @@ impl CaptureMode {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+/// Possible values for `CapabilityKnowledge`.
 pub enum CapabilityKnowledge<T> {
+    /// The `Known` variant.
     Known(T),
     /// A bounded sample of a backend capability space that also contains
     /// continuous or stepwise ranges.
     Representative {
+        /// The `values` struct field.
         values: T,
+        /// The `reason` struct field.
         reason: String,
     },
+    /// The `Unknown` variant.
     Unknown {
+        /// The `reason` struct field.
         reason: String,
     },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// Possible values for `CapabilityRangeKind`.
 pub enum CapabilityRangeKind {
+    /// The `Discrete` variant.
     Discrete,
+    /// The `Continuous` variant.
     Continuous,
+    /// The `Stepwise` variant.
     Stepwise,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// Values for `DimensionRange`.
 pub struct DimensionRange {
+    /// The minimum value.
     pub minimum: u32,
+    /// The maximum value.
     pub maximum: u32,
+    /// The step value.
     pub step: u32,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// Values for `FrameInterval`.
 pub struct FrameInterval {
+    /// The numerator value.
     pub numerator: u32,
+    /// The denominator value.
     pub denominator: u32,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+/// Values for `FrameIntervalRange`.
 pub struct FrameIntervalRange {
+    /// The kind value.
     pub kind: CapabilityRangeKind,
+    /// The minimum value.
     pub minimum: FrameInterval,
+    /// The maximum value.
     pub maximum: FrameInterval,
+    /// The step value.
     pub step: Option<FrameInterval>,
     /// Resolution at which the backend reported this interval range.
     pub at_resolution: (u32, u32),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+/// Values for `CaptureModeRange`.
 pub struct CaptureModeRange {
+    /// Pixel or capture format.
     pub format: CaptureFormat,
+    /// The kind value.
     pub kind: CapabilityRangeKind,
+    /// Frame width in pixels.
     pub width: DimensionRange,
+    /// Frame height in pixels.
     pub height: DimensionRange,
+    /// The frame intervals value.
     pub frame_intervals: Vec<FrameIntervalRange>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+/// Values for `ConversionCapability`.
 pub struct ConversionCapability {
+    /// The input value.
     pub input: CaptureFormat,
+    /// The output value.
     pub output: PixelFormat,
+    /// Whether this conversion is compiled and available.
     pub available: bool,
+    /// The requirement value.
     pub requirement: Option<&'static str>,
 }
 
 #[derive(Clone, Debug)]
+/// Values for `DeviceCapabilities`.
 pub struct DeviceCapabilities {
+    /// The capture modes value.
     pub capture_modes: CapabilityKnowledge<Vec<CaptureMode>>,
     /// Native size and/or frame-interval range descriptors. `capture_modes` is
     /// representative when this list is non-empty.
     pub capture_mode_ranges: Vec<CaptureModeRange>,
+    /// The native formats value.
     pub native_formats: Vec<CaptureFormat>,
+    /// The conversions value.
     pub conversions: Vec<ConversionCapability>,
+    /// The limitations value.
     pub limitations: Vec<String>,
 }
 
 impl DeviceCapabilities {
+    /// Performs the `single_native` operation.
     pub fn single_native(
         format: CaptureFormat,
         width: u32,
@@ -666,7 +889,7 @@ impl DeviceCapabilities {
     pub fn from_modes(modes: impl IntoIterator<Item = CaptureMode>) -> CameraResult<Self> {
         let modes = modes.into_iter().collect::<Vec<_>>();
         if modes.is_empty() {
-            return Err(CameraError::InvalidConfig(
+            return Err(CameraError::invalid_config(
                 "Device capabilities require at least one capture mode".into(),
             ));
         }
@@ -685,7 +908,7 @@ impl DeviceCapabilities {
         });
         configurations.dedup();
         if configurations.len() != modes.len() {
-            return Err(CameraError::InvalidConfig(
+            return Err(CameraError::invalid_config(
                 "Device capabilities contain duplicate capture modes".into(),
             ));
         }
@@ -753,7 +976,7 @@ impl DeviceCapabilities {
             | CapabilityKnowledge::Representative { values: modes, .. } => {
                 modes.iter().map(CaptureMode::to_config).collect()
             }
-            CapabilityKnowledge::Unknown { reason } => Err(CameraError::UnsupportedFormat(
+            CapabilityKnowledge::Unknown { reason } => Err(CameraError::unsupported_format(
                 format!("Capture modes are unknown: {reason}"),
             )),
         }
@@ -777,29 +1000,41 @@ impl DeviceCapabilities {
 }
 
 #[derive(Clone, Debug)]
+/// Values for `NegotiatedCapture`.
 pub struct NegotiatedCapture {
+    /// Negotiated native capture mode.
     pub capture: CaptureMode,
+    /// Adjustments made during negotiation.
     pub adjustments: Vec<String>,
+    /// The first frame latency value.
     pub first_frame_latency: Duration,
 }
 
 #[derive(Clone, Debug)]
+/// Values for `CapturePlan`.
 pub struct CapturePlan {
+    /// The selected value.
     pub selected: NegotiatedCapture,
+    /// Other compatible capture modes.
     pub alternatives: Vec<CaptureMode>,
+    /// Human-readable explanation of the selected mode.
     pub ranking_reason: String,
+    /// Estimated bytes reserved by the frame pool.
     pub estimated_pool_bytes: usize,
+    /// Adjustments made during negotiation.
     pub adjustments: Vec<String>,
 }
 
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// Values for `SubscriptionOptions`.
 pub struct SubscriptionOptions {
     pub(crate) delivery: DeliveryPolicy,
     pub(crate) max_rate: Option<FrameRate>,
 }
 
 impl SubscriptionOptions {
+    /// Performs the `latest` operation.
     pub fn latest() -> Self {
         Self {
             delivery: DeliveryPolicy::Latest,
@@ -807,6 +1042,7 @@ impl SubscriptionOptions {
         }
     }
 
+    /// Performs the `buffered` operation.
     pub fn buffered(capacity: usize) -> Self {
         Self {
             delivery: DeliveryPolicy::Buffered {
@@ -817,6 +1053,7 @@ impl SubscriptionOptions {
         }
     }
 
+    /// Performs the `overflow` operation.
     pub fn overflow(mut self, overflow: OverflowPolicy) -> Self {
         if let DeliveryPolicy::Buffered {
             overflow: current, ..
@@ -827,6 +1064,7 @@ impl SubscriptionOptions {
         self
     }
 
+    /// Performs the `max_rate` operation.
     pub fn max_rate(mut self, rate: FrameRate) -> Self {
         self.max_rate = Some(rate);
         self
@@ -836,7 +1074,7 @@ impl SubscriptionOptions {
     pub(crate) fn validate(self, budget: MemoryBudget) -> CameraResult<()> {
         if let DeliveryPolicy::Buffered { capacity, .. } = self.delivery {
             if capacity == 0 || capacity >= budget.buffers {
-                return Err(CameraError::InvalidConfig(
+                return Err(CameraError::invalid_config(
                     "Subscription queue must be positive and smaller than the frame pool".into(),
                 ));
             }
@@ -847,16 +1085,22 @@ impl SubscriptionOptions {
 
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
+/// Values for `V4l2Options`.
 pub struct V4l2Options {
+    /// The mmap buffers value.
     pub mmap_buffers: Option<usize>,
 }
 
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+/// Possible values for `Camera2RequestTemplate`.
 pub enum Camera2RequestTemplate {
     #[default]
+    /// The `Preview` variant.
     Preview,
+    /// The `StillCapture` variant.
     StillCapture,
+    /// The `Record` variant.
     Record,
 }
 
@@ -873,26 +1117,35 @@ impl Camera2RequestTemplate {
 
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
+/// Values for `Camera2Options`.
 pub struct Camera2Options {
+    /// The max images value.
     pub max_images: Option<u32>,
+    /// The request template value.
     pub request_template: Option<Camera2RequestTemplate>,
 }
 
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+/// Possible values for `LateFramePolicy`.
 pub enum LateFramePolicy {
     #[default]
+    /// The `Drop` variant.
     Drop,
+    /// The `Deliver` variant.
     Deliver,
 }
 
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
+/// Values for `AvFoundationOptions`.
 pub struct AvFoundationOptions {
+    /// The late frames value.
     pub late_frames: LateFramePolicy,
 }
 
 impl AvFoundationOptions {
+    /// Performs the `late_frames` operation.
     pub fn late_frames(mut self, policy: LateFramePolicy) -> Self {
         self.late_frames = policy;
         self
@@ -900,11 +1153,13 @@ impl AvFoundationOptions {
 }
 
 impl Camera2Options {
+    /// Performs the `max_images` operation.
     pub fn max_images(mut self, count: u32) -> Self {
         self.max_images = Some(count);
         self
     }
 
+    /// Performs the `request_template` operation.
     pub fn request_template(mut self, template: Camera2RequestTemplate) -> Self {
         self.request_template = Some(template);
         self
@@ -912,6 +1167,7 @@ impl Camera2Options {
 }
 
 impl V4l2Options {
+    /// Performs the `mmap_buffers` operation.
     pub fn mmap_buffers(mut self, count: usize) -> Self {
         self.mmap_buffers = Some(count);
         self
@@ -920,13 +1176,18 @@ impl V4l2Options {
 
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[derive(Clone, Debug, PartialEq, Eq)]
+/// Possible values for `BackendOptions`.
 pub enum BackendOptions {
+    /// The `V4l2` variant.
     V4l2(V4l2Options),
+    /// The `Camera2` variant.
     Camera2(Camera2Options),
+    /// The `AvFoundation` variant.
     AvFoundation(AvFoundationOptions),
 }
 
 impl BackendOptions {
+    /// Performs the `backend` operation.
     pub fn backend(&self) -> BackendId {
         match self {
             Self::V4l2(_) => BackendId::V4L2,
@@ -939,14 +1200,14 @@ impl BackendOptions {
     pub(crate) fn validate(&self) -> CameraResult<()> {
         match self {
             Self::V4l2(options) if options.mmap_buffers.is_some_and(|n| !(2..=32).contains(&n)) => {
-                Err(CameraError::InvalidConfig(
+                Err(CameraError::invalid_config(
                     "V4L2 MMAP buffer count must be 2..=32".into(),
                 ))
             }
             Self::Camera2(options)
                 if options.max_images.is_some_and(|n| !(2..=16).contains(&n)) =>
             {
-                Err(CameraError::InvalidConfig(
+                Err(CameraError::invalid_config(
                     "Camera2 max_images must be 2..=16".into(),
                 ))
             }

@@ -1,4 +1,4 @@
-#![cfg(feature = "runtime-tokio")]
+#![cfg(all(feature = "runtime-tokio", feature = "custom-backend"))]
 
 use camera::{
     BackendDevice, BackendDeviceInfo, BackendId, BackendPolicy, BackendProvider, CameraError,
@@ -17,8 +17,8 @@ use std::{
 };
 
 #[test]
-fn public_contract_is_the_breaking_0_4_api() {
-    assert_eq!(env!("CARGO_PKG_VERSION"), "0.4.0");
+fn public_contract_is_the_breaking_0_5_api() {
+    assert_eq!(env!("CARGO_PKG_VERSION"), "0.5.0");
 
     let request = CaptureRequest::builder()
         .preferred_resolution(1280, 720)
@@ -77,7 +77,7 @@ async fn simple_capture_owns_the_session_and_default_receiver() {
     capture.close().await.unwrap();
     assert!(matches!(
         capture.next_frame().await,
-        Err(CameraError::StreamStopped)
+        Err(ref error) if error.kind() == camera::CameraErrorKind::StreamStopped
     ));
 }
 
@@ -142,6 +142,21 @@ async fn planning_and_capabilities_report_conditions_instead_of_boolean_promises
     assert_eq!(plan.selected.capture.width, 640);
     assert!(!plan.ranking_reason.is_empty());
     assert!(plan.estimated_pool_bytes > 0);
+}
+
+#[tokio::test]
+async fn an_open_device_can_report_its_own_capabilities_before_streaming() {
+    let system = CameraSystem::synthetic();
+    let device = system.open(DeviceSelector::Default).await.unwrap();
+
+    let capabilities = device.capabilities().await.unwrap();
+
+    assert!(capabilities.native_formats.contains(&CaptureFormat::Rgb8));
+    assert!(matches!(
+        capabilities.capture_modes,
+        camera::CapabilityKnowledge::Known(ref modes)
+            if modes.iter().any(|mode| mode.width == 640 && mode.height == 480)
+    ));
 }
 
 #[tokio::test]
@@ -495,12 +510,9 @@ async fn startup_timeout_covers_external_capability_queries() {
                 .unwrap(),
         )
         .await;
-    assert!(matches!(
-        result,
-        Err(CameraError::Timeout {
-            stage: camera::OperationStage::Startup
-        })
-    ));
+    let error = result.unwrap_err();
+    assert_eq!(error.kind(), camera::CameraErrorKind::Timeout);
+    assert_eq!(error.stage(), Some(camera::OperationStage::Startup));
     tokio::time::sleep(Duration::from_millis(100)).await;
     let session = device
         .start(
@@ -534,7 +546,7 @@ async fn capture_builder_startup_timeout_is_one_total_deadline() {
         .start()
         .await;
 
-    assert!(matches!(result, Err(CameraError::Timeout { .. })));
+    assert!(matches!(result, Err(ref error) if error.kind() == camera::CameraErrorKind::Timeout));
 }
 
 #[derive(Debug)]
@@ -563,7 +575,7 @@ impl BackendProvider for DelayedOpenProvider {
     fn open(&self, _native_id: &str) -> CameraResult<Box<dyn BackendDevice>> {
         std::thread::sleep(self.delay);
         if self.fail {
-            Err(CameraError::DeviceOpenFailed("fixture failure".into()))
+            Err(CameraError::device_open_failed("fixture failure".into()))
         } else {
             Ok(Box::new(TestDevice {
                 running: Arc::new(AtomicBool::new(false)),
@@ -602,7 +614,9 @@ async fn preferred_backend_attempts_share_the_startup_deadline() {
         .start()
         .await;
 
-    assert!(matches!(result, Err(CameraError::BackendAttemptsFailed(_))));
+    assert!(
+        matches!(result, Err(ref error) if error.kind() == camera::CameraErrorKind::MultipleBackendsFailed)
+    );
 }
 
 #[tokio::test]
@@ -618,14 +632,12 @@ async fn external_open_and_capability_queries_have_explicit_timeouts() {
         .unwrap();
     let id = system.devices().await.unwrap().remove(0).id;
 
-    assert!(matches!(
-        system
-            .open_timeout(DeviceSelector::Default, Duration::from_millis(20))
-            .await,
-        Err(CameraError::Timeout {
-            stage: camera::OperationStage::Open
-        })
-    ));
+    let error = system
+        .open_timeout(DeviceSelector::Default, Duration::from_millis(20))
+        .await
+        .unwrap_err();
+    assert_eq!(error.kind(), camera::CameraErrorKind::Timeout);
+    assert_eq!(error.stage(), Some(camera::OperationStage::Open));
     tokio::time::timeout(Duration::from_millis(200), async {
         while dropped_devices.load(Ordering::Acquire) == 0 {
             tokio::time::sleep(Duration::from_millis(5)).await;
@@ -633,14 +645,12 @@ async fn external_open_and_capability_queries_have_explicit_timeouts() {
     })
     .await
     .unwrap();
-    assert!(matches!(
-        system
-            .capabilities_timeout(&id, Duration::from_millis(20))
-            .await,
-        Err(CameraError::Timeout {
-            stage: camera::OperationStage::Capabilities
-        })
-    ));
+    let error = system
+        .capabilities_timeout(&id, Duration::from_millis(20))
+        .await
+        .unwrap_err();
+    assert_eq!(error.kind(), camera::CameraErrorKind::Timeout);
+    assert_eq!(error.stage(), Some(camera::OperationStage::Capabilities));
 }
 
 #[derive(Debug)]
@@ -919,7 +929,7 @@ impl BackendDevice for FormatFallbackDevice {
         let format = plan.selected.capture.format;
         self.attempted.lock().unwrap().push(format);
         if format == CaptureFormat::Mjpeg {
-            return Err(CameraError::UnsupportedFormat(
+            return Err(CameraError::unsupported_format(
                 "fixture rejects MJPEG".into(),
             ));
         }
@@ -1046,12 +1056,12 @@ fn invalid_backend_options_are_structured_errors() {
         .backend_options(camera::V4l2Options::default().mmap_buffers(4))
         .build()
         .unwrap_err();
-    assert!(matches!(error, CameraError::BackendOptionMismatch { .. }));
+    assert_eq!(error.kind(), camera::CameraErrorKind::BackendOptionMismatch);
 
     let error = CameraSystem::builder()
         .backend_policy(BackendPolicy::Require(BackendId::CAMERA2))
         .backend_options(camera::Camera2Options::default().max_images(1))
         .build()
         .unwrap_err();
-    assert!(matches!(error, CameraError::InvalidConfig(_)));
+    assert_eq!(error.kind(), camera::CameraErrorKind::InvalidArgument);
 }

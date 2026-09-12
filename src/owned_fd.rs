@@ -4,7 +4,7 @@ use std::os::fd::{FromRawFd, OwnedFd};
 pub(crate) fn duplicate(fd: i32) -> CameraResult<OwnedFd> {
     let copy = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 0) };
     if copy < 0 {
-        return Err(CameraError::DeviceOpenFailed(format!(
+        return Err(CameraError::device_open_failed(format!(
             "Duplicating USB fd: {}",
             std::io::Error::last_os_error()
         )));

@@ -1,4 +1,5 @@
 //! Async cross-platform camera capture with owned sessions and immutable frames.
+#![warn(missing_docs)]
 //!
 //! ```no_run
 //! use camera::{CameraSystem, CaptureProfile, DeviceSelector};
@@ -27,6 +28,7 @@ mod controls;
 mod conversion;
 mod error;
 #[cfg(feature = "runtime-tokio")]
+#[cfg_attr(not(feature = "custom-backend"), allow(dead_code))]
 mod extension;
 mod format;
 #[cfg(feature = "runtime-tokio")]
@@ -70,8 +72,8 @@ pub use controls::{
 };
 #[cfg(feature = "convert-rgb")]
 pub use conversion::{selected_conversion_path, ConversionRequest, RgbConverter};
-pub use error::{CameraError, Result};
-#[cfg(feature = "runtime-tokio")]
+pub use error::{CameraError, CameraErrorKind, RecoveryHint};
+#[cfg(all(feature = "runtime-tokio", feature = "custom-backend"))]
 pub use extension::{
     BackendDevice, BackendDeviceInfo, BackendProvider, FrameSink, WritableFrameLease,
 };
@@ -94,6 +96,7 @@ pub use frame::{CapturedFrame, Frame, FrameKey, FrameMetrics, FrameReceiver, Rgb
 pub use traits::StreamStats;
 #[cfg(feature = "runtime-tokio")]
 pub(crate) use traits::{CameraControl, CameraManager, StreamingCamera};
+/// Result type returned by all core camera operations.
 pub type CameraResult<T> = std::result::Result<T, CameraError>;
 pub(crate) use types::{CameraConfig, VideoFormat};
 #[cfg(feature = "runtime-tokio")]

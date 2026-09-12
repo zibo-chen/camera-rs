@@ -77,12 +77,25 @@ pub enum NdkCameraStatus {
 
 impl NdkCameraStatus {
     pub fn error(self, operation: impl Into<String>) -> crate::CameraError {
-        crate::CameraError::Native {
-            backend: crate::BackendId::CAMERA2,
-            operation: operation.into(),
-            code: self as i32 as i64,
-            message: self.to_error_string().into(),
-        }
+        let kind = match self {
+            Self::ErrorInvalidParam => crate::CameraErrorKind::InvalidArgument,
+            Self::ErrorOpenFailed | Self::ErrorSessionFailed => {
+                crate::CameraErrorKind::DeviceOpenFailed
+            }
+            Self::ErrorNotFound => crate::CameraErrorKind::DeviceNotFound,
+            Self::ErrorPermission => crate::CameraErrorKind::PermissionDenied,
+            Self::ErrorAlreadyStreaming => crate::CameraErrorKind::DeviceBusy,
+            Self::ErrorNotStreaming => crate::CameraErrorKind::StreamStopped,
+            Self::ErrorInternal | Self::Ok => crate::CameraErrorKind::BackendFailure,
+        };
+        crate::CameraError::native(
+            kind,
+            crate::BackendId::CAMERA2,
+            crate::OperationStage::BackendCommand,
+            operation.into(),
+            self as i32 as i64,
+            self.to_error_string().into(),
+        )
     }
 
     pub fn is_ok(self) -> bool {

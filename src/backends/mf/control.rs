@@ -1,7 +1,7 @@
-//! 相机控制接口
+//! Camera control interface.
 //!
-//! 提供曝光、白平衡、亮度等相机参数的控制功能。
-//! 使用 IAMVideoProcAmp 和 IAMCameraControl 接口。
+//! Controls exposure, white balance, brightness, and related parameters through
+//! IAMVideoProcAmp and IAMCameraControl.
 
 use crate::error::CameraError;
 use crate::types::{CameraControlRange, CameraControlType, CameraControlValue, CameraResult};
@@ -18,20 +18,20 @@ use windows::Win32::Media::DirectShow::{
 use windows::Win32::Media::KernelStreaming::GUID_NULL;
 use windows::Win32::Media::MediaFoundation::{IMFSourceReader, MF_SOURCE_READER_MEDIASOURCE};
 
-/// 控制 ID 类型
+/// Control ID category.
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum MFControlId {
-    /// IAMVideoProcAmp 布尔类型控制
+    /// Boolean IAMVideoProcAmp control.
     ProcAmpBoolean(i32),
-    /// IAMVideoProcAmp 范围类型控制
+    /// Ranged IAMVideoProcAmp control.
     ProcAmpRange(i32),
-    /// IAMCameraControl 值类型控制
+    /// Value IAMCameraControl control.
     CameraControlValue(i32),
-    /// IAMCameraControl 范围类型控制
+    /// Ranged IAMCameraControl control.
     CameraControlRange(i32),
 }
 
-/// 将 CameraControlType 转换为 Windows 控制 ID
+/// Maps CameraControlType to a Windows control ID.
 pub(crate) fn control_type_to_mf_id(control: CameraControlType) -> Option<MFControlId> {
     match control {
         CameraControlType::Brightness => Some(MFControlId::ProcAmpRange(VideoProcAmp_Brightness.0)),
@@ -55,13 +55,13 @@ pub(crate) fn control_type_to_mf_id(control: CameraControlType) -> Option<MFCont
         }
         CameraControlType::Iris => Some(MFControlId::CameraControlValue(CameraControl_Iris.0)),
         CameraControlType::Focus => Some(MFControlId::CameraControlValue(CameraControl_Focus.0)),
-        CameraControlType::AutoExposure => None, // 通过 flag 控制
-        CameraControlType::AutoFocus => None,    // 通过 flag 控制
-        CameraControlType::AutoWhiteBalance => None, // 通过 flag 控制
+        CameraControlType::AutoExposure => None, // Controlled through flags.
+        CameraControlType::AutoFocus => None,    // Controlled through flags.
+        CameraControlType::AutoWhiteBalance => None, // Controlled through flags.
     }
 }
 
-/// 获取 IAMVideoProcAmp 接口
+/// Returns the IAMVideoProcAmp interface.
 pub(crate) fn get_video_proc_amp(source_reader: &IMFSourceReader) -> CameraResult<IAMVideoProcAmp> {
     unsafe {
         let mut receiver: MaybeUninit<IAMVideoProcAmp> = MaybeUninit::uninit();
@@ -74,13 +74,20 @@ pub(crate) fn get_video_proc_amp(source_reader: &IMFSourceReader) -> CameraResul
                 &IAMVideoProcAmp::IID,
                 ptr,
             )
-            .map_err(|e| CameraError::Other(format!("Failed to get IAMVideoProcAmp: {}", e)))?;
+            .map_err(|e| {
+                super::native_error(
+                    crate::CameraErrorKind::ControlFailure,
+                    crate::OperationStage::BackendCommand,
+                    "get IAMVideoProcAmp",
+                    e,
+                )
+            })?;
 
         Ok(receiver.assume_init())
     }
 }
 
-/// 获取 IAMCameraControl 接口
+/// Returns the IAMCameraControl interface.
 pub(crate) fn get_camera_control(
     source_reader: &IMFSourceReader,
 ) -> CameraResult<IAMCameraControl> {
@@ -95,7 +102,14 @@ pub(crate) fn get_camera_control(
                 &IAMCameraControl::IID,
                 ptr,
             )
-            .map_err(|e| CameraError::Other(format!("Failed to get IAMCameraControl: {}", e)))?;
+            .map_err(|e| {
+                super::native_error(
+                    crate::CameraErrorKind::ControlFailure,
+                    crate::OperationStage::BackendCommand,
+                    "get IAMCameraControl",
+                    e,
+                )
+            })?;
 
         Ok(receiver.assume_init())
     }
@@ -109,7 +123,7 @@ fn automatic_base(control: CameraControlType) -> Option<CameraControlType> {
         _ => None,
     }
 }
-/// 获取控制值
+/// Reads a control value.
 pub(crate) fn get_control(
     source_reader: &IMFSourceReader,
     control: CameraControlType,
@@ -118,9 +132,8 @@ pub(crate) fn get_control(
         let value = get_control(source_reader, base)?;
         return Ok(CameraControlValue::Boolean(value.is_auto()));
     }
-    let mf_id = control_type_to_mf_id(control).ok_or_else(|| {
-        CameraError::UnsupportedFormat(format!("Unsupported control: {:?}", control))
-    })?;
+    let mf_id = control_type_to_mf_id(control)
+        .ok_or_else(|| CameraError::control_not_supported(format!("{control:?}")))?;
 
     match mf_id {
         MFControlId::ProcAmpBoolean(id) | MFControlId::ProcAmpRange(id) => {
@@ -130,7 +143,12 @@ pub(crate) fn get_control(
 
             unsafe {
                 proc_amp.Get(id, &mut value, &mut flags).map_err(|e| {
-                    CameraError::Other(format!("Failed to get VideoProcAmp value: {}", e))
+                    super::native_error(
+                        crate::CameraErrorKind::ControlFailure,
+                        crate::OperationStage::BackendCommand,
+                        "get VideoProcAmp value",
+                        e,
+                    )
                 })?;
             }
 
@@ -144,7 +162,12 @@ pub(crate) fn get_control(
 
             unsafe {
                 cam_ctrl.Get(id, &mut value, &mut flags).map_err(|e| {
-                    CameraError::Other(format!("Failed to get CameraControl value: {}", e))
+                    super::native_error(
+                        crate::CameraErrorKind::ControlFailure,
+                        crate::OperationStage::BackendCommand,
+                        "get CameraControl value",
+                        e,
+                    )
                 })?;
             }
 
@@ -154,7 +177,7 @@ pub(crate) fn get_control(
     }
 }
 
-/// 设置控制值
+/// Sets a control value.
 pub(crate) fn set_control(
     source_reader: &IMFSourceReader,
     control: CameraControlType,
@@ -162,17 +185,17 @@ pub(crate) fn set_control(
 ) -> CameraResult<()> {
     if let Some(base) = automatic_base(control) {
         let automatic = value.as_bool().ok_or_else(|| {
-            CameraError::InvalidConfig("Automatic control expects boolean".into())
+            CameraError::invalid_config("Automatic control expects boolean".into())
         })?;
         let range = get_control_range(source_reader, base)?;
         if automatic && !range.supports_auto {
-            return Err(CameraError::ControlNotSupported(
+            return Err(CameraError::control_not_supported(
                 "Automatic mode unavailable".into(),
             ));
         }
         let current = get_control(source_reader, base)?
             .as_i32()
-            .ok_or_else(|| CameraError::NotReadable("Native control value".into()))?;
+            .ok_or_else(|| CameraError::control_not_readable("Native control value".into()))?;
         return set_control(
             source_reader,
             base,
@@ -182,9 +205,8 @@ pub(crate) fn set_control(
             },
         );
     }
-    let mf_id = control_type_to_mf_id(control).ok_or_else(|| {
-        CameraError::UnsupportedFormat(format!("Unsupported control: {:?}", control))
-    })?;
+    let mf_id = control_type_to_mf_id(control)
+        .ok_or_else(|| CameraError::control_not_supported(format!("{control:?}")))?;
 
     let (int_value, is_auto) = match value {
         CameraControlValue::Integer { value, is_auto } => (value, is_auto),
@@ -203,7 +225,12 @@ pub(crate) fn set_control(
             let proc_amp = get_video_proc_amp(source_reader)?;
             unsafe {
                 proc_amp.Set(id, int_value, flags).map_err(|e| {
-                    CameraError::Other(format!("Failed to set VideoProcAmp value: {}", e))
+                    super::native_error(
+                        crate::CameraErrorKind::ControlFailure,
+                        crate::OperationStage::BackendCommand,
+                        "set VideoProcAmp value",
+                        e,
+                    )
                 })?;
             }
         }
@@ -211,7 +238,12 @@ pub(crate) fn set_control(
             let cam_ctrl = get_camera_control(source_reader)?;
             unsafe {
                 cam_ctrl.Set(id, int_value, flags).map_err(|e| {
-                    CameraError::Other(format!("Failed to set CameraControl value: {}", e))
+                    super::native_error(
+                        crate::CameraErrorKind::ControlFailure,
+                        crate::OperationStage::BackendCommand,
+                        "set CameraControl value",
+                        e,
+                    )
                 })?;
             }
         }
@@ -220,7 +252,7 @@ pub(crate) fn set_control(
     Ok(())
 }
 
-/// 获取控制范围
+/// Returns a control range.
 pub(crate) fn get_control_range(
     source_reader: &IMFSourceReader,
     control: CameraControlType,
@@ -228,18 +260,17 @@ pub(crate) fn get_control_range(
     if let Some(base) = automatic_base(control) {
         let range = get_control_range(source_reader, base)?;
         if !range.supports_auto {
-            return Err(CameraError::ControlNotSupported(
+            return Err(CameraError::control_not_supported(
                 "Automatic mode unavailable".into(),
             ));
         }
         // GetRange exposes capability flags, not an automatic-mode default.
-        return Err(CameraError::NotReadable(
+        return Err(CameraError::control_not_readable(
             "Automatic mode default/range is not reported by Media Foundation".into(),
         ));
     }
-    let mf_id = control_type_to_mf_id(control).ok_or_else(|| {
-        CameraError::UnsupportedFormat(format!("Unsupported control: {:?}", control))
-    })?;
+    let mf_id = control_type_to_mf_id(control)
+        .ok_or_else(|| CameraError::control_not_supported(format!("{control:?}")))?;
 
     let mut min = 0i32;
     let mut max = 0i32;
@@ -254,7 +285,12 @@ pub(crate) fn get_control_range(
                 proc_amp
                     .GetRange(id, &mut min, &mut max, &mut step, &mut default, &mut flags)
                     .map_err(|e| {
-                        CameraError::Other(format!("Failed to get VideoProcAmp range: {}", e))
+                        super::native_error(
+                            crate::CameraErrorKind::ControlFailure,
+                            crate::OperationStage::BackendCommand,
+                            "get VideoProcAmp range",
+                            e,
+                        )
                     })?;
             }
         }
@@ -264,7 +300,12 @@ pub(crate) fn get_control_range(
                 cam_ctrl
                     .GetRange(id, &mut min, &mut max, &mut step, &mut default, &mut flags)
                     .map_err(|e| {
-                        CameraError::Other(format!("Failed to get CameraControl range: {}", e))
+                        super::native_error(
+                            crate::CameraErrorKind::ControlFailure,
+                            crate::OperationStage::BackendCommand,
+                            "get CameraControl range",
+                            e,
+                        )
                     })?;
             }
         }
@@ -279,7 +320,7 @@ pub(crate) fn get_control_range(
     })
 }
 
-/// 检查是否支持指定控制
+/// Checks whether a control is supported.
 pub(crate) fn supports_control(
     source_reader: &IMFSourceReader,
     control: CameraControlType,
@@ -290,7 +331,7 @@ pub(crate) fn supports_control(
     get_control_range(source_reader, control).is_ok()
 }
 
-/// 获取所有支持的控制类型
+/// Returns all supported control types.
 pub(crate) fn get_supported_controls(source_reader: &IMFSourceReader) -> Vec<CameraControlType> {
     let all_controls = [
         CameraControlType::Brightness,

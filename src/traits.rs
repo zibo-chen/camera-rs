@@ -1,8 +1,8 @@
-//! 简化的摄像头接口定义
+//! Simplified camera interface definitions.
 //!
-//! 专注于两个核心功能：
-//! 1. 获取相机配置支持
-//! 2. 异步视频流处理
+//! The interfaces focus on two core capabilities:
+//! 1. Querying supported camera configurations.
+//! 2. Processing asynchronous video streams.
 
 use crate::pixels::Pixels as Array3;
 use crate::{
@@ -11,19 +11,19 @@ use crate::{
 };
 use std::time::Duration;
 
-/// 简化的摄像头管理接口
+/// Simplified camera management interface.
 pub trait CameraManager {
-    /// 列出所有可用的摄像头设备
+    /// Lists all available camera devices.
     fn list_devices() -> CameraResult<Vec<CameraDeviceInfo>>;
 
-    /// 获取设备支持的配置选项
+    /// Returns the configurations supported by a device.
     fn get_supported_configs(device_index: u32) -> CameraResult<Vec<CameraConfig>>;
 
-    /// 检查特定配置是否被设备支持
+    /// Checks whether a device supports a specific configuration.
     fn is_config_supported(device_index: u32, config: &CameraConfig) -> CameraResult<bool>;
 }
 
-/// 基于 ringbuf 的流式摄像头接口
+/// Streaming camera interface backed by a ring buffer.
 #[allow(async_fn_in_trait)]
 pub trait StreamingCamera: Send + Sync {
     /// Shared snapshots supplied by native callback/worker backends.
@@ -33,7 +33,7 @@ pub trait StreamingCamera: Send + Sync {
 
     fn get_shared_frame(&self) -> CameraResult<Option<std::sync::Arc<crate::CapturedFrame>>> {
         self.frame_hub().map(|hub| hub.latest()).ok_or_else(|| {
-            crate::CameraError::StreamError("Shared frames unavailable for this backend".into())
+            crate::CameraError::stream_error("Shared frames unavailable for this backend".into())
         })
     }
 
@@ -44,61 +44,63 @@ pub trait StreamingCamera: Send + Sync {
     ) -> CameraResult<std::sync::Arc<crate::CapturedFrame>> {
         self.frame_hub()
             .ok_or_else(|| {
-                crate::CameraError::StreamError("Shared frames unavailable for this backend".into())
+                crate::CameraError::stream_error(
+                    "Shared frames unavailable for this backend".into(),
+                )
             })?
             .wait_after(after, timeout)
             .await
     }
-    /// 启动异步视频流
+    /// Starts the asynchronous video stream.
     ///
-    /// 启动后，视频帧会在后台持续捕获并存储在 ring buffer 中
+    /// Once started, frames are captured in the background and stored in the ring buffer.
     async fn start_stream(&self, config: CameraConfig) -> CameraResult<()>;
 
-    /// 停止视频流
+    /// Stops the video stream.
     async fn stop_stream(&self) -> CameraResult<()>;
 
-    /// 立即获取最新的一帧（非阻塞）
+    /// Returns the latest frame immediately without blocking.
     ///
-    /// 返回 None 如果缓冲区为空
-    /// 返回 Array3<u8> 形状为 (height, width, 3) 的 RGB 数据
+    /// Returns `None` when the buffer is empty.
+    /// The returned `Array3<u8>` contains RGB data shaped as `(height, width, 3)`.
     fn get_latest_frame(&self) -> CameraResult<Option<Array3<u8>>>;
 
-    /// 等待并获取下一帧（带超时）
-    /// 返回 Array3<u8> 形状为 (height, width, 3) 的 RGB 数据
+    /// Waits for the next frame until the timeout expires.
+    /// The returned `Array3<u8>` contains RGB data shaped as `(height, width, 3)`.
     async fn wait_for_frame(&self, timeout: Duration) -> CameraResult<Array3<u8>>;
 
-    /// 检查流是否正在运行
+    /// Returns whether the stream is running.
     fn is_streaming(&self) -> bool;
 
-    /// 获取当前配置
+    /// Returns the current configuration.
     fn get_config(&self) -> Option<CameraConfig>;
 
-    /// 获取流状态统计
+    /// Returns stream statistics.
     fn get_stats(&self) -> StreamStats;
 
-    /// 设置缓冲区大小（重新配置 ring buffer）
+    /// Sets the buffer size by reconfiguring the ring buffer.
     async fn set_buffer_size(&self, size: usize) -> CameraResult<()>;
 }
 
-/// 流统计信息
+/// Stream statistics.
 #[derive(Debug, Clone, Default)]
 pub struct StreamStats {
-    /// 总捕获帧数
+    /// Total number of captured frames.
     pub total_frames: u64,
-    /// 丢弃的帧数（缓冲区满时）
+    /// Number of frames dropped because the buffer was full.
     pub dropped_frames: u64,
-    /// 当前 FPS
+    /// Current frame rate.
     pub current_fps: f64,
-    /// 缓冲区当前大小
+    /// Current buffer capacity.
     pub buffer_size: usize,
-    /// 缓冲区中当前帧数
+    /// Current number of frames in the buffer.
     pub buffered_frames: usize,
-    /// 运行时长（秒）
+    /// Running time in seconds.
     pub uptime_seconds: u64,
 }
 
 impl StreamStats {
-    /// 计算丢帧率
+    /// Calculates the frame drop ratio.
     pub fn drop_rate(&self) -> f64 {
         if self.total_frames == 0 {
             0.0
@@ -107,7 +109,7 @@ impl StreamStats {
         }
     }
 
-    /// 计算缓冲区使用率
+    /// Calculates buffer utilization.
     pub fn buffer_usage(&self) -> f64 {
         if self.buffer_size == 0 {
             0.0
@@ -118,49 +120,51 @@ impl StreamStats {
 }
 
 // ============================================================================
-// 摄像头控制接口
+// Camera control interface.
 // ============================================================================
 
-/// 摄像头控制参数接口
+/// Camera control parameter interface.
 #[allow(async_fn_in_trait)]
 pub trait CameraControl {
-    /// 获取指定控制参数的当前值
+    /// Returns the current value of the specified control.
     fn get_control(&self, control: CameraControlType) -> CameraResult<CameraControlValue>;
 
-    /// 设置指定控制参数的值
+    /// Sets the specified control value.
     fn set_control(
         &self,
         control: CameraControlType,
         value: CameraControlValue,
     ) -> CameraResult<()>;
 
-    /// 获取指定控制参数的取值范围
+    /// Returns the valid range for the specified control.
     fn get_control_range(&self, control: CameraControlType) -> CameraResult<CameraControlRange>;
 
-    /// 检查设备是否支持指定的控制参数
+    /// Checks whether the device supports the specified control.
     fn supports_control(&self, control: CameraControlType) -> bool;
 
-    /// 获取设备支持的所有控制参数
+    /// Returns all controls supported by the device.
     fn get_supported_controls(&self) -> Vec<CameraControlType>;
 
-    /// 将控制参数重置为默认值
+    /// Resets the specified control to its default value.
     fn reset_control(&self, control: CameraControlType) -> CameraResult<()> {
         let range = self.get_control_range(control)?;
         self.set_control(control, CameraControlValue::manual(range.default))
     }
 
-    /// 将所有控制参数重置为默认值
+    /// Resets all controls to their default values.
     fn reset_all_controls(&self) -> CameraResult<()> {
         let mut failures = Vec::new();
         for control in self.get_supported_controls() {
             if let Err(error) = self.reset_control(control) {
-                failures.push(format!("{control:?}: {error}"));
+                failures.push(std::sync::Arc::new(
+                    error.with_operation(format!("{control:?}")),
+                ));
             }
         }
         if failures.is_empty() {
             Ok(())
         } else {
-            Err(crate::CameraError::ControlBatch(failures))
+            Err(crate::CameraError::control_batch(failures))
         }
     }
 }
@@ -184,19 +188,19 @@ mod camera_control_tests {
     fn test_stream_stats_drop_rate() {
         let mut stats = StreamStats::default();
 
-        // 没有帧时应该返回0
+        // No captured frames means a zero drop ratio.
         assert_eq!(stats.drop_rate(), 0.0);
 
-        // 有帧但没有丢帧
+        // Captured frames with no drops.
         stats.total_frames = 100;
         stats.dropped_frames = 0;
         assert_eq!(stats.drop_rate(), 0.0);
 
-        // 有丢帧
+        // Some captured frames were dropped.
         stats.dropped_frames = 10;
         assert_eq!(stats.drop_rate(), 0.1);
 
-        // 全部丢帧
+        // Every captured frame was dropped.
         stats.dropped_frames = 100;
         assert_eq!(stats.drop_rate(), 1.0);
     }
@@ -205,19 +209,19 @@ mod camera_control_tests {
     fn test_stream_stats_buffer_usage() {
         let mut stats = StreamStats::default();
 
-        // 没有缓冲区时应该返回0
+        // No buffer means zero utilization.
         assert_eq!(stats.buffer_usage(), 0.0);
 
-        // 空缓冲区
+        // Empty buffer.
         stats.buffer_size = 10;
         stats.buffered_frames = 0;
         assert_eq!(stats.buffer_usage(), 0.0);
 
-        // 半满缓冲区
+        // Half-full buffer.
         stats.buffered_frames = 5;
         assert_eq!(stats.buffer_usage(), 0.5);
 
-        // 满缓冲区
+        // Full buffer.
         stats.buffered_frames = 10;
         assert_eq!(stats.buffer_usage(), 1.0);
     }

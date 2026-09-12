@@ -6,112 +6,185 @@ use crate::{
     CameraResult,
 };
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+/// Backend-neutral identifier for a camera control.
 pub enum ControlId {
+    /// The `ExposureMode` variant.
     ExposureMode,
+    /// The `ExposureTime` variant.
     ExposureTime,
+    /// The `ExposureCompensation` variant.
     ExposureCompensation,
+    /// The `FocusMode` variant.
     FocusMode,
+    /// The `FocusPosition` variant.
     FocusPosition,
+    /// The `WhiteBalanceMode` variant.
     WhiteBalanceMode,
+    /// The `WhiteBalanceTemperature` variant.
     WhiteBalanceTemperature,
+    /// The `Zoom` variant.
     Zoom,
+    /// The `Brightness` variant.
     Brightness,
+    /// The `Contrast` variant.
     Contrast,
+    /// The `Hue` variant.
     Hue,
+    /// The `Saturation` variant.
     Saturation,
+    /// The `Sharpness` variant.
     Sharpness,
+    /// The `Gamma` variant.
     Gamma,
+    /// The `BacklightCompensation` variant.
     BacklightCompensation,
+    /// The `Gain` variant.
     Gain,
+    /// The `Pan` variant.
     Pan,
+    /// The `Tilt` variant.
     Tilt,
+    /// The `Iris` variant.
     Iris,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// Unit or representation used by a numeric control value.
 pub enum ControlUnit {
+    /// The `Boolean` variant.
     Boolean,
+    /// The `Mode` variant.
     Mode,
+    /// The `Native` variant.
     Native,
+    /// The `HundredMicroseconds` variant.
     HundredMicroseconds,
+    /// The `Log2Seconds` variant.
     Log2Seconds,
+    /// The `MilliEv` variant.
     MilliEv,
+    /// The `CompensationIndex` variant.
     CompensationIndex,
+    /// The `Kelvin` variant.
     Kelvin,
+    /// The `Percent` variant.
     Percent,
+    /// The `Degrees` variant.
     Degrees,
+    /// The `ArcSeconds` variant.
     ArcSeconds,
+    /// The `Iso` variant.
     Iso,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// Common operating modes for automatic and manual controls.
 pub enum ControlMode {
+    /// The `Manual` variant.
     Manual,
+    /// The `Automatic` variant.
     Automatic,
+    /// The `Locked` variant.
     Locked,
+    /// The `Single` variant.
     Single,
+    /// The `Continuous` variant.
     Continuous,
 }
 #[derive(Clone, Debug, PartialEq)]
+/// Numeric or mode value accepted by the control API.
 pub enum ControlValue {
+    /// The `Number` variant.
     Number(f64),
+    /// The `Mode` variant.
     Mode(ControlMode),
 }
 #[derive(Clone, Debug, PartialEq)]
+/// Indicates whether a returned value is measured, requested, or unavailable.
 pub enum ControlReadback {
+    /// Value confirmed by the camera backend.
     Actual(ControlValue),
+    /// Requested value retained because the backend cannot read it back.
     Requested(ControlValue),
+    /// The backend cannot report either an actual or requested value.
     Unknown,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// Validated white-balance temperature in kelvin.
 pub struct Kelvin(u32);
 impl Kelvin {
+    /// Creates a temperature in the supported 1,000–40,000 K range.
     pub fn new(value: u32) -> CameraResult<Self> {
         if !(1_000..=40_000).contains(&value) {
-            return Err(CameraError::InvalidConfig(
+            return Err(CameraError::invalid_config(
                 "White-balance temperature must be 1000..=40000 K".into(),
             ));
         }
         Ok(Self(value))
     }
+    /// Returns the temperature in kelvin.
     pub const fn get(self) -> u32 {
         self.0
     }
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// Possible values for `Exposure`.
 pub enum Exposure {
+    /// The `Auto` variant.
     Auto,
+    /// The `Manual` variant.
     Manual(std::time::Duration),
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// Possible values for `WhiteBalance`.
 pub enum WhiteBalance {
+    /// The `Auto` variant.
     Auto,
+    /// The `Temperature` variant.
     Temperature(Kelvin),
 }
 #[derive(Clone, Copy, Debug, PartialEq)]
+/// Possible values for `Focus`.
 pub enum Focus {
+    /// The `Auto` variant.
     Auto,
+    /// The `Position` variant.
     Position(f64),
 }
 #[derive(Clone, Debug)]
+/// Numeric limits and optional default for a camera control.
 pub struct ControlRange {
+    /// The min value.
     pub min: f64,
+    /// The max value.
     pub max: f64,
+    /// The step value.
     pub step: Option<f64>,
+    /// The default value.
     pub default: Option<ControlValue>,
 }
 #[derive(Clone, Debug)]
+/// Capabilities and access rules for one camera control.
 pub struct ControlDescriptor {
+    /// The id value.
     pub id: ControlId,
+    /// The unit value.
     pub unit: ControlUnit,
+    /// The readable value.
     pub readable: bool,
+    /// The writable value.
     pub writable: Option<bool>,
+    /// The range value.
     pub range: Option<ControlRange>,
+    /// The modes value.
     pub modes: Vec<ControlMode>,
     /// Some controls only apply while the associated automatic mode is disabled.
     pub requires_manual: Option<ControlId>,
 }
 #[derive(Debug)]
+/// Result of applying one item from a batch of control changes.
 pub struct ControlOutcome {
+    /// The id value.
     pub id: ControlId,
+    /// The result value.
     pub result: CameraResult<()>,
 }
 fn mapping(backend: BackendType, id: ControlId) -> CameraResult<(Raw, ControlUnit)> {
@@ -119,7 +192,7 @@ fn mapping(backend: BackendType, id: ControlId) -> CameraResult<(Raw, ControlUni
     use ControlUnit as U;
     let av = backend == BackendType::AVFoundation;
     let c2 = backend == BackendType::Camera2;
-    let unsupported = || CameraError::ControlNotSupported(format!("{id:?} on {backend}"));
+    let unsupported = || CameraError::control_not_supported(format!("{id:?} on {backend}"));
     Ok(match id {
         ExposureMode => (if av { Raw::Exposure } else { Raw::AutoExposure }, U::Mode),
         ExposureTime if av || c2 => return Err(unsupported()),
@@ -191,7 +264,11 @@ fn decode(backend: BackendType, id: ControlId, value: RawValue) -> CameraResult<
                 Some(0) => ControlMode::Locked,
                 Some(1) => ControlMode::Single,
                 Some(2) => ControlMode::Continuous,
-                _ => return Err(CameraError::NotReadable("Unknown native mode".into())),
+                _ => {
+                    return Err(CameraError::control_not_readable(
+                        "Unknown native mode".into(),
+                    ))
+                }
             }
         } else if value.as_bool().unwrap_or(false) {
             ControlMode::Automatic
@@ -204,7 +281,7 @@ fn decode(backend: BackendType, id: ControlId, value: RawValue) -> CameraResult<
             RawValue::Float(v) => v as f64,
             _ => value
                 .as_i32()
-                .ok_or_else(|| CameraError::NotReadable("Native numeric value".into()))?
+                .ok_or_else(|| CameraError::control_not_readable("Native numeric value".into()))?
                 as f64,
         }))
     }
@@ -239,7 +316,7 @@ fn descriptor(camera: &BackendCamera, id: ControlId) -> CameraResult<ControlDesc
     let backend = camera.backend_type();
     let (raw, unit) = mapping(backend, id)?;
     if !camera.supports_control(raw) {
-        return Err(CameraError::ControlNotSupported(format!("{id:?}")));
+        return Err(CameraError::control_not_supported(format!("{id:?}")));
     }
     let readable = backend != BackendType::Camera2 && camera.get_control(raw).is_ok();
     let range = camera
@@ -338,7 +415,7 @@ impl CaptureSession {
             for &id in IDS {
                 match descriptor(&c, id) {
                     Ok(descriptor) => controls.push(descriptor),
-                    Err(CameraError::ControlNotSupported(_)) => {}
+                    Err(error) if error.kind() == crate::CameraErrorKind::ControlNotSupported => {}
                     Err(error) => return Err(error),
                 }
             }
@@ -355,7 +432,7 @@ impl CaptureSession {
             .await;
         match actual {
             Ok(v) => Ok(ControlReadback::Actual(v)),
-            Err(CameraError::NotReadable(_)) => Ok(self
+            Err(error) if error.kind() == crate::CameraErrorKind::ControlNotReadable => Ok(self
                 .requested_control(id)
                 .map_or(ControlReadback::Unknown, ControlReadback::Requested)),
             Err(e) => Err(e),
@@ -368,12 +445,14 @@ impl CaptureSession {
             let (raw, unit) = mapping(backend, id)?;
             let desc = descriptor(&c, id)?;
             if desc.writable == Some(false) {
-                return Err(CameraError::ControlNotSupported("Read-only control".into()));
+                return Err(CameraError::control_not_supported(
+                    "Read-only control".into(),
+                ));
             }
             let raw_value = match value {
                 ControlValue::Mode(mode) if unit == ControlUnit::Mode => {
                     if !desc.modes.contains(&mode) {
-                        return Err(CameraError::InvalidConfig("Invalid control mode".into()));
+                        return Err(CameraError::invalid_config("Invalid control mode".into()));
                     }
                     #[cfg(all(
                         any(feature = "native", feature = "backend-camera2"),
@@ -386,7 +465,7 @@ impl CaptureSession {
                             .into_iter()
                             .find(|&value| camera2_mode(id, value) == Some(mode))
                             .ok_or_else(|| {
-                                CameraError::ControlNotSupported("Camera2 mode".into())
+                                CameraError::control_not_supported("Camera2 mode".into())
                             })?;
                         return c.set_control(raw, RawValue::manual(value));
                     }
@@ -407,7 +486,7 @@ impl CaptureSession {
                         || v < i32::MIN as f64
                         || v > i32::MAX as f64
                     {
-                        return Err(CameraError::InvalidConfig(
+                        return Err(CameraError::invalid_config(
                             "Native control expects a finite representable integer".into(),
                         ));
                     }
@@ -418,7 +497,7 @@ impl CaptureSession {
                                 .step
                                 .is_some_and(|step| step > 0.0 && (v - range.min) % step != 0.0)
                         {
-                            return Err(CameraError::InvalidConfig(
+                            return Err(CameraError::invalid_config(
                                 "Control value outside native range/step".into(),
                             ));
                         }
@@ -426,7 +505,7 @@ impl CaptureSession {
                     RawValue::manual(v as i32)
                 }
                 _ => {
-                    return Err(CameraError::InvalidConfig(
+                    return Err(CameraError::invalid_config(
                         "Control value kind differs from descriptor".into(),
                     ))
                 }
@@ -458,7 +537,7 @@ impl CaptureSession {
             let result = if let Some(value) = desc.range.and_then(|r| r.default) {
                 self.set_control(desc.id, value).await
             } else {
-                Err(CameraError::ControlNotSupported(
+                Err(CameraError::control_not_supported(
                     "Native default is unavailable".into(),
                 ))
             };
@@ -476,19 +555,19 @@ impl CaptureSession {
             .await?
             .into_iter()
             .find(|c| c.id == ControlId::ExposureTime)
-            .ok_or_else(|| CameraError::ControlNotSupported("Exposure duration".into()))?
+            .ok_or_else(|| CameraError::control_not_supported("Exposure duration".into()))?
             .unit;
         let value = match unit {
             ControlUnit::HundredMicroseconds => duration.as_secs_f64() * 10_000.0,
             ControlUnit::Log2Seconds => duration.as_secs_f64().log2(),
             _ => {
-                return Err(CameraError::ControlNotSupported(
+                return Err(CameraError::control_not_supported(
                     "Exposure duration unit".into(),
                 ))
             }
         };
         if !value.is_finite() || (value - value.round()).abs() > 1e-6 {
-            return Err(CameraError::InvalidConfig(
+            return Err(CameraError::invalid_config(
                 "Duration is not representable in the native control unit".into(),
             ));
         }

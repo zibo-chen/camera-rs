@@ -1,9 +1,9 @@
-//! FFI 绑定到 libuvc C 库
+//! FFI bindings for the libuvc C library.
 
 use libc::{c_char, c_int, c_void, size_t, timespec, timeval};
 
 // ============================================================================
-// 错误码定义
+// Error codes.
 // ============================================================================
 
 pub type UvcError = c_int;
@@ -23,9 +23,8 @@ pub const UVC_ERROR_NO_MEM: UvcError = -11;
 pub const UVC_ERROR_NOT_SUPPORTED: UvcError = -12;
 
 // ============================================================================
-// 帧格式枚举
-// 必须与 libuvc/include/libuvc/libuvc.h 中的 enum uvc_frame_format 保持一致
-// 经过 C 编译器验证的正确值：
+// Frame format values. These must match enum uvc_frame_format in
+// libuvc/include/libuvc/libuvc.h and are verified by the C ABI probe.
 //   UNKNOWN=0, UNCOMPRESSED=1, COMPRESSED=2, YUYV=3, UYVY=4,
 //   RGB=5, BGR=6, MJPEG=7, H264=8, GRAY8=9, GRAY16=10
 // ============================================================================
@@ -34,7 +33,7 @@ pub const UVC_ERROR_NOT_SUPPORTED: UvcError = -12;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UvcFrameFormat {
     Unknown = 0,
-    // Any = 0,  // 与 Unknown 相同
+    // Any = 0,  // Same value as Unknown.
     Uncompressed = 1,
     Compressed = 2,
     Yuyv = 3,
@@ -45,7 +44,7 @@ pub enum UvcFrameFormat {
     H264 = 8,
     Gray8 = 9,
     Gray16 = 10,
-    // 以下是 Bayer 格式
+    // Bayer formats.
     By8 = 11,
     Ba81 = 12,
     Sgrbg8 = 13,
@@ -55,12 +54,12 @@ pub enum UvcFrameFormat {
     // YUV420
     Nv12 = 17,
     P010 = 18,
-    // Count (用于边界检查)
+    // Count sentinel used for bounds checking.
     // Count = 19,
 }
 
 // ============================================================================
-// UVC 请求代码枚举
+// UVC request codes.
 // ============================================================================
 
 #[repr(u8)]
@@ -78,7 +77,7 @@ pub enum UvcReqCode {
 }
 
 // ============================================================================
-// 不透明结构体（仅声明）
+// Opaque structure declarations.
 // ============================================================================
 
 #[repr(C)]
@@ -96,9 +95,9 @@ pub struct UvcDeviceHandle {
     _private: [u8; 0],
 }
 
-/// 流控制结构体
-/// 必须与 libuvc 中的 uvc_stream_ctrl_t 完全匹配
-/// 总大小: 40 字节 (经 C 编译器验证)
+/// Stream control structure.
+/// Must exactly match libuvc's `uvc_stream_ctrl_t`.
+/// The C ABI probe verifies its 40-byte size.
 #[repr(C)]
 pub struct UvcStreamCtrl {
     pub bm_hint: u16,            // offset 0
@@ -128,7 +127,7 @@ pub struct LibusbContext {
 }
 
 // ============================================================================
-// 格式和帧描述符
+// Format and frame descriptors.
 // ============================================================================
 
 #[repr(C)]
@@ -176,7 +175,7 @@ pub struct UvcFrameDesc {
 }
 
 // ============================================================================
-// 设备描述符
+// Device descriptor.
 // ============================================================================
 
 #[repr(C)]
@@ -190,14 +189,13 @@ pub struct UvcDeviceDescriptor {
 }
 
 // ============================================================================
-// 帧结构体
-// 必须与 libuvc/include/libuvc/libuvc.h 中的 uvc_frame 结构体完全匹配
-// 在 macOS ARM64 上：
+// Frame structure. This must exactly match struct uvc_frame in
+// libuvc/include/libuvc/libuvc.h. On macOS ARM64:
 //   - size_t = 8 bytes
 //   - uint32_t = 4 bytes
 //   - timeval = 16 bytes (tv_sec: i64, tv_usec: i32 + 4 padding)
 //   - timespec = 16 bytes (tv_sec: i64, tv_nsec: i64)
-//   - 指针 = 8 bytes
+//   - pointer = 8 bytes
 // ============================================================================
 
 #[repr(C)]
@@ -238,7 +236,7 @@ pub struct UvcFrame {
 }
 
 // ============================================================================
-// 流控制结构体
+// Stream control structure.
 // ============================================================================
 
 #[repr(C)]
@@ -258,7 +256,7 @@ pub struct UvcStreamCtrlParams {
 }
 
 // ============================================================================
-// 回调函数类型
+// Callback types.
 // ============================================================================
 
 pub type UvcFrameCallback = extern "C" fn(frame: *mut UvcFrame, user_ptr: *mut c_void);
@@ -276,34 +274,34 @@ pub type UvcStatusCallback = extern "C" fn(
 pub type UvcButtonCallback = extern "C" fn(button: c_int, state: c_int, user_ptr: *mut c_void);
 
 // ============================================================================
-// libusb 选项（用于 Android 支持）
+// libusb options used for Android support.
 // ============================================================================
 
-/// libusb 选项枚举
+/// libusb option values.
 #[repr(C)]
 pub enum LibusbOption {
-    /// 使用 UsbDk 后端（仅 Windows）
+    /// Uses the UsbDk backend on Windows.
     UseUsbdk = 1,
-    /// 不进行设备发现（Android 需要）
+    /// Disables device discovery as required by the Android FD path.
     NoDeviceDiscovery = 2,
 }
 
 // ============================================================================
-// FFI 函数声明
+// FFI function declarations.
 // ============================================================================
 
 extern "C" {
-    // libusb 选项设置（Android 需要）
-    /// 设置 libusb 选项
-    /// 当 ctx 为 NULL 时，设置全局默认选项
+    // libusb option setup for Android.
+    /// Sets a libusb option.
+    /// A null context changes the global default.
     pub fn libusb_set_option(ctx: *mut LibusbContext, option: LibusbOption, ...) -> c_int;
 
-    // 上下文管理
+    // Context management.
     pub fn uvc_init(ctx: *mut *mut UvcContext, usb_ctx: *mut LibusbContext) -> UvcError;
     pub fn uvc_init2(ctx: *mut *mut UvcContext, usb_ctx: *mut LibusbContext) -> UvcError;
     pub fn uvc_exit(ctx: *mut UvcContext);
 
-    // 设备发现
+    // Device discovery.
     pub fn uvc_find_device(
         ctx: *mut UvcContext,
         dev: *mut *mut UvcDevice,
@@ -316,7 +314,7 @@ extern "C" {
 
     pub fn uvc_free_device_list(list: *mut *mut UvcDevice, unref_devices: u8);
 
-    // 设备描述符
+    // Device descriptors.
     pub fn uvc_get_device_descriptor(
         dev: *mut UvcDevice,
         desc: *mut *mut UvcDeviceDescriptor,
@@ -324,18 +322,18 @@ extern "C" {
 
     pub fn uvc_free_device_descriptor(desc: *mut UvcDeviceDescriptor);
 
-    // 设备引用
+    // Device references.
     pub fn uvc_ref_device(dev: *mut UvcDevice);
     pub fn uvc_unref_device(dev: *mut UvcDevice);
 
-    // 设备打开/关闭
+    // Device open and close.
     pub fn uvc_open(dev: *mut UvcDevice, devh: *mut *mut UvcDeviceHandle) -> UvcError;
     pub fn uvc_close(devh: *mut UvcDeviceHandle);
 
-    // Android 文件描述符支持
+    // Android file descriptor support.
     pub fn uvc_wrap(fd: c_int, ctx: *mut UvcContext, devh: *mut *mut UvcDeviceHandle) -> UvcError;
 
-    // 流控制
+    // Stream control.
     pub fn uvc_get_stream_ctrl_format_size(
         devh: *mut UvcDeviceHandle,
         ctrl: *mut UvcStreamCtrl,
@@ -356,24 +354,24 @@ extern "C" {
 
     pub fn uvc_stop_streaming(devh: *mut UvcDeviceHandle);
 
-    // 格式枚举
+    // Format enumeration.
     pub fn uvc_get_format_descs(devh: *mut UvcDeviceHandle) -> *const UvcFormatDesc;
 
-    // 帧管理
+    // Frame management.
     pub fn uvc_allocate_frame(data_bytes: size_t) -> *mut UvcFrame;
     pub fn uvc_free_frame(frame: *mut UvcFrame);
 
-    // 注意：MJPEG 解码现在使用 Rust 的 turbojpeg crate
-    // 不再需要 uvc_mjpeg2rgb, uvc_yuyv2rgb 等 C 函数
+    // MJPEG decoding now uses the Rust turbojpeg crate, so the C conversion
+    // functions such as uvc_mjpeg2rgb and uvc_yuyv2rgb are not required.
 
-    // ==================== 摄像头控制参数 ====================
+    // ==================== Camera controls ====================
 
-    // 自动曝光模式
+    // Automatic exposure mode.
     pub fn uvc_get_ae_mode(devh: *mut UvcDeviceHandle, mode: *mut u8, req_code: u8) -> UvcError;
 
     pub fn uvc_set_ae_mode(devh: *mut UvcDeviceHandle, mode: u8) -> UvcError;
 
-    // 曝光时间（绝对值）
+    // Absolute exposure time.
     pub fn uvc_get_exposure_abs(
         devh: *mut UvcDeviceHandle,
         time: *mut u32,
@@ -382,19 +380,19 @@ extern "C" {
 
     pub fn uvc_set_exposure_abs(devh: *mut UvcDeviceHandle, time: u32) -> UvcError;
 
-    // 焦距（绝对值）
+    // Absolute focus.
     pub fn uvc_get_focus_abs(devh: *mut UvcDeviceHandle, focus: *mut u16, req_code: u8)
         -> UvcError;
 
     pub fn uvc_set_focus_abs(devh: *mut UvcDeviceHandle, focus: u16) -> UvcError;
 
-    // 自动对焦
+    // Automatic focus.
     pub fn uvc_get_focus_auto(devh: *mut UvcDeviceHandle, state: *mut u8, req_code: u8)
         -> UvcError;
 
     pub fn uvc_set_focus_auto(devh: *mut UvcDeviceHandle, state: u8) -> UvcError;
 
-    // 变焦（绝对值）
+    // Absolute zoom.
     pub fn uvc_get_zoom_abs(
         devh: *mut UvcDeviceHandle,
         focal_length: *mut u16,
@@ -403,7 +401,7 @@ extern "C" {
 
     pub fn uvc_set_zoom_abs(devh: *mut UvcDeviceHandle, focal_length: u16) -> UvcError;
 
-    // 亮度
+    // Brightness.
     pub fn uvc_get_brightness(
         devh: *mut UvcDeviceHandle,
         brightness: *mut i16,
@@ -412,7 +410,7 @@ extern "C" {
 
     pub fn uvc_set_brightness(devh: *mut UvcDeviceHandle, brightness: i16) -> UvcError;
 
-    // 对比度
+    // Contrast.
     pub fn uvc_get_contrast(
         devh: *mut UvcDeviceHandle,
         contrast: *mut u16,
@@ -421,7 +419,7 @@ extern "C" {
 
     pub fn uvc_set_contrast(devh: *mut UvcDeviceHandle, contrast: u16) -> UvcError;
 
-    // 饱和度
+    // Saturation.
     pub fn uvc_get_saturation(
         devh: *mut UvcDeviceHandle,
         saturation: *mut u16,
@@ -430,12 +428,12 @@ extern "C" {
 
     pub fn uvc_set_saturation(devh: *mut UvcDeviceHandle, saturation: u16) -> UvcError;
 
-    // 色调
+    // Hue.
     pub fn uvc_get_hue(devh: *mut UvcDeviceHandle, hue: *mut i16, req_code: u8) -> UvcError;
 
     pub fn uvc_set_hue(devh: *mut UvcDeviceHandle, hue: i16) -> UvcError;
 
-    // 锐度
+    // Sharpness.
     pub fn uvc_get_sharpness(
         devh: *mut UvcDeviceHandle,
         sharpness: *mut u16,
@@ -444,12 +442,12 @@ extern "C" {
 
     pub fn uvc_set_sharpness(devh: *mut UvcDeviceHandle, sharpness: u16) -> UvcError;
 
-    // 伽马值
+    // Gamma.
     pub fn uvc_get_gamma(devh: *mut UvcDeviceHandle, gamma: *mut u16, req_code: u8) -> UvcError;
 
     pub fn uvc_set_gamma(devh: *mut UvcDeviceHandle, gamma: u16) -> UvcError;
 
-    // 白平衡温度
+    // White balance temperature.
     pub fn uvc_get_white_balance_temperature(
         devh: *mut UvcDeviceHandle,
         temperature: *mut u16,
@@ -461,7 +459,7 @@ extern "C" {
         temperature: u16,
     ) -> UvcError;
 
-    // 自动白平衡
+    // Automatic white balance.
     pub fn uvc_get_white_balance_temperature_auto(
         devh: *mut UvcDeviceHandle,
         state: *mut u8,
@@ -473,12 +471,12 @@ extern "C" {
         state: u8,
     ) -> UvcError;
 
-    // 增益
+    // Gain.
     pub fn uvc_get_gain(devh: *mut UvcDeviceHandle, gain: *mut u16, req_code: u8) -> UvcError;
 
     pub fn uvc_set_gain(devh: *mut UvcDeviceHandle, gain: u16) -> UvcError;
 
-    // 背光补偿
+    // Backlight compensation.
     pub fn uvc_get_backlight_compensation(
         devh: *mut UvcDeviceHandle,
         backlight_compensation: *mut u16,
@@ -490,7 +488,7 @@ extern "C" {
         backlight_compensation: u16,
     ) -> UvcError;
 
-    // 其他工具函数
+    // Additional utility functions.
     pub fn uvc_perror(err: UvcError, msg: *const c_char);
     pub fn uvc_strerror(err: UvcError) -> *const c_char;
 }

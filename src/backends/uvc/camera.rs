@@ -1,4 +1,4 @@
-//! UVC 摄像头实现
+//! UVC camera implementation.
 
 use super::context::{StreamCtrl, UvcContext, UvcDeviceHandle};
 use super::ffi;
@@ -68,7 +68,7 @@ pub struct UvcCamera {
 }
 
 impl UvcCamera {
-    /// 创建新的 UVC 摄像头实例
+    /// Creates a UVC camera instance.
     pub fn new(device_index: u32) -> Result<Self> {
         Self::new_with_hub(device_index, crate::FrameHub::default())
     }
@@ -103,16 +103,13 @@ impl UvcCamera {
 
     pub(crate) fn exposure_modes(&self) -> CameraResult<Vec<crate::ControlMode>> {
         let handle = self.device_handle.lock();
-        let handle = handle.as_ref().ok_or(CameraError::StreamStopped)?;
+        let handle = handle.as_ref().ok_or(CameraError::stream_stopped())?;
         let mut mask = 0;
         let code = unsafe {
             ffi::uvc_get_ae_mode(handle.as_ptr(), &mut mask, ffi::UvcReqCode::GetRes as u8)
         };
         if code != ffi::UVC_SUCCESS {
-            return Err(CameraError::UvcError {
-                code,
-                message: "Query exposure modes".into(),
-            });
+            return Err(CameraError::uvc(code, "Query exposure modes".into()));
         }
         let mut modes = Vec::new();
         if mask & 1 != 0 {
@@ -123,11 +120,11 @@ impl UvcCamera {
         }
         Ok(modes)
     }
-    /// 从文件描述符创建(Android 使用)
+    /// Creates a camera from an Android file descriptor.
     ///
-    /// 在 Android 上，应用程序无法直接访问 USB 设备节点。
-    /// 需要通过 UsbManager.openDevice() 获取 UsbDeviceConnection，
-    /// 然后调用 getFileDescriptor() 获取文件描述符传递给此方法。
+    /// Android applications cannot access USB device nodes directly. Use
+    /// `UsbManager.openDevice()` to obtain a `UsbDeviceConnection`, then pass
+    /// the value returned by `getFileDescriptor()` to this method.
     #[cfg(unix)]
     pub fn from_fd(fd: i32) -> Result<Self> {
         log::info!("Creating UvcCamera from file descriptor: {}", fd);
@@ -136,7 +133,7 @@ impl UvcCamera {
         let mut ctx = UvcContext::new()?;
         let devh = ctx.wrap_device(fd)?;
 
-        // 查询并打印设备支持的格式
+        // Query and log the formats supported by the device.
         Self::log_supported_formats(devh.as_ptr());
 
         *camera.context.lock() = Some(ctx);
@@ -146,7 +143,7 @@ impl UvcCamera {
         Ok(camera)
     }
 
-    /// 打印设备支持的所有格式
+    /// Logs all formats supported by the device.
     fn log_supported_formats(devh: *mut ffi::UvcDeviceHandle) {
         log::debug!(">>> Querying device supported formats...");
         unsafe {
@@ -180,7 +177,7 @@ impl UvcCamera {
                     format.guid_format
                 );
 
-                // 遍历帧描述符
+                // Visit each frame descriptor.
                 let mut frame_idx = 0;
                 let mut current_frame = format.frame_descs;
 
@@ -210,6 +207,55 @@ impl UvcCamera {
             }
             log::debug!("=== End of Supported Formats ===");
         }
+    }
+
+    fn supported_configs_from_handle(devh: *mut ffi::UvcDeviceHandle) -> Vec<CameraConfig> {
+        let mut configs = Vec::new();
+        unsafe {
+            let mut current_format = ffi::uvc_get_format_descs(devh);
+            while !current_format.is_null() {
+                let format = &*current_format;
+                if let Some(video_format) =
+                    Self::descriptor_format(format.b_descriptor_subtype as u8, &format.guid_format)
+                {
+                    let mut current_frame = format.frame_descs;
+                    while !current_frame.is_null() {
+                        let frame = &*current_frame;
+                        let width = frame.w_width as u32;
+                        let height = frame.w_height as u32;
+                        for frame_rate in Self::descriptor_frame_rates(frame) {
+                            if width > 0 && height > 0 {
+                                let candidate = CameraConfig::new(
+                                    video_format,
+                                    width,
+                                    height,
+                                    frame_rate.numerator(),
+                                )
+                                .with_frame_rate(frame_rate);
+                                if !configs.contains(&candidate) {
+                                    configs.push(candidate);
+                                }
+                            }
+                        }
+                        current_frame = frame.next;
+                    }
+                }
+                current_format = format.next;
+            }
+        }
+        configs
+    }
+
+    pub(crate) fn opened_device_capabilities(&self) -> CameraResult<crate::DeviceCapabilities> {
+        let handle = self.device_handle.lock();
+        let handle = handle.as_ref().ok_or_else(|| {
+            CameraError::invalid_state(
+                "UVC device must be open before querying capabilities".into(),
+            )
+        })?;
+        Ok(crate::DeviceCapabilities::from_configurations(
+            Self::supported_configs_from_handle(handle.as_ptr()),
+        ))
     }
 
     /// Compatibility shim; callbacks no longer require an Arc<UvcCamera>.
@@ -264,12 +310,12 @@ impl UvcCamera {
                         |rgb| {
                             crate::mjpeg::decode_with(&mut decoder, &job.data, |decoder, data| {
                                 let header = decoder.read_header(data).map_err(|error| {
-                                    CameraError::InvalidFormat(error.to_string())
+                                    CameraError::invalid_frame(error.to_string())
                                 })?;
                                 if header.width != job.width as usize
                                     || header.height != job.height as usize
                                 {
-                                    return Err(CameraError::InvalidFormat(
+                                    return Err(CameraError::invalid_frame(
                                         "MJPEG dimensions differ from negotiated frame".into(),
                                     ));
                                 }
@@ -284,7 +330,7 @@ impl UvcCamera {
                                             format: PixelFormat::RGB,
                                         },
                                     )
-                                    .map_err(|error| CameraError::InvalidFormat(error.to_string()))
+                                    .map_err(|error| CameraError::invalid_frame(error.to_string()))
                             })
                         },
                     );
@@ -295,7 +341,11 @@ impl UvcCamera {
                     worker_buffers.lock().push(job.data);
                 }
             })
-            .map_err(|error| CameraError::Other(format!("Start UVC MJPEG worker: {error}")))?;
+            .map_err(|error| {
+                CameraError::worker_failure(format!("Start UVC MJPEG worker: {error}"))
+                    .with_backend(crate::BackendId::UVC)
+                    .with_source(error)
+            })?;
         Ok((MjpegDispatch { sender, buffers }, worker))
     }
 
@@ -331,7 +381,7 @@ impl UvcCamera {
                     ffi::UvcFrameFormat::Bgr => crate::PixelFormat::Bgr8,
                     ffi::UvcFrameFormat::Gray8 => crate::PixelFormat::Gray8,
                     _ => {
-                        return Err(CameraError::UnsupportedFormat(
+                        return Err(CameraError::unsupported_format(
                             "Unsupported UVC native layout".into(),
                         ))
                     }
@@ -362,7 +412,7 @@ impl UvcCamera {
                 );
             }
             #[cfg(not(feature = "convert-rgb"))]
-            return Err(CameraError::UnsupportedFormat(
+            return Err(CameraError::unsupported_format(
                 "RGB delivery requires the convert-rgb feature".into(),
             ));
             #[cfg(feature = "convert-rgb")]
@@ -391,7 +441,7 @@ impl UvcCamera {
                             }
                             Err(mpsc::TrySendError::Disconnected(job)) => {
                                 dispatch.buffers.lock().push(job.data);
-                                Err(CameraError::StreamStopped)
+                                Err(CameraError::stream_stopped())
                             }
                         };
                     }
@@ -405,7 +455,7 @@ impl UvcCamera {
                     |rgb| match frame.frame_format {
                         ffi::UvcFrameFormat::Mjpeg => {
                             #[cfg(not(feature = "decode-mjpeg"))]
-                            return Err(CameraError::UnsupportedFormat(
+                            return Err(CameraError::unsupported_format(
                                 "MJPEG decoding requires the decode-mjpeg feature".into(),
                             ));
                             #[cfg(feature = "decode-mjpeg")]
@@ -414,11 +464,11 @@ impl UvcCamera {
                                 crate::mjpeg::decode_with(&mut guard, data, |decoder, data| {
                                     let header = decoder
                                         .read_header(data)
-                                        .map_err(|e| CameraError::InvalidFormat(e.to_string()))?;
+                                        .map_err(|e| CameraError::invalid_frame(e.to_string()))?;
                                     if header.width != frame.width as usize
                                         || header.height != frame.height as usize
                                     {
-                                        return Err(CameraError::InvalidFormat(
+                                        return Err(CameraError::invalid_frame(
                                             "MJPEG dimensions differ from negotiated frame".into(),
                                         ));
                                     }
@@ -433,18 +483,18 @@ impl UvcCamera {
                                                 format: PixelFormat::RGB,
                                             },
                                         )
-                                        .map_err(|e| CameraError::InvalidFormat(e.to_string()))
+                                        .map_err(|e| CameraError::invalid_frame(e.to_string()))
                                 })
                             }
                         }
                         ffi::UvcFrameFormat::Yuyv | ffi::UvcFrameFormat::Uyvy => {
                             let width = frame.width as usize;
                             let packed = width.checked_mul(2).ok_or_else(|| {
-                                CameraError::InvalidFormat("UVC row size overflow".into())
+                                CameraError::invalid_frame("UVC row size overflow".into())
                             })?;
                             let stride = if frame.step == 0 { packed } else { frame.step };
                             if stride < packed {
-                                return Err(CameraError::InvalidFormat(
+                                return Err(CameraError::invalid_frame(
                                     "UVC row stride is too short".into(),
                                 ));
                             }
@@ -467,11 +517,11 @@ impl UvcCamera {
                             }
                             for (y, row) in rgb.chunks_exact_mut(width * 3).enumerate() {
                                 let offset = y.checked_mul(stride).ok_or_else(|| {
-                                    CameraError::InvalidFormat("UVC stride overflow".into())
+                                    CameraError::invalid_frame("UVC stride overflow".into())
                                 })?;
                                 let src =
                                     data.get(offset..offset.saturating_add(packed)).ok_or_else(
-                                        || CameraError::InvalidFormat("Truncated UVC row".into()),
+                                        || CameraError::invalid_frame("Truncated UVC row".into()),
                                     )?;
                                 if frame.frame_format == ffi::UvcFrameFormat::Yuyv {
                                     context.state.converter.yuyv_to_rgb_into(
@@ -502,7 +552,7 @@ impl UvcCamera {
                             let packed = frame.width as usize * channels;
                             let stride = if frame.step == 0 { packed } else { frame.step };
                             if stride < packed {
-                                return Err(CameraError::InvalidFormat(
+                                return Err(CameraError::invalid_frame(
                                     "UVC stride too short".into(),
                                 ));
                             }
@@ -510,11 +560,11 @@ impl UvcCamera {
                                 rgb.chunks_exact_mut(frame.width as usize * 3).enumerate()
                             {
                                 let offset = y.checked_mul(stride).ok_or_else(|| {
-                                    CameraError::InvalidFormat("UVC row overflow".into())
+                                    CameraError::invalid_frame("UVC row overflow".into())
                                 })?;
                                 let src =
                                     data.get(offset..offset.saturating_add(packed)).ok_or_else(
-                                        || CameraError::InvalidFormat("Truncated UVC row".into()),
+                                        || CameraError::invalid_frame("Truncated UVC row".into()),
                                     )?;
                                 if channels == 1 {
                                     for (out, &gray) in
@@ -537,7 +587,7 @@ impl UvcCamera {
                             }
                             Ok(())
                         }
-                        _ => Err(CameraError::UnsupportedFormat(format!(
+                        _ => Err(CameraError::unsupported_format(format!(
                             "{:?}",
                             frame.frame_format
                         ))),
@@ -556,16 +606,15 @@ impl UvcCamera {
     #[cfg(feature = "decode-mjpeg")]
     #[allow(dead_code)]
     fn decode_mjpeg(jpeg_data: &[u8], width: u32, height: u32) -> Result<Vec<u8>> {
-        let mut decompressor = Decompressor::new().map_err(|e| {
-            CameraError::Other(format!("Failed to create JPEG decompressor: {}", e))
-        })?;
+        let mut decompressor = Decompressor::new()
+            .map_err(|e| CameraError::invalid_frame(e.to_string()).with_source(e))?;
 
-        // 读取 JPEG 头
+        // Read the JPEG header.
         let header = decompressor
             .read_header(jpeg_data)
-            .map_err(|e| CameraError::Other(format!("Failed to read JPEG header: {}", e)))?;
+            .map_err(|e| CameraError::invalid_frame(e.to_string()).with_source(e))?;
 
-        // 验证尺寸
+        // Validate the dimensions.
         if header.width != width as usize || header.height != height as usize {
             log::warn!(
                 "JPEG size mismatch: expected {}x{}, actual {}x{}",
@@ -576,7 +625,7 @@ impl UvcCamera {
             );
         }
 
-        // 准备输出缓冲区
+        // Prepare the output buffer.
         let mut image = Image {
             pixels: vec![0; 3 * header.width * header.height],
             width: header.width,
@@ -585,31 +634,31 @@ impl UvcCamera {
             format: PixelFormat::RGB,
         };
 
-        // 解压缩
+        // Decode the image.
         decompressor
             .decompress(jpeg_data, image.as_deref_mut())
-            .map_err(|e| CameraError::Other(format!("JPEG decompression failed: {}", e)))?;
+            .map_err(|e| CameraError::invalid_frame(e.to_string()).with_source(e))?;
 
         Ok(image.pixels)
     }
 
-    /// YUYV 转 RGB（兼容旧 API）
+    /// Converts YUYV to RGB for the compatibility API.
     #[cfg(feature = "convert-rgb")]
     #[allow(dead_code)]
     fn yuyv_to_rgb(yuyv_data: &[u8], width: u32, height: u32) -> Result<Vec<u8>> {
-        // 使用优化的颜色转换器
+        // Use the optimized color converter.
         ColorConverter::new().yuyv_to_rgb(yuyv_data, width, height)
     }
 
-    /// UYVY 转 RGB（兼容旧 API）
+    /// Converts UYVY to RGB for the compatibility API.
     #[cfg(feature = "convert-rgb")]
     #[allow(dead_code)]
     fn uyvy_to_rgb(uyvy_data: &[u8], width: u32, height: u32) -> Result<Vec<u8>> {
-        // 使用优化的颜色转换器
+        // Use the optimized color converter.
         ColorConverter::new().uyvy_to_rgb(uyvy_data, width, height)
     }
 
-    /// 转换格式枚举
+    /// Converts the public format enum into a libuvc format.
     fn format_to_uvc(format: VideoFormat) -> ffi::UvcFrameFormat {
         match format {
             VideoFormat::MJPEG => ffi::UvcFrameFormat::Mjpeg,
@@ -627,13 +676,13 @@ impl CameraManager for UvcCamera {
     fn list_devices() -> CameraResult<Vec<CameraDeviceInfo>> {
         #[cfg(target_os = "android")]
         {
-            Err(CameraError::PermissionDenied(
+            Err(CameraError::permission_denied(
                 "Enumerate USB devices with camera-android and pass an authorized BorrowedFd"
                     .into(),
             ))
         }
 
-        // 非 Android 平台: 使用 libuvc 扫描
+        // Non-Android platforms use libuvc discovery.
         #[cfg(not(target_os = "android"))]
         {
             let mut ctx = UvcContext::new()?;
@@ -647,8 +696,8 @@ impl CameraManager for UvcCamera {
                 }
             }
 
-            // CRITICAL: 确保 devices 在 context 之前被 drop
-            // 避免 "device still referenced at libusb_exit" 错误
+            // Drop devices before the context to avoid
+            // "device still referenced at libusb_exit".
             drop(devices);
             drop(ctx);
 
@@ -657,64 +706,19 @@ impl CameraManager for UvcCamera {
     }
 
     fn get_supported_configs(device_index: u32) -> CameraResult<Vec<CameraConfig>> {
-        // 打开设备并查询支持的格式
+        // Open the device and query its supported formats.
         let mut ctx = UvcContext::new()?;
         let devices = ctx.get_device_list()?;
 
         let device = devices.get(device_index as usize).ok_or_else(|| {
-            CameraError::DeviceNotFound(format!("Device index {} not found", device_index))
+            CameraError::device_not_found(format!("Device index {} not found", device_index))
         })?;
 
         let devh = device.open()?;
 
-        // 获取格式描述符
-        let mut configs = Vec::new();
-        unsafe {
-            let format_desc_ptr = ffi::uvc_get_format_descs(devh.as_ptr());
+        let configs = Self::supported_configs_from_handle(devh.as_ptr());
 
-            if !format_desc_ptr.is_null() {
-                let mut current_format = format_desc_ptr;
-
-                while !current_format.is_null() {
-                    let format = &*current_format;
-
-                    // 判断格式类型
-                    // 注意：b_descriptor_subtype 是 u32，但我们只需要低 8 位
-                    let video_format = Self::descriptor_format(
-                        format.b_descriptor_subtype as u8,
-                        &format.guid_format,
-                    );
-
-                    if let Some(vf) = video_format {
-                        // 遍历帧描述符
-                        let mut current_frame = format.frame_descs;
-
-                        while !current_frame.is_null() {
-                            let frame = &*current_frame;
-
-                            let width = frame.w_width as u32;
-                            let height = frame.w_height as u32;
-                            for fps in Self::descriptor_frame_rates(frame) {
-                                if width > 0 && height > 0 {
-                                    let candidate =
-                                        CameraConfig::new(vf, width, height, fps.numerator())
-                                            .with_frame_rate(fps);
-                                    if !configs.contains(&candidate) {
-                                        configs.push(candidate);
-                                    }
-                                }
-                            }
-
-                            current_frame = frame.next;
-                        }
-                    }
-
-                    current_format = format.next;
-                }
-            }
-        }
-
-        // 清理
+        // Release temporary discovery resources.
         drop(devh);
         drop(devices);
         drop(ctx);
@@ -781,19 +785,19 @@ impl UvcCamera {
         rates
     }
 
-    /// 通过设备唯一ID查找设备索引
+    /// Finds a device index by unique ID.
     ///
-    /// 设备唯一ID格式为 "vendor_id:product_id:serial_number" 或 "vendor_id:product_id:index"
+    /// IDs use `vendor_id:product_id:serial_number` or `vendor_id:product_id:index`.
     ///
-    /// # 参数
-    /// - `unique_id`: 设备唯一标识符
+    /// # Parameters
+    /// - `unique_id`: Unique device identifier.
     ///
-    /// # 返回
-    /// 如果找到匹配的设备，返回其索引和设备信息
+    /// # Returns
+    /// The matching device index and device information.
     pub fn find_device_by_unique_id(unique_id: &str) -> CameraResult<(u32, CameraDeviceInfo)> {
         let devices = Self::list_devices()?;
 
-        // 首先尝试精确匹配
+        // Try an exact match first.
         for device in &devices {
             if device.unique_id() == unique_id {
                 log::info!(
@@ -805,22 +809,22 @@ impl UvcCamera {
             }
         }
 
-        // 如果精确匹配失败，尝试解析 unique_id 并进行部分匹配
-        // 格式: "vendor_id:product_id:serial_or_index"
+        // If an exact match fails, parse the ID and try a partial match using
+        // `vendor_id:product_id:serial_or_index`.
         let parts: Vec<&str> = unique_id.split(':').collect();
         if parts.len() >= 2 {
             let target_vid = u16::from_str_radix(parts[0], 16).ok();
             let target_pid = u16::from_str_radix(parts[1], 16).ok();
 
             if let (Some(vid), Some(pid)) = (target_vid, target_pid) {
-                // 查找具有相同 VID:PID 的设备
+                // Find devices with the same VID and PID.
                 let matching_devices: Vec<_> = devices
                     .iter()
                     .filter(|d| d.vendor_id == Some(vid) && d.product_id == Some(pid))
                     .collect();
 
                 if matching_devices.len() == 1 {
-                    // 只有一个匹配的设备，直接返回
+                    // A single matching device is unambiguous.
                     let device = matching_devices[0];
                     log::info!(
                         "Found single device with VID:PID {:04x}:{:04x}: device {}",
@@ -830,7 +834,7 @@ impl UvcCamera {
                     );
                     return Ok((device.index, device.clone()));
                 } else if !matching_devices.is_empty() {
-                    // 有多个匹配的设备，尝试通过序列号匹配
+                    // Disambiguate multiple matches by serial number.
                     if parts.len() >= 3 {
                         let target_serial = parts[2];
                         for device in &matching_devices {
@@ -847,7 +851,7 @@ impl UvcCamera {
                         }
                     }
 
-                    // 无法确定是哪个设备，返回错误
+                    // The device cannot be identified unambiguously.
                     log::warn!(
                         "Found {} devices with VID:PID {:04x}:{:04x}, but cannot match unique_id {}",
                         matching_devices.len(), vid, pid, unique_id
@@ -856,37 +860,40 @@ impl UvcCamera {
             }
         }
 
-        Err(CameraError::DeviceNotFound(format!(
+        Err(CameraError::device_not_found(format!(
             "No device found with unique_id: {}",
             unique_id
         )))
     }
 
-    /// 通过设备唯一ID或索引打开摄像头
+    /// Opens a camera by unique ID or index.
     ///
-    /// # 参数
-    /// - `unique_id`: 可选的设备唯一ID。如果为 None，则使用设备索引
-    /// - `device_index`: 当 unique_id 为 None 时使用的设备索引
+    /// # Parameters
+    /// - `unique_id`: Optional unique ID. The index is used when this is `None`.
+    /// - `device_index`: Device index used when `unique_id` is `None`.
     ///
-    /// # 返回
-    /// 返回摄像头实例和设备信息
+    /// # Returns
+    /// The camera instance and its device information.
     pub fn open_by_unique_id_or_index(
         unique_id: Option<&str>,
         device_index: u32,
     ) -> CameraResult<(Self, CameraDeviceInfo)> {
         let (actual_index, device_info) = if let Some(id) = unique_id {
-            // 通过唯一ID查找设备
+            // Find the device by unique ID.
             log::info!("Opening camera by unique_id: {}", id);
             Self::find_device_by_unique_id(id)?
         } else {
-            // 通过索引查找设备
+            // Find the device by index.
             log::info!("Opening camera by index: {}", device_index);
             let devices = Self::list_devices()?;
             let device = devices
                 .into_iter()
                 .find(|d| d.index == device_index)
                 .ok_or_else(|| {
-                    CameraError::DeviceNotFound(format!("Device index {} not found", device_index))
+                    CameraError::device_not_found(format!(
+                        "Device index {} not found",
+                        device_index
+                    ))
                 })?;
             (device_index, device)
         };
@@ -899,7 +906,7 @@ impl UvcCamera {
         let camera = self.clone();
         tokio::task::spawn_blocking(move || camera.start_sync(config))
             .await
-            .map_err(|e| CameraError::Other(e.to_string()))?
+            .map_err(|e| CameraError::worker_failure(e.to_string()).with_source(e))?
     }
 
     fn start_sync(&self, mut config: CameraConfig) -> CameraResult<()> {
@@ -907,12 +914,12 @@ impl UvcCamera {
         config.validate()?;
 
         if self.capture.hub.is_streaming() {
-            return Err(CameraError::StreamError(
+            return Err(CameraError::stream_error(
                 "Stream already running".to_string(),
             ));
         }
 
-        // 初始化上下文和设备
+        // Initialize the context and device.
         {
             let mut ctx_guard = self.context.lock();
             if ctx_guard.is_none() {
@@ -928,16 +935,16 @@ impl UvcCamera {
                     });
                     let found = matches
                         .next()
-                        .ok_or_else(|| CameraError::DeviceNotFound(expected.clone()))?;
+                        .ok_or_else(|| CameraError::device_not_found(expected.clone()))?;
                     if matches.next().is_some() {
-                        return Err(CameraError::AmbiguousDevice(expected.clone()));
+                        return Err(CameraError::ambiguous_device(expected.clone()));
                     }
                     Some(found)
                 } else {
                     devices.get(self.device_index as usize)
                 };
                 let device = selected.ok_or_else(|| {
-                    CameraError::DeviceNotFound(format!(
+                    CameraError::device_not_found(format!(
                         "Device index {} does not exist",
                         self.device_index
                     ))
@@ -945,8 +952,8 @@ impl UvcCamera {
 
                 let devh = device.open()?;
 
-                // CRITICAL: 在保存 context 之前显式 drop devices
-                // 避免 "device still referenced at libusb_exit" 错误
+                // Explicitly drop devices before storing the context to avoid
+                // "device still referenced at libusb_exit".
                 drop(devices);
 
                 *self.device_handle.lock() = Some(devh);
@@ -954,13 +961,13 @@ impl UvcCamera {
             }
         }
 
-        // 配置流
+        // Configure the stream.
         let mut devh_guard = self.device_handle.lock();
         let devh = devh_guard
             .as_mut()
-            .ok_or_else(|| CameraError::DeviceOpenFailed("Device not open".to_string()))?;
+            .ok_or_else(|| CameraError::device_open_failed("Device not open".to_string()))?;
 
-        // 打印设备支持的格式（用于调试）
+        // Log supported formats for diagnostics.
         Self::log_supported_formats(devh.as_ptr());
 
         let uvc_format = Self::format_to_uvc(config.format);
@@ -980,10 +987,10 @@ impl UvcCamera {
             / config.fps as u64;
         ctrl.set_frame_interval(
             u32::try_from(interval)
-                .map_err(|_| CameraError::InvalidConfig("UVC frame interval overflow".into()))?,
+                .map_err(|_| CameraError::invalid_config("UVC frame interval overflow".into()))?,
         );
         if ctrl.frame_interval() == 0 {
-            return Err(CameraError::InvalidConfig(
+            return Err(CameraError::invalid_config(
                 "UVC frame interval is zero".into(),
             ));
         }
@@ -993,7 +1000,7 @@ impl UvcCamera {
         let session = self.capture.hub.start();
         #[cfg(not(feature = "decode-mjpeg"))]
         if config.format == VideoFormat::MJPEG && !self.capture.hub.wants_native() {
-            return Err(CameraError::UnsupportedFormat(
+            return Err(CameraError::unsupported_format(
                 "MJPEG decoding requires the decode-mjpeg feature".into(),
             ));
         }
@@ -1049,7 +1056,7 @@ impl UvcCamera {
             camera.stop_locked();
         })
         .await
-        .map_err(|e| CameraError::Other(e.to_string()))
+        .map_err(|e| CameraError::worker_failure(e.to_string()).with_source(e))
     }
 }
 
@@ -1093,14 +1100,14 @@ impl StreamingCamera for UvcCamera {
         self.capture.hub.stats()
     }
     async fn set_buffer_size(&self, _size: usize) -> CameraResult<()> {
-        Err(CameraError::InvalidConfig(
+        Err(CameraError::invalid_config(
             "Frame pool capacity is fixed for the lifetime of the camera".into(),
         ))
     }
 }
 
 // ============================================================================
-// 摄像头控制参数实现
+// Camera control implementation.
 // ============================================================================
 
 impl CameraControl for UvcCamera {
@@ -1108,7 +1115,7 @@ impl CameraControl for UvcCamera {
         let devh = self.device_handle.lock();
         let devh = devh
             .as_ref()
-            .ok_or_else(|| CameraError::DeviceOpenFailed("Device not open".to_string()))?
+            .ok_or_else(|| CameraError::device_open_failed("Device not open".to_string()))?
             .as_ptr();
 
         use ffi::UvcReqCode;
@@ -1119,10 +1126,10 @@ impl CameraControl for UvcCamera {
                 let mut mode = 0u8;
                 let result = unsafe { ffi::uvc_get_ae_mode(devh, &mut mode, req_code) };
                 if result != ffi::UVC_SUCCESS {
-                    return Err(CameraError::UvcError {
-                        code: result,
-                        message: "Failed to get auto exposure mode".to_string(),
-                    });
+                    return Err(CameraError::uvc(
+                        result,
+                        "Failed to get auto exposure mode".to_string(),
+                    ));
                 }
                 Ok(CameraControlValue::Boolean(matches!(mode, 2 | 4 | 8)))
             }
@@ -1130,10 +1137,10 @@ impl CameraControl for UvcCamera {
                 let mut time = 0u32;
                 let result = unsafe { ffi::uvc_get_exposure_abs(devh, &mut time, req_code) };
                 if result != ffi::UVC_SUCCESS {
-                    return Err(CameraError::UvcError {
-                        code: result,
-                        message: "Failed to get exposure time".to_string(),
-                    });
+                    return Err(CameraError::uvc(
+                        result,
+                        "Failed to get exposure time".to_string(),
+                    ));
                 }
                 Ok(CameraControlValue::manual(time as i32))
             }
@@ -1141,10 +1148,7 @@ impl CameraControl for UvcCamera {
                 let mut focus = 0u16;
                 let result = unsafe { ffi::uvc_get_focus_abs(devh, &mut focus, req_code) };
                 if result != ffi::UVC_SUCCESS {
-                    return Err(CameraError::UvcError {
-                        code: result,
-                        message: "Failed to get focus".to_string(),
-                    });
+                    return Err(CameraError::uvc(result, "Failed to get focus".to_string()));
                 }
                 Ok(CameraControlValue::manual(focus as i32))
             }
@@ -1152,10 +1156,10 @@ impl CameraControl for UvcCamera {
                 let mut state = 0u8;
                 let result = unsafe { ffi::uvc_get_focus_auto(devh, &mut state, req_code) };
                 if result != ffi::UVC_SUCCESS {
-                    return Err(CameraError::UvcError {
-                        code: result,
-                        message: "Failed to get auto focus state".to_string(),
-                    });
+                    return Err(CameraError::uvc(
+                        result,
+                        "Failed to get auto focus state".to_string(),
+                    ));
                 }
                 Ok(CameraControlValue::Boolean(state != 0))
             }
@@ -1163,10 +1167,7 @@ impl CameraControl for UvcCamera {
                 let mut zoom = 0u16;
                 let result = unsafe { ffi::uvc_get_zoom_abs(devh, &mut zoom, req_code) };
                 if result != ffi::UVC_SUCCESS {
-                    return Err(CameraError::UvcError {
-                        code: result,
-                        message: "Failed to get zoom".to_string(),
-                    });
+                    return Err(CameraError::uvc(result, "Failed to get zoom".to_string()));
                 }
                 Ok(CameraControlValue::manual(zoom as i32))
             }
@@ -1174,10 +1175,10 @@ impl CameraControl for UvcCamera {
                 let mut brightness = 0i16;
                 let result = unsafe { ffi::uvc_get_brightness(devh, &mut brightness, req_code) };
                 if result != ffi::UVC_SUCCESS {
-                    return Err(CameraError::UvcError {
-                        code: result,
-                        message: "Failed to get brightness".to_string(),
-                    });
+                    return Err(CameraError::uvc(
+                        result,
+                        "Failed to get brightness".to_string(),
+                    ));
                 }
                 Ok(CameraControlValue::manual(brightness as i32))
             }
@@ -1185,10 +1186,10 @@ impl CameraControl for UvcCamera {
                 let mut contrast = 0u16;
                 let result = unsafe { ffi::uvc_get_contrast(devh, &mut contrast, req_code) };
                 if result != ffi::UVC_SUCCESS {
-                    return Err(CameraError::UvcError {
-                        code: result,
-                        message: "Failed to get contrast".to_string(),
-                    });
+                    return Err(CameraError::uvc(
+                        result,
+                        "Failed to get contrast".to_string(),
+                    ));
                 }
                 Ok(CameraControlValue::manual(contrast as i32))
             }
@@ -1196,10 +1197,10 @@ impl CameraControl for UvcCamera {
                 let mut saturation = 0u16;
                 let result = unsafe { ffi::uvc_get_saturation(devh, &mut saturation, req_code) };
                 if result != ffi::UVC_SUCCESS {
-                    return Err(CameraError::UvcError {
-                        code: result,
-                        message: "Failed to get saturation".to_string(),
-                    });
+                    return Err(CameraError::uvc(
+                        result,
+                        "Failed to get saturation".to_string(),
+                    ));
                 }
                 Ok(CameraControlValue::manual(saturation as i32))
             }
@@ -1207,10 +1208,7 @@ impl CameraControl for UvcCamera {
                 let mut hue = 0i16;
                 let result = unsafe { ffi::uvc_get_hue(devh, &mut hue, req_code) };
                 if result != ffi::UVC_SUCCESS {
-                    return Err(CameraError::UvcError {
-                        code: result,
-                        message: "Failed to get hue".to_string(),
-                    });
+                    return Err(CameraError::uvc(result, "Failed to get hue".to_string()));
                 }
                 Ok(CameraControlValue::manual(hue as i32))
             }
@@ -1218,10 +1216,10 @@ impl CameraControl for UvcCamera {
                 let mut sharpness = 0u16;
                 let result = unsafe { ffi::uvc_get_sharpness(devh, &mut sharpness, req_code) };
                 if result != ffi::UVC_SUCCESS {
-                    return Err(CameraError::UvcError {
-                        code: result,
-                        message: "Failed to get sharpness".to_string(),
-                    });
+                    return Err(CameraError::uvc(
+                        result,
+                        "Failed to get sharpness".to_string(),
+                    ));
                 }
                 Ok(CameraControlValue::manual(sharpness as i32))
             }
@@ -1229,10 +1227,7 @@ impl CameraControl for UvcCamera {
                 let mut gamma = 0u16;
                 let result = unsafe { ffi::uvc_get_gamma(devh, &mut gamma, req_code) };
                 if result != ffi::UVC_SUCCESS {
-                    return Err(CameraError::UvcError {
-                        code: result,
-                        message: "Failed to get gamma".to_string(),
-                    });
+                    return Err(CameraError::uvc(result, "Failed to get gamma".to_string()));
                 }
                 Ok(CameraControlValue::manual(gamma as i32))
             }
@@ -1241,10 +1236,10 @@ impl CameraControl for UvcCamera {
                 let result =
                     unsafe { ffi::uvc_get_white_balance_temperature(devh, &mut temp, req_code) };
                 if result != ffi::UVC_SUCCESS {
-                    return Err(CameraError::UvcError {
-                        code: result,
-                        message: "Failed to get white balance temperature".to_string(),
-                    });
+                    return Err(CameraError::uvc(
+                        result,
+                        "Failed to get white balance temperature".to_string(),
+                    ));
                 }
                 Ok(CameraControlValue::manual(temp as i32))
             }
@@ -1254,10 +1249,10 @@ impl CameraControl for UvcCamera {
                     ffi::uvc_get_white_balance_temperature_auto(devh, &mut state, req_code)
                 };
                 if result != ffi::UVC_SUCCESS {
-                    return Err(CameraError::UvcError {
-                        code: result,
-                        message: "Failed to get auto white balance state".to_string(),
-                    });
+                    return Err(CameraError::uvc(
+                        result,
+                        "Failed to get auto white balance state".to_string(),
+                    ));
                 }
                 Ok(CameraControlValue::Boolean(state != 0))
             }
@@ -1265,10 +1260,7 @@ impl CameraControl for UvcCamera {
                 let mut gain = 0u16;
                 let result = unsafe { ffi::uvc_get_gain(devh, &mut gain, req_code) };
                 if result != ffi::UVC_SUCCESS {
-                    return Err(CameraError::UvcError {
-                        code: result,
-                        message: "Failed to get gain".to_string(),
-                    });
+                    return Err(CameraError::uvc(result, "Failed to get gain".to_string()));
                 }
                 Ok(CameraControlValue::manual(gain as i32))
             }
@@ -1277,16 +1269,16 @@ impl CameraControl for UvcCamera {
                 let result =
                     unsafe { ffi::uvc_get_backlight_compensation(devh, &mut comp, req_code) };
                 if result != ffi::UVC_SUCCESS {
-                    return Err(CameraError::UvcError {
-                        code: result,
-                        message: "Failed to get backlight compensation".to_string(),
-                    });
+                    return Err(CameraError::uvc(
+                        result,
+                        "Failed to get backlight compensation".to_string(),
+                    ));
                 }
                 Ok(CameraControlValue::manual(comp as i32))
             }
             CameraControlType::Pan | CameraControlType::Tilt | CameraControlType::Iris => {
-                // UVC 库不直接支持这些控制，返回错误
-                Err(CameraError::ControlNotSupported(format!("{:?}", control)))
+                // libuvc does not expose these controls directly.
+                Err(CameraError::control_not_supported(format!("{:?}", control)))
             }
         }
     }
@@ -1299,43 +1291,40 @@ impl CameraControl for UvcCamera {
         let devh = self.device_handle.lock();
         let devh = devh
             .as_ref()
-            .ok_or_else(|| CameraError::DeviceOpenFailed("Device not open".to_string()))?
+            .ok_or_else(|| CameraError::device_open_failed("Device not open".to_string()))?
             .as_ptr();
 
         let result =
             match control {
                 CameraControlType::AutoExposure => {
                     let enabled = value.as_bool().ok_or_else(|| {
-                        CameraError::InvalidConfig("Auto exposure expects boolean".into())
+                        CameraError::invalid_config("Auto exposure expects boolean".into())
                     })?;
                     let mut mask = 0u8;
                     let code = unsafe {
                         ffi::uvc_get_ae_mode(devh, &mut mask, ffi::UvcReqCode::GetRes as u8)
                     };
                     if code != ffi::UVC_SUCCESS {
-                        return Err(CameraError::UvcError {
-                            code,
-                            message: "Query AE supported modes".into(),
-                        });
+                        return Err(CameraError::uvc(code, "Query AE supported modes".into()));
                     }
                     let mode = select_ae_mode(mask, enabled)?;
                     unsafe { ffi::uvc_set_ae_mode(devh, mode) }
                 }
                 CameraControlType::Exposure => {
                     let time = value.as_i32().ok_or_else(|| {
-                        CameraError::InvalidConfig("Invalid exposure time value".to_string())
+                        CameraError::invalid_config("Invalid exposure time value".to_string())
                     })? as u32;
                     unsafe { ffi::uvc_set_exposure_abs(devh, time) }
                 }
                 CameraControlType::Focus => {
                     let focus = value.as_i32().ok_or_else(|| {
-                        CameraError::InvalidConfig("Invalid focus value".to_string())
+                        CameraError::invalid_config("Invalid focus value".to_string())
                     })? as u16;
                     unsafe { ffi::uvc_set_focus_abs(devh, focus) }
                 }
                 CameraControlType::AutoFocus => {
                     let state = if value.as_bool().ok_or_else(|| {
-                        CameraError::InvalidConfig("Invalid auto focus value".to_string())
+                        CameraError::invalid_config("Invalid auto focus value".to_string())
                     })? {
                         1u8
                     } else {
@@ -1345,49 +1334,49 @@ impl CameraControl for UvcCamera {
                 }
                 CameraControlType::Zoom => {
                     let zoom = value.as_i32().ok_or_else(|| {
-                        CameraError::InvalidConfig("Invalid zoom value".to_string())
+                        CameraError::invalid_config("Invalid zoom value".to_string())
                     })? as u16;
                     unsafe { ffi::uvc_set_zoom_abs(devh, zoom) }
                 }
                 CameraControlType::Brightness => {
                     let brightness = value.as_i32().ok_or_else(|| {
-                        CameraError::InvalidConfig("Invalid brightness value".to_string())
+                        CameraError::invalid_config("Invalid brightness value".to_string())
                     })? as i16;
                     unsafe { ffi::uvc_set_brightness(devh, brightness) }
                 }
                 CameraControlType::Contrast => {
                     let contrast = value.as_i32().ok_or_else(|| {
-                        CameraError::InvalidConfig("Invalid contrast value".to_string())
+                        CameraError::invalid_config("Invalid contrast value".to_string())
                     })? as u16;
                     unsafe { ffi::uvc_set_contrast(devh, contrast) }
                 }
                 CameraControlType::Saturation => {
                     let saturation = value.as_i32().ok_or_else(|| {
-                        CameraError::InvalidConfig("Invalid saturation value".to_string())
+                        CameraError::invalid_config("Invalid saturation value".to_string())
                     })? as u16;
                     unsafe { ffi::uvc_set_saturation(devh, saturation) }
                 }
                 CameraControlType::Hue => {
                     let hue = value.as_i32().ok_or_else(|| {
-                        CameraError::InvalidConfig("Invalid hue value".to_string())
+                        CameraError::invalid_config("Invalid hue value".to_string())
                     })? as i16;
                     unsafe { ffi::uvc_set_hue(devh, hue) }
                 }
                 CameraControlType::Sharpness => {
                     let sharpness = value.as_i32().ok_or_else(|| {
-                        CameraError::InvalidConfig("Invalid sharpness value".to_string())
+                        CameraError::invalid_config("Invalid sharpness value".to_string())
                     })? as u16;
                     unsafe { ffi::uvc_set_sharpness(devh, sharpness) }
                 }
                 CameraControlType::Gamma => {
                     let gamma = value.as_i32().ok_or_else(|| {
-                        CameraError::InvalidConfig("Invalid gamma value".to_string())
+                        CameraError::invalid_config("Invalid gamma value".to_string())
                     })? as u16;
                     unsafe { ffi::uvc_set_gamma(devh, gamma) }
                 }
                 CameraControlType::WhiteBalance => {
                     let temp = value.as_i32().ok_or_else(|| {
-                        CameraError::InvalidConfig(
+                        CameraError::invalid_config(
                             "Invalid white balance temperature value".to_string(),
                         )
                     })? as u16;
@@ -1395,7 +1384,7 @@ impl CameraControl for UvcCamera {
                 }
                 CameraControlType::AutoWhiteBalance => {
                     let state = if value.as_bool().ok_or_else(|| {
-                        CameraError::InvalidConfig("Invalid auto white balance value".to_string())
+                        CameraError::invalid_config("Invalid auto white balance value".to_string())
                     })? {
                         1u8
                     } else {
@@ -1405,29 +1394,29 @@ impl CameraControl for UvcCamera {
                 }
                 CameraControlType::Gain => {
                     let gain = value.as_i32().ok_or_else(|| {
-                        CameraError::InvalidConfig("Invalid gain value".to_string())
+                        CameraError::invalid_config("Invalid gain value".to_string())
                     })? as u16;
                     unsafe { ffi::uvc_set_gain(devh, gain) }
                 }
                 CameraControlType::BacklightCompensation => {
                     let comp = value.as_i32().ok_or_else(|| {
-                        CameraError::InvalidConfig(
+                        CameraError::invalid_config(
                             "Invalid backlight compensation value".to_string(),
                         )
                     })? as u16;
                     unsafe { ffi::uvc_set_backlight_compensation(devh, comp) }
                 }
                 CameraControlType::Pan | CameraControlType::Tilt | CameraControlType::Iris => {
-                    // UVC 库不直接支持这些控制，返回错误
-                    return Err(CameraError::ControlNotSupported(format!("{:?}", control)));
+                    // libuvc does not expose these controls directly.
+                    return Err(CameraError::control_not_supported(format!("{:?}", control)));
                 }
             };
 
         if result != ffi::UVC_SUCCESS {
-            Err(CameraError::UvcError {
-                code: result,
-                message: format!("Failed to set control parameter: {:?}", control),
-            })
+            Err(CameraError::uvc(
+                result,
+                format!("Failed to set control parameter: {:?}", control),
+            ))
         } else {
             Ok(())
         }
@@ -1437,7 +1426,7 @@ impl CameraControl for UvcCamera {
         let devh = self.device_handle.lock();
         let devh = devh
             .as_ref()
-            .ok_or_else(|| CameraError::DeviceOpenFailed("Device not open".to_string()))?
+            .ok_or_else(|| CameraError::device_open_failed("Device not open".to_string()))?
             .as_ptr();
 
         use ffi::UvcReqCode;
@@ -1452,10 +1441,7 @@ impl CameraControl for UvcCamera {
             };
             let code = unsafe { getter(devh, &mut value, UvcReqCode::GetDef as u8) };
             if code != ffi::UVC_SUCCESS {
-                return Err(CameraError::UvcError {
-                    code,
-                    message: format!("Query {control:?} default"),
-                });
+                return Err(CameraError::uvc(code, format!("Query {control:?} default")));
             }
             let default = if control == CameraControlType::AutoExposure {
                 i32::from(matches!(value, 2 | 4 | 8))
@@ -1479,17 +1465,17 @@ impl CameraControl for UvcCamera {
                     let mut raw = 0 as $ty;
                     let code = unsafe { $getter(devh, &mut raw, request as u8) };
                     if code != ffi::UVC_SUCCESS {
-                        return Err(CameraError::UvcError {
+                        return Err(CameraError::uvc(
                             code,
-                            message: format!("Query {control:?} {request:?}"),
-                        });
+                            format!("Query {control:?} {request:?}"),
+                        ));
                     }
                     values[i] = i32::try_from(raw).map_err(|_| {
-                        CameraError::InvalidFormat("UVC control range exceeds i32".into())
+                        CameraError::invalid_frame("UVC control range exceeds i32".into())
                     })?;
                 }
                 if values[0] > values[1] || values[2] <= 0 {
-                    return Err(CameraError::InvalidFormat(
+                    return Err(CameraError::invalid_frame(
                         "Invalid native control range".into(),
                     ));
                 }
@@ -1513,12 +1499,12 @@ impl CameraControl for UvcCamera {
             CameraControlType::BacklightCompensation => {
                 range!(ffi::uvc_get_backlight_compensation, u16)
             }
-            _ => Err(CameraError::ControlNotSupported(format!("{control:?}"))),
+            _ => Err(CameraError::control_not_supported(format!("{control:?}"))),
         }
     }
 
     fn supports_control(&self, control: CameraControlType) -> bool {
-        // 尝试获取控制值，如果成功则支持
+        // A successfully queried value indicates control support.
         self.get_control(control).is_ok()
     }
 
@@ -1559,7 +1545,7 @@ fn select_ae_mode(mask: u8, enabled: bool) -> CameraResult<u8> {
         .copied()
         .find(|m| mask & m != 0)
         .ok_or_else(|| {
-            CameraError::ControlNotSupported("Requested UVC exposure mode is unavailable".into())
+            CameraError::control_not_supported("Requested UVC exposure mode is unavailable".into())
         })
 }
 
@@ -1567,7 +1553,7 @@ impl Drop for UvcCamera {
     fn drop(&mut self) {
         log::debug!("UvcCamera::drop() 调用");
 
-        // cleanup 已经会处理停止流，直接调用即可
+        // cleanup also stops an active stream.
         self.cleanup();
 
         log::debug!("UvcCamera::drop() 完成");

@@ -7,30 +7,45 @@ use crate::{
 use std::{fmt, sync::Arc};
 
 #[derive(Clone, Debug)]
+/// Backend-neutral device metadata returned by a custom provider.
 pub struct BackendDeviceInfo {
+    /// Backend-native identifier, unique within the provider.
     pub native_id: String,
+    /// Human-readable name.
     pub name: String,
+    /// Human-readable description.
     pub description: String,
+    /// Persistence guarantee for the identifier.
     pub stability: IdentityStability,
+    /// Physical camera facing.
     pub facing: CameraFacing,
+    /// USB identity when available.
     pub usb: Option<UsbIdentity>,
 }
 
+/// Behavior required by `BackendProvider`.
 pub trait BackendProvider: fmt::Debug + Send + Sync + 'static {
+    /// Returns the provider's stable, namespaced backend identifier.
     fn id(&self) -> BackendId;
+    /// Enumerates devices without opening them.
     fn enumerate(&self) -> CameraResult<Vec<BackendDeviceInfo>>;
+    /// Opens the device identified by an earlier enumeration result.
     fn open(&self, native_id: &str) -> CameraResult<Box<dyn BackendDevice>>;
 }
 
 /// A device handle may keep native thread-affine objects inside its own worker.
 /// Calls are serialized by the framework and never occur on the per-frame path.
 pub trait BackendDevice: Send + 'static {
+    /// Returns capture modes and controls supported by this device.
     fn capabilities(&self) -> CameraResult<DeviceCapabilities>;
+    /// Starts native capture and publishes frames into the supplied bounded sink.
     fn start(&mut self, sink: FrameSink, plan: &CapturePlan) -> CameraResult<()>;
+    /// Stops native capture and releases streaming resources.
     fn stop(&mut self) -> CameraResult<()>;
 }
 
 #[derive(Clone)]
+/// Bounded frame destination supplied to an application-provided backend.
 pub struct FrameSink {
     hub: FrameHub,
     session: u64,
@@ -50,6 +65,9 @@ impl FrameSink {
         Self { hub, session }
     }
 
+    /// Copies one frame into the pool and publishes it to current subscribers.
+    ///
+    /// Returns `false` when policy or pool pressure intentionally drops the frame.
     pub fn publish_bytes(
         &self,
         layout: FrameLayout,
@@ -60,6 +78,7 @@ impl FrameSink {
             .publish_native(self.session, layout, timestamp, None, &[bytes])
     }
 
+    /// Borrows writable storage directly from the bounded frame pool.
     pub fn writable(&self, layout: FrameLayout) -> CameraResult<WritableFrameLease> {
         Ok(WritableFrameLease {
             inner: Some(self.hub.writable_native(self.session, layout)?),
@@ -81,6 +100,7 @@ pub struct WritableFrameLease {
 }
 
 impl WritableFrameLease {
+    /// Returns the exact frame payload slice described by the requested layout.
     pub fn bytes_mut(&mut self) -> &mut [u8] {
         self.inner
             .as_mut()
@@ -88,6 +108,7 @@ impl WritableFrameLease {
             .bytes_mut()
     }
 
+    /// Attaches the backend's source timestamp to this frame.
     pub fn timestamp(mut self, timestamp: SourceTimestamp) -> Self {
         self.inner
             .as_mut()
@@ -96,6 +117,7 @@ impl WritableFrameLease {
         self
     }
 
+    /// Makes the completed frame immutable and visible to subscribers.
     pub fn commit(mut self) -> CameraResult<bool> {
         self.inner
             .take()
@@ -129,7 +151,7 @@ impl fmt::Debug for RegisteredBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{CameraError, PixelFormat, PlaneLayout, SessionEvent};
+    use crate::{PixelFormat, PlaneLayout, SessionEvent};
 
     fn rgb_layout() -> FrameLayout {
         FrameLayout {
@@ -167,7 +189,7 @@ mod tests {
 
         assert!(matches!(
             sink.writable(rgb_layout()),
-            Err(CameraError::BufferEmpty)
+            Err(ref error) if error.kind() == crate::CameraErrorKind::BufferExhausted
         ));
         assert!(matches!(
             receiver.try_recv().unwrap(),

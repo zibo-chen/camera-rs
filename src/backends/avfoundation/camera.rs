@@ -1,4 +1,4 @@
-//! AVFoundation 摄像头实现
+//! AVFoundation camera implementation.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -16,27 +16,27 @@ use crate::types::{
 use super::capture::CaptureSession;
 use super::device::{get_supported_configs, query_devices};
 
-/// AVFoundation 摄像头实现
+/// AVFoundation camera implementation.
 ///
-/// 提供 macOS/iOS 平台的原生摄像头访问。
+/// Provides native camera access on macOS and iOS.
 pub struct AVFoundationCamera {
-    /// 设备索引
+    /// Device index.
     device_id: String,
     hub: Arc<crate::FrameHub>,
     lifecycle: Mutex<()>,
-    /// 捕获会话
+    /// Capture session.
     session: Mutex<Option<CaptureSession>>,
-    /// 是否正在流
+    /// Whether streaming is active.
     is_streaming: Arc<AtomicBool>,
-    /// 当前配置
+    /// Current configuration.
     current_config: Mutex<Option<CameraConfig>>,
-    /// 启动时间
+    /// Start time.
     start_time: Mutex<Option<Instant>>,
     discard_late_frames: AtomicBool,
 }
 
 impl AVFoundationCamera {
-    /// 创建新的 AVFoundation 摄像头实例
+    /// Creates an AVFoundation camera instance.
     pub fn new(device_index: u32) -> CameraResult<Self> {
         Self::new_with_hub(device_index, crate::FrameHub::default())
     }
@@ -50,10 +50,10 @@ impl AVFoundationCamera {
     ) -> CameraResult<Self> {
         log::info!("Creating AVFoundationCamera for device {}", device_index);
 
-        // 验证设备存在
+        // Verify that the device exists.
         let devices = query_devices()?;
         if device_index as usize >= devices.len() {
-            return Err(CameraError::DeviceNotFound(format!(
+            return Err(CameraError::device_not_found(format!(
                 "Device index {} not found, only {} devices available",
                 device_index,
                 devices.len()
@@ -78,7 +78,7 @@ impl AVFoundationCamera {
 
     pub(crate) fn set_options(&self, options: crate::AvFoundationOptions) -> CameraResult<()> {
         if self.is_streaming.load(Ordering::Acquire) {
-            return Err(CameraError::InvalidState(
+            return Err(CameraError::invalid_state(
                 "AVFoundation options must be set before streaming".into(),
             ));
         }
@@ -91,7 +91,10 @@ impl AVFoundationCamera {
 
     pub(crate) fn supported_modes(&self, control: CameraControlType) -> CameraResult<Vec<i32>> {
         let session = self.session.lock().unwrap();
-        let device = session.as_ref().ok_or(CameraError::StreamStopped)?.device();
+        let device = session
+            .as_ref()
+            .ok_or(CameraError::stream_stopped())?
+            .device();
         Ok((0..=2)
             .filter(|&mode| unsafe {
                 let mode = mode as isize;
@@ -108,12 +111,12 @@ impl AVFoundationCamera {
             })
             .collect())
     }
-    /// 请求相机权限
+    /// Requests camera permission.
     pub async fn request_permission() -> CameraResult<bool> {
         Ok(super::device::request_authorization().await)
     }
 
-    /// 检查权限状态
+    /// Returns the current permission status.
     pub fn authorization_status() -> super::device::AVAuthorizationStatus {
         super::device::authorization_status()
     }
@@ -129,7 +132,7 @@ impl AVFoundationCamera {
         }
     }
 
-    /// 清理资源
+    /// Releases resources.
     pub fn cleanup(&self) {
         let _guard = self.lifecycle.lock().unwrap();
         self.hub.stop();
@@ -209,7 +212,7 @@ impl StreamingCamera for AVFoundationCamera {
     }
 
     async fn set_buffer_size(&self, _size: usize) -> CameraResult<()> {
-        Err(CameraError::InvalidConfig(
+        Err(CameraError::invalid_config(
             "Frame pool capacity is fixed for the lifetime of the camera".into(),
         ))
     }
@@ -224,12 +227,12 @@ impl CameraControl for AVFoundationCamera {
 
             match control {
                 CameraControlType::Brightness => {
-                    // AVFoundation 使用 exposureTargetBias 作为亮度
+                    // AVFoundation represents brightness as exposureTargetBias.
                     let bias: f32 = unsafe { objc2::msg_send![device, exposureTargetBias] };
                     Ok(CameraControlValue::manual((bias * 1000.0).round() as i32))
                 }
                 CameraControlType::Focus => {
-                    // focusMode 返回 NSInteger (isize)
+                    // focusMode returns NSInteger (isize).
                     let mode: isize = unsafe { objc2::msg_send![device, focusMode] };
                     Ok(CameraControlValue::manual(mode as i32))
                 }
@@ -245,10 +248,10 @@ impl CameraControl for AVFoundationCamera {
                     let factor: f64 = unsafe { objc2::msg_send![device, videoZoomFactor] };
                     Ok(CameraControlValue::manual((factor * 100.0) as i32))
                 }
-                _ => Err(CameraError::ControlNotSupported(format!("{:?}", control))),
+                _ => Err(CameraError::control_not_supported(format!("{:?}", control))),
             }
         } else {
-            Err(CameraError::StreamError("No active session".into()))
+            Err(CameraError::stream_error("No active session".into()))
         }
     }
 
@@ -262,11 +265,15 @@ impl CameraControl for AVFoundationCamera {
         if let Some(ref s) = *session {
             let device = s.device();
 
-            // 锁定设备进行配置
+            // Lock the device before changing its configuration.
             unsafe {
-                device
-                    .lockForConfiguration()
-                    .map_err(|e| CameraError::Other(format!("Failed to lock device: {:?}", e)))?;
+                device.lockForConfiguration().map_err(|e| {
+                    CameraError::backend_failure(
+                        crate::BackendId::AV_FOUNDATION,
+                        crate::OperationStage::BackendCommand,
+                        format!("Failed to lock device: {e:?}"),
+                    )
+                })?;
             }
 
             struct Unlock<'a>(&'a objc2_av_foundation::AVCaptureDevice);
@@ -281,7 +288,7 @@ impl CameraControl for AVFoundationCamera {
             let result = match control {
                 CameraControlType::Brightness => {
                     let bias = value.as_i32().ok_or_else(|| {
-                        CameraError::InvalidConfig("Exposure bias expects milliev".into())
+                        CameraError::invalid_config("Exposure bias expects milliev".into())
                     })? as f32
                         / 1000.0;
                     unsafe {
@@ -294,7 +301,7 @@ impl CameraControl for AVFoundationCamera {
                     let supported: bool =
                         unsafe { objc2::msg_send![device,isFocusModeSupported:mode] };
                     if !supported {
-                        return Err(CameraError::ControlNotSupported(
+                        return Err(CameraError::control_not_supported(
                             "Native mode unavailable".into(),
                         ));
                     }
@@ -308,7 +315,7 @@ impl CameraControl for AVFoundationCamera {
                     let supported: bool =
                         unsafe { objc2::msg_send![device,isExposureModeSupported:mode] };
                     if !supported {
-                        return Err(CameraError::ControlNotSupported(
+                        return Err(CameraError::control_not_supported(
                             "Native mode unavailable".into(),
                         ));
                     }
@@ -322,7 +329,7 @@ impl CameraControl for AVFoundationCamera {
                     let supported: bool =
                         unsafe { objc2::msg_send![device,isWhiteBalanceModeSupported:mode] };
                     if !supported {
-                        return Err(CameraError::ControlNotSupported(
+                        return Err(CameraError::control_not_supported(
                             "Native mode unavailable".into(),
                         ));
                     }
@@ -332,19 +339,19 @@ impl CameraControl for AVFoundationCamera {
                     Ok(())
                 }
                 CameraControlType::Zoom => {
-                    // videoZoomFactor 是 CGFloat (f64 on 64-bit)
+                    // videoZoomFactor is CGFloat (f64 on 64-bit targets).
                     let factor = value.as_i32().unwrap_or(100) as f64 / 100.0;
                     unsafe {
                         let _: () = objc2::msg_send![device, setVideoZoomFactor: factor];
                     }
                     Ok(())
                 }
-                _ => Err(CameraError::ControlNotSupported(format!("{:?}", control))),
+                _ => Err(CameraError::control_not_supported(format!("{:?}", control))),
             };
 
             result
         } else {
-            Err(CameraError::StreamError("No active session".into()))
+            Err(CameraError::stream_error("No active session".into()))
         }
     }
 
@@ -367,7 +374,7 @@ impl CameraControl for AVFoundationCamera {
                     })
                 }
                 CameraControlType::Zoom => {
-                    // videoZoomFactor 返回 CGFloat (f64 on 64-bit)
+                    // videoZoomFactor returns CGFloat (f64 on 64-bit targets).
                     let min: f64 = unsafe { objc2::msg_send![device, minAvailableVideoZoomFactor] };
                     let max: f64 = unsafe { objc2::msg_send![device, maxAvailableVideoZoomFactor] };
                     Ok(CameraControlRange {
@@ -378,10 +385,10 @@ impl CameraControl for AVFoundationCamera {
                         supports_auto: false,
                     })
                 }
-                _ => Err(CameraError::ControlNotSupported(format!("{:?}", control))),
+                _ => Err(CameraError::control_not_supported(format!("{:?}", control))),
             }
         } else {
-            Err(CameraError::StreamError("No active session".into()))
+            Err(CameraError::stream_error("No active session".into()))
         }
     }
 
@@ -407,7 +414,7 @@ impl CameraControl for AVFoundationCamera {
     }
 }
 
-// SAFETY: AVFoundationCamera 使用线程安全的同步原语
+// SAFETY: AVFoundationCamera uses thread-safe synchronization primitives.
 unsafe impl Send for AVFoundationCamera {}
 unsafe impl Sync for AVFoundationCamera {}
 
@@ -422,16 +429,16 @@ impl AVFoundationCamera {
         let _guard = self.lifecycle.lock().unwrap();
         log::info!("Starting stream with config: {:?}", config);
 
-        // 检查是否已在流
+        // Reject duplicate starts.
         if self.is_streaming.load(Ordering::Relaxed) {
             log::warn!("Stream is already running");
             return Ok(());
         }
 
-        // 验证配置
+        // Validate the configuration.
         config.validate()?;
 
-        // 创建捕获会话
+        // Create the capture session.
         self.hub.start();
         let mut session = match CaptureSession::new(
             &self.device_id,
@@ -446,13 +453,13 @@ impl AVFoundationCamera {
             }
         };
 
-        // 启动会话
+        // Start the session.
         if let Err(error) = session.start() {
             self.hub.stop();
             return Err(error);
         }
 
-        // 更新状态
+        // Update lifecycle state.
         self.is_streaming.store(true, Ordering::SeqCst);
         *self.current_config.lock().unwrap() = Some(session.config().clone());
         *self.session.lock().unwrap() = Some(session);
@@ -465,7 +472,7 @@ impl AVFoundationCamera {
         let camera = self.clone();
         tokio::task::spawn_blocking(move || camera.start_stream_sync(config))
             .await
-            .map_err(|e| CameraError::Other(e.to_string()))?
+            .map_err(|e| CameraError::worker_failure(e.to_string()).with_source(e))?
     }
     fn stop_stream_sync(&self) -> CameraResult<()> {
         let _guard = self.lifecycle.lock().unwrap();
@@ -488,7 +495,7 @@ impl AVFoundationCamera {
         let camera = self.clone();
         tokio::task::spawn_blocking(move || camera.stop_stream_sync())
             .await
-            .map_err(|e| CameraError::Other(e.to_string()))?
+            .map_err(|e| CameraError::worker_failure(e.to_string()).with_source(e))?
     }
 }
 
@@ -504,16 +511,16 @@ mod tests {
 
     #[test]
     fn test_create_camera() {
-        // 如果没有摄像头，这会失败，但不会 panic
+        // This can fail when no camera is available, but must not panic.
         let result = AVFoundationCamera::new(0);
-        // 不断言成功，因为可能没有摄像头
+        // Do not require success because the host may have no camera.
         let _ = result;
     }
 
     #[test]
     fn test_authorization_status() {
         let status = AVFoundationCamera::authorization_status();
-        // 只要能调用就行
+        // Verify that the method can be called safely.
         println!("Authorization status: {:?}", status);
     }
 }

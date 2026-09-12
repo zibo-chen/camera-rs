@@ -48,14 +48,16 @@ fn open(path: &Path) -> CameraResult<File> {
         .custom_flags(libc::O_NONBLOCK | libc::O_CLOEXEC)
         .open(path)
         .map_err(|e| match e.kind() {
-            std::io::ErrorKind::NotFound => CameraError::DeviceNotFound(path.display().to_string()),
-            std::io::ErrorKind::PermissionDenied => {
-                CameraError::PermissionDenied(format!("{}: {e}", path.display()))
+            std::io::ErrorKind::NotFound => {
+                CameraError::device_not_found(path.display().to_string())
             }
-            _ => CameraError::DeviceOpenFailed(format!("{}: {e}", path.display())),
+            std::io::ErrorKind::PermissionDenied => {
+                CameraError::permission_denied(format!("{}: {e}", path.display()))
+            }
+            _ => CameraError::device_open_failed(format!("{}: {e}", path.display())),
         })?;
     native::probe(file.as_raw_fd()).map_err(|e| {
-        CameraError::DeviceOpenFailed(format!(
+        CameraError::device_open_failed(format!(
             "{} is not a supported V4L2 capture device: {e}",
             path.display()
         ))
@@ -250,7 +252,7 @@ impl Inner {
         if let Some(worker) = state.worker.take() {
             worker
                 .join()
-                .map_err(|_| CameraError::StreamError("V4L2 capture worker panicked".into()))??;
+                .map_err(|_| CameraError::stream_error("V4L2 capture worker panicked".into()))??;
         }
         Ok(())
     }
@@ -265,7 +267,7 @@ impl Inner {
             return if state.config.as_ref() == Some(&config) {
                 Ok(())
             } else {
-                Err(CameraError::StreamError(
+                Err(CameraError::stream_error(
                     "Stop the V4L2 stream before changing configuration".into(),
                 ))
             };
@@ -324,7 +326,7 @@ impl Inner {
                         format.strides,
                         |planes, timestamp, clock, source_sequence, damaged| {
                             if damaged {
-                                let error = CameraError::InvalidFormat(
+                                let error = CameraError::invalid_frame(
                                     "V4L2 driver marked frame damaged".into(),
                                 );
                                 hub.record_input_error(session);
@@ -337,7 +339,7 @@ impl Inner {
                             });
                             if !native_output && actual.format == VideoFormat::MJPEG {
                                 let Some(plane) = planes.first() else {
-                                    return Err(CameraError::BufferEmpty);
+                                    return Err(CameraError::buffer_exhausted());
                                 };
                                 compressed_scratch.clear();
                                 compressed_scratch.extend_from_slice(plane.data);
@@ -394,19 +396,20 @@ impl Inner {
                     }
                     match result {
                         Ok(()) => last_frame = Instant::now(),
-                        Err(CameraError::Io(error))
-                            if error.raw_os_error() == Some(libc::ECANCELED) =>
+                        Err(error)
+                            if error.io_error().and_then(std::io::Error::raw_os_error)
+                                == Some(libc::ECANCELED) =>
                         {
                             break
                         }
-                        Err(CameraError::Io(error))
+                        Err(error)
                             if matches!(
-                                error.raw_os_error(),
+                                error.io_error().and_then(std::io::Error::raw_os_error),
                                 Some(libc::EAGAIN | libc::ETIMEDOUT)
                             ) =>
                         {
                             if last_frame.elapsed() >= Duration::from_secs(5) {
-                                return Err(CameraError::StreamError(
+                                return Err(CameraError::stream_error(
                                     "V4L2 delivered no buffers for 5 seconds".into(),
                                 ));
                             }
@@ -435,7 +438,7 @@ impl Inner {
                 let _ = self.stop_locked(&mut state);
                 Err(match response {
                     Ok(Err(error)) => error,
-                    _ => CameraError::StreamError("V4L2 worker exited during startup".into()),
+                    _ => CameraError::stream_error("V4L2 worker exited during startup".into()),
                 })
             }
         }
@@ -458,7 +461,7 @@ fn requested_format(fd: i32, config: &CameraConfig) -> CameraResult<native::Form
     }
     Ok(native::Format {
         fourcc: selected.ok_or_else(|| {
-            CameraError::UnsupportedFormat(format!(
+            CameraError::unsupported_format(format!(
                 "V4L2 device does not advertise {:?}",
                 config.format
             ))
@@ -472,15 +475,15 @@ fn requested_format(fd: i32, config: &CameraConfig) -> CameraResult<native::Form
 }
 fn config_from_format(format: &native::Format) -> CameraResult<CameraConfig> {
     let pixel_format = from_fourcc(format.fourcc).ok_or_else(|| {
-        CameraError::UnsupportedFormat(format!("V4L2 negotiated fourcc 0x{:08x}", format.fourcc))
+        CameraError::unsupported_format(format!("V4L2 negotiated fourcc 0x{:08x}", format.fourcc))
     })?;
     if format.planes != 1 && !(pixel_format == VideoFormat::NV12 && format.planes == 2) {
-        return Err(CameraError::UnsupportedFormat(
+        return Err(CameraError::unsupported_format(
             "Unsupported V4L2 plane layout".into(),
         ));
     }
     if format.fps == 0 {
-        return Err(CameraError::UnsupportedFormat(
+        return Err(CameraError::unsupported_format(
             "V4L2 driver does not report a frame interval".into(),
         ));
     }
@@ -503,7 +506,7 @@ fn native_layout(
         VideoFormat::NV12 => PixelFormat::Nv12,
         VideoFormat::RGB => PixelFormat::Rgb8,
         VideoFormat::Gray => PixelFormat::Gray8,
-        _ => return Err(CameraError::UnsupportedFormat("V4L2 native layout".into())),
+        _ => return Err(CameraError::unsupported_format("V4L2 native layout".into())),
     };
     let mut layout = FrameLayout::packed(
         config.width,
@@ -535,7 +538,7 @@ fn native_layout(
                 .stride
                 .checked_mul(config.height as usize)
                 .filter(|&n| n < planes[0].data.len())
-                .ok_or_else(|| CameraError::InvalidFormat("Truncated V4L2 NV12".into()))?;
+                .ok_or_else(|| CameraError::invalid_frame("Truncated V4L2 NV12".into()))?;
             layout.planes[0].length = y_len;
             (y_len, planes[0].data.len() - y_len, planes[0].stride)
         };
@@ -567,7 +570,7 @@ impl CameraManager for V4l2Camera {
             let file = match open(&entry.path()) {
                 Ok(file) => file,
                 Err(error) => {
-                    if matches!(error, CameraError::PermissionDenied(_)) {
+                    if error.kind() == crate::CameraErrorKind::PermissionDenied {
                         denied.push(entry.path().display().to_string());
                     }
                     log::debug!("Skipping {}: {error}", entry.path().display());
@@ -602,7 +605,7 @@ impl CameraManager for V4l2Camera {
         }
         devices.sort_by_key(|d| d.index);
         if devices.is_empty() && !denied.is_empty() {
-            return Err(CameraError::PermissionDenied(format!(
+            return Err(CameraError::permission_denied(format!(
                 "V4L2 device access denied: {}. Android applications normally need Camera2 or an authorized USB descriptor.",
                 denied.join(", ")
             )));
@@ -652,7 +655,9 @@ impl CameraManager for V4l2Camera {
         }
         let mut format = match requested_format(fd, config) {
             Ok(f) => f,
-            Err(CameraError::UnsupportedFormat(_)) => return Ok(false),
+            Err(ref error) if error.kind() == crate::CameraErrorKind::UnsupportedFormat => {
+                return Ok(false)
+            }
             Err(e) => return Err(e),
         };
         match native::configure(fd, &mut format, false) {
@@ -841,13 +846,13 @@ impl StreamingCamera for V4l2Camera {
         let inner = self.inner.clone();
         tokio::task::spawn_blocking(move || inner.start(config))
             .await
-            .map_err(|e| CameraError::Other(e.to_string()))?
+            .map_err(|e| CameraError::worker_failure(e.to_string()).with_source(e))?
     }
     async fn stop_stream(&self) -> CameraResult<()> {
         let inner = self.inner.clone();
         tokio::task::spawn_blocking(move || inner.stop())
             .await
-            .map_err(|e| CameraError::Other(e.to_string()))?
+            .map_err(|e| CameraError::worker_failure(e.to_string()).with_source(e))?
     }
     fn get_latest_frame(&self) -> CameraResult<Option<Array3<u8>>> {
         Ok(self.inner.hub.latest().map(|f| {
@@ -885,7 +890,7 @@ impl StreamingCamera for V4l2Camera {
     /// snapshot pool remains bounded independently at its default capacity.
     async fn set_buffer_size(&self, size: usize) -> CameraResult<()> {
         if !(2..=32).contains(&size) {
-            return Err(CameraError::InvalidConfig(
+            return Err(CameraError::invalid_config(
                 "V4L2 buffer count must be between 2 and 32".into(),
             ));
         }
@@ -893,7 +898,7 @@ impl StreamingCamera for V4l2Camera {
         tokio::task::spawn_blocking(move || {
             let mut state = inner.state.lock();
             if inner.hub.is_streaming() {
-                return Err(CameraError::StreamError(
+                return Err(CameraError::stream_error(
                     "Stop V4L2 before changing buffer count".into(),
                 ));
             }
@@ -901,7 +906,7 @@ impl StreamingCamera for V4l2Camera {
             Ok(())
         })
         .await
-        .map_err(|e| CameraError::Other(e.to_string()))?
+        .map_err(|e| CameraError::worker_failure(e.to_string()).with_source(e))?
     }
 }
 
@@ -962,7 +967,7 @@ fn auto_control(control: CameraControlType) -> Option<CameraControlType> {
 }
 fn control_error(control: CameraControlType, error: std::io::Error) -> CameraError {
     if matches!(error.raw_os_error(), Some(libc::EINVAL | libc::ENOTSUP)) {
-        CameraError::ControlNotSupported(control.display_name().to_string())
+        CameraError::control_not_supported(control.display_name().to_string())
     } else {
         error.into()
     }
@@ -1012,7 +1017,7 @@ impl CameraControl for V4l2Camera {
         let _guard = self.inner.state.lock();
         let range = self.query(control)?;
         if range.read_only != 0 {
-            return Err(CameraError::ControlNotSupported(format!(
+            return Err(CameraError::control_not_supported(format!(
                 "{control:?} is read-only"
             )));
         }
@@ -1020,14 +1025,14 @@ impl CameraControl for V4l2Camera {
             CameraControlValue::Integer { value, is_auto } => (value, is_auto),
             CameraControlValue::Boolean(v) => (i32::from(v), false),
             CameraControlValue::Float(_) => {
-                return Err(CameraError::InvalidConfig(
+                return Err(CameraError::invalid_config(
                     "V4L2 controls require integer or boolean values".into(),
                 ))
             }
         };
         if control.is_auto_control() {
             if value != 0 && value != 1 {
-                return Err(CameraError::InvalidConfig(
+                return Err(CameraError::invalid_config(
                     "V4L2 auto controls require 0 or 1".into(),
                 ));
             }
@@ -1037,7 +1042,7 @@ impl CameraControl for V4l2Camera {
         if auto {
             return self.write_auto(
                 automatic.ok_or_else(|| {
-                    CameraError::ControlNotSupported(format!("{control:?} has no automatic mode"))
+                    CameraError::control_not_supported(format!("{control:?} has no automatic mode"))
                 })?,
                 true,
             );
@@ -1046,7 +1051,7 @@ impl CameraControl for V4l2Camera {
             || value > range.max
             || (i64::from(value) - i64::from(range.min)) % i64::from(range.step.max(1)) != 0
         {
-            return Err(CameraError::InvalidConfig(format!(
+            return Err(CameraError::invalid_config(format!(
                 "{control:?} is outside its V4L2 range/step"
             )));
         }

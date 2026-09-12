@@ -1,7 +1,7 @@
 //! Physical-device diagnostic. Android V4L2 requires access to /dev/videoN.
 use camera::{
-    BackendId, BackendPolicy, CameraError, CameraSystem, CaptureFormat, CaptureRequest,
-    DeviceSelector, FrameRate, SubscriptionOptions, V4l2Options,
+    BackendId, BackendPolicy, CameraSystem, CaptureFormat, CaptureRequest, DeviceSelector,
+    FrameRate, SubscriptionOptions, V4l2Options,
 };
 use std::time::{Duration, Instant};
 
@@ -117,7 +117,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         session.close().await?;
         assert!(matches!(
             receiver.next().await,
-            Err(CameraError::StreamStopped)
+            Err(ref error) if error.kind() == camera::CameraErrorKind::StreamStopped
         ));
         let count = fds();
         if let Some(warm) = warm_fds {

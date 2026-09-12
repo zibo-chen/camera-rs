@@ -3,7 +3,7 @@ use turbojpeg::Decompressor;
 
 fn complete_frame(data: &[u8]) -> CameraResult<&[u8]> {
     if data.len() < 4 || !data.starts_with(&[0xff, 0xd8]) {
-        return Err(CameraError::InvalidFormat(
+        return Err(CameraError::invalid_frame(
             "MJPEG frame is missing its JPEG start marker".into(),
         ));
     }
@@ -15,7 +15,7 @@ fn complete_frame(data: &[u8]) -> CameraResult<&[u8]> {
         .rposition(|marker| marker == [0xff, 0xd9])
         .map(|position| position + 2)
         .ok_or_else(|| {
-            CameraError::InvalidFormat("MJPEG frame is missing its JPEG end marker".into())
+            CameraError::invalid_frame("MJPEG frame is missing its JPEG end marker".into())
         })?;
     Ok(&data[..end])
 }
@@ -36,7 +36,7 @@ pub(crate) fn decode_with<T>(
     let complete = complete_frame(data)?;
     if decoder.is_none() {
         *decoder = Some(
-            Decompressor::new().map_err(|error| CameraError::InvalidFormat(error.to_string()))?,
+            Decompressor::new().map_err(|error| CameraError::invalid_frame(error.to_string()))?,
         );
     }
     let result = decode(decoder.as_mut().unwrap(), complete);

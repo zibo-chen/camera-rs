@@ -1,17 +1,19 @@
 [package]
-name = "camera-android"
-version = "0.4.0"
+name = "camera-rs-android"
+version = "0.5.0"
 edition = "2021"
 rust-version = "1.88"
 license = "MIT OR Apache-2.0"
 readme = "README.md"
-include = ["src/**", "Cargo.toml", "README.md", "LICENSE-*"]
+documentation = "https://docs.rs/camera-rs-android"
+homepage = "https://docs.rs/camera-rs-android"
+include = ["src/**", "java/**", "tests/**", "Cargo.toml", "README.md", "LICENSE-*"]
 description = "Android USB permission and JNI adapter for camera"
-[workspace]
 [lib]
+name = "camera_android"
 crate-type = ["rlib", "cdylib", "staticlib"]
 [dependencies]
-camera = { path = "..", version = "0.4.0", default-features = false, features = ["runtime-tokio"] }
+camera = { package = "camera-rs", path = "..", version = "0.5.0", default-features = false, features = ["runtime-tokio"] }
 jni = "0.21"
 log = "0.4"
 libc = "0.2"
@@ -20,9 +22,16 @@ serde_json = "1.0"
 tokio = { version = "1", features = ["rt-multi-thread", "sync", "time"] }
 
 [features]
-default = ["camera2"]
+# The Java facade's start() method returns RGB frames. Keep the default feature
+# set aligned with that public contract so a default Camera2 build is usable.
+default = ["camera2", "convert-rgb"]
 camera2 = ["camera/backend-camera2"]
 uvc = ["camera/backend-uvc"]
 v4l2 = ["camera/backend-v4l2"]
 convert-rgb = ["camera/convert-rgb"]
 decode-mjpeg = ["camera/decode-mjpeg", "convert-rgb"]
+
+[package.metadata.docs.rs]
+no-default-features = true
+features = ["convert-rgb"]
+targets = ["x86_64-unknown-linux-gnu"]

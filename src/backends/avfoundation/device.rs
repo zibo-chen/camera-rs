@@ -1,4 +1,4 @@
-//! AVFoundation 设备枚举和权限处理
+//! AVFoundation device enumeration and permission handling.
 
 use crate::error::CameraError;
 use crate::types::{CameraConfig, CameraDeviceInfo, CameraResult, VideoFormat};
@@ -21,16 +21,16 @@ pub(super) fn fps_matches_range(requested: f64, min_fps: f64, max_fps: f64) -> b
     requested >= min_fps - FRAME_RATE_EPSILON && requested <= max_fps + FRAME_RATE_EPSILON
 }
 
-/// 权限状态
+/// Camera permission status.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AVAuthorizationStatus {
-    /// 用户尚未做出选择
+    /// The user has not made a choice.
     NotDetermined,
-    /// 用户无法更改此应用程序的状态（受限）
+    /// The user cannot change this application's restricted status.
     Restricted,
-    /// 用户明确拒绝
+    /// The user explicitly denied access.
     Denied,
-    /// 用户已授权
+    /// The user granted access.
     Authorized,
 }
 
@@ -46,7 +46,7 @@ impl From<AVAuthStatus> for AVAuthorizationStatus {
     }
 }
 
-/// 获取当前相机权限状态
+/// Returns the current camera permission status.
 pub fn authorization_status() -> AVAuthorizationStatus {
     unsafe {
         let video_type = AVMediaTypeVideo.expect("AVMediaTypeVideo should be available");
@@ -55,9 +55,9 @@ pub fn authorization_status() -> AVAuthorizationStatus {
     }
 }
 
-/// 请求相机权限
+/// Requests camera permission.
 ///
-/// 返回一个 Future，在用户做出选择后完成
+/// Returns a future that completes after the user responds.
 pub async fn request_authorization() -> bool {
     use block2::StackBlock;
     use std::sync::mpsc;
@@ -73,11 +73,11 @@ pub async fn request_authorization() -> bool {
         AVCaptureDevice::requestAccessForMediaType_completionHandler(video_type, &block);
     }
 
-    // 等待用户响应
+    // Wait for the user's response.
     rx.recv().unwrap_or(false)
 }
 
-/// 获取设备类型列表
+/// Returns the discovery device types.
 #[allow(deprecated)]
 fn get_device_types() -> Vec<&'static AVCaptureDeviceType> {
     unsafe {
@@ -94,19 +94,19 @@ fn get_device_types() -> Vec<&'static AVCaptureDeviceType> {
     }
 }
 
-/// 查询所有可用的摄像头设备
+/// Queries all available camera devices.
 pub fn query_devices() -> CameraResult<Vec<CameraDeviceInfo>> {
     unsafe {
         let mut devices = Vec::new();
 
-        // 创建设备类型数组
+        // Build the device type array.
         let device_types = get_device_types();
 
-        // 创建 NSArray
+        // Create the NSArray.
         let types_array: Retained<NSArray<AVCaptureDeviceType>> =
             NSArray::from_slice(&device_types);
 
-        // 创建 discovery session
+        // Create the discovery session.
         let video_type = AVMediaTypeVideo.expect("AVMediaTypeVideo should be available");
         let discovery_session =
             AVCaptureDeviceDiscoverySession::discoverySessionWithDeviceTypes_mediaType_position(
@@ -148,7 +148,7 @@ pub fn query_devices() -> CameraResult<Vec<CameraDeviceInfo>> {
     }
 }
 
-/// 根据索引获取 AVCaptureDevice
+/// Returns an AVCaptureDevice by index.
 pub(crate) fn get_device_by_index(index: u32) -> CameraResult<Retained<AVCaptureDevice>> {
     unsafe {
         let device_types = get_device_types();
@@ -167,7 +167,7 @@ pub(crate) fn get_device_by_index(index: u32) -> CameraResult<Retained<AVCapture
         let count = av_devices.len();
 
         if (index as usize) >= count {
-            return Err(CameraError::DeviceNotFound(format!(
+            return Err(CameraError::device_not_found(format!(
                 "Device index {} not found",
                 index
             )));
@@ -178,17 +178,17 @@ pub(crate) fn get_device_by_index(index: u32) -> CameraResult<Retained<AVCapture
     }
 }
 
-/// 根据 unique ID 获取 AVCaptureDevice
+/// Returns an AVCaptureDevice by unique ID.
 #[allow(dead_code)]
 pub(crate) fn get_device_by_id(unique_id: &str) -> CameraResult<Retained<AVCaptureDevice>> {
     unsafe {
         let ns_id = NSString::from_str(unique_id);
         AVCaptureDevice::deviceWithUniqueID(&ns_id)
-            .ok_or_else(|| CameraError::DeviceNotFound(format!("Device {} not found", unique_id)))
+            .ok_or_else(|| CameraError::device_not_found(format!("Device {} not found", unique_id)))
     }
 }
 
-/// 获取设备支持的配置
+/// Returns configurations supported by the device.
 pub(crate) fn get_supported_configs(device: &AVCaptureDevice) -> CameraResult<Vec<CameraConfig>> {
     unsafe {
         let mut configs = Vec::new();
@@ -198,7 +198,7 @@ pub(crate) fn get_supported_configs(device: &AVCaptureDevice) -> CameraResult<Ve
         for i in 0..count {
             let format = formats.objectAtIndex_unchecked(i);
             if let Some(config) = parse_format(format) {
-                // 获取该格式支持的帧率范围
+                // Enumerate frame-rate ranges for this format.
                 let frame_rate_ranges = format.videoSupportedFrameRateRanges();
                 let range_count = frame_rate_ranges.len();
 
@@ -231,9 +231,9 @@ pub(crate) fn get_supported_configs(device: &AVCaptureDevice) -> CameraResult<Ve
             }
         }
 
-        // 去重 - 需要考虑视频格式
+        // Deduplicate while preserving distinct video formats.
         configs.sort_by(|a, b| {
-            // 将 VideoFormat 转为判别序号进行排序
+            // Convert VideoFormat to a discriminant for ordering.
             let format_ord = |f: &crate::types::VideoFormat| -> u8 {
                 match f {
                     crate::types::VideoFormat::MJPEG => 0,
@@ -271,18 +271,18 @@ pub(crate) fn get_supported_configs(device: &AVCaptureDevice) -> CameraResult<Ve
     }
 }
 
-/// 解析 AVCaptureDeviceFormat 为 CameraConfig
+/// Converts an AVCaptureDeviceFormat into a CameraConfig.
 fn parse_format(format: &AVCaptureDeviceFormat) -> Option<CameraConfig> {
     unsafe {
         let format_desc = format.formatDescription();
 
-        // 获取分辨率
+        // Read the dimensions.
         let dimensions = objc2_core_media::CMVideoFormatDescriptionGetDimensions(&format_desc);
 
         let width = dimensions.width as u32;
         let height = dimensions.height as u32;
 
-        // 获取像素格式 - 使用方法调用
+        // Read the pixel format through the Objective-C method.
         let media_subtype = format_desc.media_sub_type();
 
         let video_format = fourcc_to_format(media_subtype)?;
@@ -292,14 +292,14 @@ fn parse_format(format: &AVCaptureDeviceFormat) -> Option<CameraConfig> {
             width,
             height,
             fps_denominator: 1,
-            fps: 30, // 默认值，会在调用者处更新
+            fps: 30, // Default value updated by the caller.
         })
     }
 }
 
-/// 将 FourCC 转换为 VideoFormat
+/// Converts a FourCC value into a VideoFormat.
 pub(crate) fn fourcc_to_format(fourcc: u32) -> Option<VideoFormat> {
-    // 常见的 FourCC 代码
+    // Common FourCC values.
     // https://developer.apple.com/documentation/corevideo/cvpixelformattype
     const KCVPIXELFORMATTYPE_422YPCBCR8: u32 = 0x32767579; // '2vuy' - UYVY
     const KCVPIXELFORMATTYPE_422YPCBCR8_YUVS: u32 = 0x79757673; // 'yuvs' - YUYV
@@ -337,7 +337,7 @@ fn cross_format_fallback_priority(format: VideoFormat) -> i32 {
     }
 }
 
-/// 根据配置查找最佳匹配的 AVCaptureDeviceFormat
+/// Finds the AVCaptureDeviceFormat that best matches a configuration.
 pub(crate) fn find_best_format(
     device: &AVCaptureDevice,
     config: &CameraConfig,
@@ -366,34 +366,34 @@ pub(crate) fn find_best_format(
             let width = dimensions.width as u32;
             let height = dimensions.height as u32;
 
-            // 获取格式的视频格式类型
+            // Resolve the format's VideoFormat value.
             let media_subtype = format_desc.media_sub_type();
             let video_format = match fourcc_to_format(media_subtype) {
                 Some(f) => f,
-                None => continue, // 跳过不支持的格式
+                None => continue, // Skip unsupported formats.
             };
 
-            // 计算匹配分数
+            // Calculate the match score.
             let mut score = 0;
             let mut fps_supported = false;
 
-            // 视频格式匹配得高分
+            // Strongly prefer an exact video format match.
             if video_format == config.format {
                 score += 2000;
             } else {
-                // 跳过格式不匹配的
+                // Reject mismatched formats in the exact pass.
                 continue;
             }
 
-            // 分辨率精确匹配得高分
+            // Strongly prefer an exact resolution match.
             if width == config.width && height == config.height {
                 score += 1000;
             } else {
-                // 跳过分辨率不匹配的格式
+                // Reject mismatched resolutions in the exact pass.
                 continue;
             }
 
-            // 检查帧率支持
+            // Check frame-rate support.
             let frame_rate_ranges = format.videoSupportedFrameRateRanges();
             let range_count = frame_rate_ranges.len();
 
@@ -404,7 +404,7 @@ pub(crate) fn find_best_format(
                 let requested_fps = config.frame_rate()?.as_f64();
                 if fps_matches_range(requested_fps, min_fps, max_fps) {
                     fps_supported = true;
-                    // 精确匹配最大帧率得更高分
+                    // Prefer an exact maximum frame-rate match.
                     if (requested_fps - max_fps).abs() <= FRAME_RATE_EPSILON {
                         score += 100;
                     } else {
@@ -414,7 +414,7 @@ pub(crate) fn find_best_format(
                 }
             }
 
-            // 只有支持指定帧率的格式才考虑
+            // Consider only formats that support the requested frame rate.
             if !fps_supported {
                 continue;
             }
@@ -434,7 +434,7 @@ pub(crate) fn find_best_format(
             }
         }
 
-        // 如果没有精确匹配，尝试寻找最接近的分辨率（同格式）
+        // If no exact match exists, find the closest resolution in the same format.
         if best_match.is_none() {
             log::warn!(
                 "No exact match for {:?} {}x{}@{}fps, searching for closest format...",
@@ -453,19 +453,19 @@ pub(crate) fn find_best_format(
                 let width = dimensions.width as u32;
                 let height = dimensions.height as u32;
 
-                // 获取格式的视频格式类型
+                // Resolve the format's VideoFormat value.
                 let media_subtype = format_desc.media_sub_type();
                 let video_format = match fourcc_to_format(media_subtype) {
                     Some(f) => f,
                     None => continue,
                 };
 
-                // 优先匹配相同视频格式
+                // Keep the requested video format.
                 if video_format != config.format {
                     continue;
                 }
 
-                // 检查帧率支持
+                // Check frame-rate support.
                 let frame_rate_ranges = format.videoSupportedFrameRateRanges();
                 let range_count = frame_rate_ranges.len();
 
@@ -484,11 +484,11 @@ pub(crate) fn find_best_format(
                     continue;
                 }
 
-                // 计算分辨率差异分数（越小越好）
+                // Smaller resolution differences produce better scores.
                 let diff = ((width as i32 - config.width as i32).abs()
                     + (height as i32 - config.height as i32).abs())
                     as i32;
-                let score = -diff; // 负分，差异越小分数越高
+                let score = -diff; // Negative distance: smaller differences rank higher.
 
                 if score > best_score {
                     best_score = score;
@@ -505,8 +505,8 @@ pub(crate) fn find_best_format(
             }
         }
 
-        // 如果仍然没有匹配，尝试使用任意可用格式（跨视频格式回退）
-        // 这对于 macOS 内置摄像头很重要，因为它们通常只支持 NV12
+        // If no same-format candidate exists, allow a cross-format fallback.
+        // This matters for built-in macOS cameras that often expose only NV12.
         if best_match.is_none() {
             log::warn!(
                 "No matching format for {:?}, trying any available format for {}x{}@{}fps...",
@@ -525,14 +525,14 @@ pub(crate) fn find_best_format(
                 let width = dimensions.width as u32;
                 let height = dimensions.height as u32;
 
-                // 获取格式的视频格式类型
+                // Resolve the format's VideoFormat value.
                 let media_subtype = format_desc.media_sub_type();
                 let video_format = match fourcc_to_format(media_subtype) {
                     Some(f) => f,
                     None => continue,
                 };
 
-                // 检查帧率支持
+                // Check frame-rate support.
                 let frame_rate_ranges = format.videoSupportedFrameRateRanges();
                 let range_count = frame_rate_ranges.len();
 
@@ -551,12 +551,12 @@ pub(crate) fn find_best_format(
                     continue;
                 }
 
-                // 计算分辨率差异分数
+                // Calculate resolution distance.
                 let diff = ((width as i32 - config.width as i32).abs()
                     + (height as i32 - config.height as i32).abs())
                     as i32;
 
-                // 分数 = 格式优先级 * 1000 - 分辨率差异
+                // Score = format priority * 1000 - resolution distance.
                 let score = cross_format_fallback_priority(video_format) * 1000 - diff;
 
                 if score > best_score {
@@ -592,7 +592,7 @@ pub(crate) fn find_best_format(
         }
 
         best_match.ok_or_else(|| {
-            CameraError::UnsupportedFormat(format!(
+            CameraError::unsupported_format(format!(
                 "No matching format for {:?} {}x{}@{:.6}fps ({}/{})",
                 config.format,
                 config.width,
@@ -611,14 +611,14 @@ mod tests {
 
     #[test]
     fn test_authorization_status() {
-        // 只测试函数能正常调用
+        // Verify that the function can be called safely.
         let _status = authorization_status();
     }
 
     #[test]
     fn test_query_devices() {
         let result = query_devices();
-        // 在没有摄像头的环境中可能返回空列表，但不应该出错
+        // A host without cameras may return an empty list without error.
         assert!(result.is_ok());
     }
 

@@ -22,8 +22,11 @@ pub(crate) enum RecoveryTrigger {
     FrameErrors { consecutive: u64 },
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+/// Values for `FrameKey`.
 pub struct FrameKey {
+    /// The session value.
     pub session: u64,
+    /// The sequence value.
     pub sequence: u64,
 }
 #[derive(Clone, Debug)]
@@ -100,47 +103,57 @@ impl Storage {
 /// Cheaply shared immutable frame. RGB/native bytes never change while retained.
 #[derive(Debug)]
 pub struct CapturedFrame {
+    /// The key value.
     pub key: FrameKey,
     storage: Storage,
     layout: FrameLayout,
     /// Host monotonic processing-entry time, not the sensor exposure time.
     pub captured_at: Instant,
+    /// The timestamp ns value.
     pub timestamp_ns: u64,
+    /// The source timestamp ns value.
     pub source_timestamp_ns: Option<i64>,
     source_clock: ClockDomain,
+    /// The source sequence value.
     pub source_sequence: Option<u64>,
 }
+/// Convenient result type for `Frame`.
 pub type Frame = Arc<CapturedFrame>;
 impl CapturedFrame {
+    /// Performs the `age` operation.
     pub fn age(&self) -> Duration {
         self.captured_at.elapsed()
     }
+    /// Performs the `layout` operation.
     pub fn layout(&self) -> &FrameLayout {
         &self.layout
     }
+    /// Performs the `bytes` operation.
     pub fn bytes(&self) -> &[u8] {
         self.storage.bytes()
     }
+    /// Performs the `plane` operation.
     pub fn plane(&self, index: usize) -> Option<&[u8]> {
         let p = self.layout.planes.get(index)?;
         self.bytes().get(p.offset..p.offset + p.length)
     }
+    /// Performs the `rgb_view` operation.
     pub fn rgb_view(&self) -> CameraResult<RgbView<'_>> {
         if self.layout.format != PixelFormat::Rgb8 || self.layout.planes.len() != 1 {
-            return Err(CameraError::UnsupportedFormat(
+            return Err(CameraError::unsupported_format(
                 "Frame layout is not packed RGB8".into(),
             ));
         }
         let plane = self.layout.planes[0];
         if plane.pixel_stride != 3 {
-            return Err(CameraError::InvalidFormat(
+            return Err(CameraError::invalid_frame(
                 "RGB8 pixel stride must be three bytes".into(),
             ));
         }
         let bytes = self
             .bytes()
             .get(plane.offset..plane.offset + plane.length)
-            .ok_or_else(|| CameraError::InvalidFormat("RGB plane is outside the frame".into()))?;
+            .ok_or_else(|| CameraError::invalid_frame("RGB plane is outside the frame".into()))?;
         Ok(RgbView {
             bytes,
             width: self.layout.width as usize,
@@ -148,21 +161,24 @@ impl CapturedFrame {
             row_stride: plane.row_stride,
         })
     }
+    /// Performs the `source_timestamp` operation.
     pub fn source_timestamp(&self) -> Option<SourceTimestamp> {
         self.source_timestamp_ns.map(|nanoseconds| SourceTimestamp {
             nanoseconds,
             clock: self.source_clock,
         })
     }
+    /// Performs the `copy_to` operation.
     pub fn copy_to(&self, out: &mut [u8]) -> CameraResult<()> {
         if out.len() != self.bytes().len() {
-            return Err(CameraError::InvalidFormat(
+            return Err(CameraError::invalid_frame(
                 "Destination length differs from frame".into(),
             ));
         }
         out.copy_from_slice(self.bytes());
         Ok(())
     }
+    /// Performs the `to_owned_bytes` operation.
     pub fn to_owned_bytes(&self) -> Vec<u8> {
         self.bytes().to_vec()
     }
@@ -170,12 +186,13 @@ impl CapturedFrame {
     pub(crate) fn rgb_pixels(&self) -> CameraResult<&Arc<Pixels<u8>>> {
         match &self.storage {
             Storage::Rgb(p) => Ok(p),
-            _ => Err(CameraError::UnsupportedFormat(
+            _ => Err(CameraError::unsupported_format(
                 "Frame is native; request RGB or convert explicitly".into(),
             )),
         }
     }
     #[cfg(feature = "ndarray")]
+    /// Performs the `ndarray_view` operation.
     pub fn ndarray_view(&self) -> CameraResult<ndarray::ArrayView3<'_, u8>> {
         use ndarray::ShapeBuilder;
         let view = self.rgb_view()?;
@@ -183,11 +200,12 @@ impl CapturedFrame {
             (view.height, view.width, 3).strides((view.row_stride, 3, 1)),
             view.bytes,
         )
-        .map_err(|error| CameraError::InvalidFormat(error.to_string()))
+        .map_err(|error| CameraError::invalid_frame(error.to_string()))
     }
 }
 
 #[derive(Clone, Copy, Debug)]
+/// Values for `RgbView`.
 pub struct RgbView<'a> {
     bytes: &'a [u8],
     width: usize,
@@ -196,18 +214,22 @@ pub struct RgbView<'a> {
 }
 
 impl<'a> RgbView<'a> {
+    /// Performs the `width` operation.
     pub fn width(&self) -> usize {
         self.width
     }
 
+    /// Performs the `height` operation.
     pub fn height(&self) -> usize {
         self.height
     }
 
+    /// Performs the `row_stride` operation.
     pub fn row_stride(&self) -> usize {
         self.row_stride
     }
 
+    /// Performs the `row` operation.
     pub fn row(&self, index: usize) -> Option<&'a [u8]> {
         if index >= self.height {
             return None;
@@ -217,27 +239,39 @@ impl<'a> RgbView<'a> {
             .get(start..start.checked_add(self.width.checked_mul(3)?)?)
     }
 
+    /// Performs the `bytes` operation.
     pub fn bytes(&self) -> &'a [u8] {
         self.bytes
     }
 }
 #[derive(Clone, Default, Debug)]
+/// Values for `FrameMetrics`.
 pub struct FrameMetrics {
+    /// Number of frames received from the backend.
     pub received: u64,
+    /// Number of frames published to consumers.
     pub published: u64,
+    /// Frames dropped because the bounded pool was exhausted.
     pub pool_drops: u64,
+    /// Number of frame conversion failures.
     pub conversion_errors: u64,
     /// Failed conversions since the latest successfully published frame.
     pub consecutive_conversion_errors: u64,
     /// Largest failed-conversion burst observed in the current session.
     pub max_consecutive_conversion_errors: u64,
+    /// The allocated buffers value.
     pub allocated_buffers: usize,
+    /// The allocated bytes value.
     pub allocated_bytes: usize,
+    /// The retained buffers value.
     pub retained_buffers: usize,
+    /// The conversion total ns value.
     pub conversion_total_ns: u64,
+    /// The conversion max ns value.
     pub conversion_max_ns: u64,
     /// Quantiles of at most the latest 256 published-frame conversion durations.
     pub conversion_p50_ns: u64,
+    /// The conversion p95 ns value.
     pub conversion_p95_ns: u64,
 }
 #[derive(Clone, Default)]
@@ -296,6 +330,7 @@ impl Default for FrameHub {
     }
 }
 impl FrameHub {
+    /// Creates a frame hub with a bounded reusable-buffer pool.
     pub fn new(capacity: usize) -> Self {
         let (state, _) = watch::channel(Snapshot::default());
         let (recovery_wake, _) = watch::channel(0);
@@ -324,13 +359,13 @@ impl FrameHub {
     }
     pub(crate) fn configure(&self, r: &StreamRequest) -> CameraResult<()> {
         if self.is_streaming() {
-            return Err(CameraError::InvalidState(
+            return Err(CameraError::invalid_state(
                 "Stop before configuring buffers".into(),
             ));
         }
         let mut pool = self.pool.lock();
         if pool.slots.iter().any(|s| s.data.is_none() && s.bytes > 0) {
-            return Err(CameraError::InvalidState(
+            return Err(CameraError::invalid_state(
                 "Frame conversion is still finishing".into(),
             ));
         }
@@ -339,7 +374,7 @@ impl FrameHub {
         if pool.slots.len() > r.memory.buffers
             || pool.slots.iter().map(|s| s.bytes).sum::<usize>() > r.memory.bytes
         {
-            return Err(CameraError::InvalidConfig(
+            return Err(CameraError::invalid_config(
                 "Retained frames exceed the new budget".into(),
             ));
         }
@@ -348,6 +383,7 @@ impl FrameHub {
             .store(r.output == OutputFormat::Native, Ordering::Release);
         Ok(())
     }
+    /// Starts a new stream generation and returns its session identifier.
     pub fn start(&self) -> u64 {
         let mut pool = self.pool.lock();
         pool.metrics = FrameMetrics::default();
@@ -410,6 +446,7 @@ impl FrameHub {
             s.recovering = false;
         });
     }
+    /// Marks the current stream generation as stopped and wakes subscribers.
     pub fn stop(&self) {
         self.pool.lock().stopped = Some(Instant::now());
         self.clear_queues();
@@ -419,12 +456,15 @@ impl FrameHub {
         });
         self.wake_recovery();
     }
+    /// Returns the current stream session identifier.
     pub fn session(&self) -> u64 {
         self.state.borrow().session
     }
+    /// Returns whether the frame hub currently accepts published frames.
     pub fn is_streaming(&self) -> bool {
         self.state.borrow().active
     }
+    /// Returns the latest published frame, if one exists.
     pub fn latest(&self) -> Option<Frame> {
         self.state.borrow().latest.clone()
     }
@@ -579,6 +619,7 @@ impl FrameHub {
             last: None,
         })
     }
+    /// Waits for a frame newer than `after` until the timeout expires.
     pub async fn wait_after(
         &self,
         after: Option<FrameKey>,
@@ -595,15 +636,16 @@ impl FrameHub {
         timeout: Duration,
     ) -> CameraResult<Frame> {
         if self.session() != session {
-            return Err(CameraError::StreamStopped);
+            return Err(CameraError::stream_stopped());
         }
         let mut rx = self.subscribe_with(SubscriptionOptions::latest())?;
         let frame = rx.next_timeout(timeout).await?;
         if frame.key.session != session {
-            return Err(CameraError::StreamStopped);
+            return Err(CameraError::stream_stopped());
         }
         Ok(frame)
     }
+    /// Publishes an RGB frame filled by `convert` into a pooled buffer.
     pub fn publish_rgb(
         &self,
         session: u64,
@@ -656,10 +698,11 @@ impl FrameHub {
             .try_fold(0, |n: usize, p| {
                 p.offset.checked_add(p.length).map(|end| n.max(end))
             })
-            .ok_or_else(|| CameraError::InvalidFormat("Native plane extent overflow".into()))?;
+            .ok_or_else(|| CameraError::invalid_frame("Native plane extent overflow".into()))?;
         layout.validate(length)?;
         self.publish(session, layout, timestamp, None, false, convert)
     }
+    #[cfg_attr(not(feature = "custom-backend"), allow(dead_code))]
     pub(crate) fn publish_native(
         &self,
         session: u64,
@@ -671,7 +714,7 @@ impl FrameHub {
         let len = parts
             .iter()
             .try_fold(0usize, |n, p| n.checked_add(p.len()))
-            .ok_or_else(|| CameraError::InvalidFormat("Native size overflow".into()))?;
+            .ok_or_else(|| CameraError::invalid_frame("Native size overflow".into()))?;
         layout.validate(len)?;
         let end = layout
             .planes
@@ -680,7 +723,7 @@ impl FrameHub {
             .max()
             .unwrap_or(0);
         if end != len {
-            return Err(CameraError::InvalidFormat(
+            return Err(CameraError::invalid_frame(
                 "Native payload contains undescribed trailing data".into(),
             ));
         }
@@ -694,6 +737,7 @@ impl FrameHub {
         })
     }
 
+    #[cfg_attr(not(feature = "custom-backend"), allow(dead_code))]
     pub(crate) fn writable_native(
         &self,
         session: u64,
@@ -703,7 +747,7 @@ impl FrameHub {
         layout.validate(length)?;
         let lease = self
             .reserve(session, &layout, false)?
-            .ok_or(CameraError::BufferEmpty)?;
+            .ok_or(CameraError::buffer_exhausted())?;
         Ok(NativeWriteLease {
             lease: Some(lease),
             session,
@@ -727,7 +771,7 @@ impl FrameHub {
         };
         length
             .filter(|&length| length > 0 && length <= MAX_FRAME_BYTES)
-            .ok_or_else(|| CameraError::InvalidFormat("Frame exceeds size limit".into()))
+            .ok_or_else(|| CameraError::invalid_frame("Frame exceeds size limit".into()))
     }
 
     fn reserve(
@@ -974,6 +1018,7 @@ impl FrameHub {
         }
         Ok(published)
     }
+    /// Returns a snapshot of allocation, delivery, and conversion metrics.
     pub fn metrics(&self) -> FrameMetrics {
         let (mut samples, allocated_buffers, allocated_bytes, retained_buffers, metrics) = {
             let p = self.pool.lock();
@@ -1004,6 +1049,7 @@ impl FrameHub {
             ..metrics
         }
     }
+    /// Returns a snapshot of stream throughput and buffer statistics.
     pub fn stats(&self) -> StreamStats {
         let p = self.pool.lock();
         StreamStats {
@@ -1028,6 +1074,7 @@ impl FrameHub {
         }
     }
 }
+#[cfg_attr(not(feature = "custom-backend"), allow(dead_code))]
 pub(crate) struct NativeWriteLease {
     lease: Option<Lease>,
     session: u64,
@@ -1036,6 +1083,7 @@ pub(crate) struct NativeWriteLease {
     captured_at: Instant,
 }
 
+#[cfg_attr(not(feature = "custom-backend"), allow(dead_code))]
 impl NativeWriteLease {
     pub(crate) fn bytes_mut(&mut self) -> &mut [u8] {
         self.lease
@@ -1101,15 +1149,19 @@ impl FrameReceiver {
         let _ = self.subscriber.owner.set(flag);
         self
     }
+    /// Performs the `last_key` operation.
     pub fn last_key(&self) -> Option<FrameKey> {
         self.last
     }
+    /// Performs the `queued_frames` operation.
     pub fn queued_frames(&self) -> usize {
         self.subscriber.queue.lock().len()
     }
+    /// Performs the `dropped_frames` operation.
     pub fn dropped_frames(&self) -> u64 {
         self.subscriber.dropped.load(Ordering::Relaxed)
     }
+    /// Performs the `next` operation.
     pub async fn next(&mut self) -> CameraResult<Frame> {
         loop {
             {
@@ -1121,7 +1173,7 @@ impl FrameReceiver {
                     .is_some_and(|f| f.load(Ordering::Acquire))
                     || (!state.active && !state.recovering && !state.reconnect_enabled)
                 {
-                    return Err(CameraError::StreamStopped);
+                    return Err(CameraError::stream_stopped());
                 }
                 let mut q = self.subscriber.queue.lock();
                 while let Some(f) = q.pop_front() {
@@ -1134,14 +1186,13 @@ impl FrameReceiver {
             self.state
                 .changed()
                 .await
-                .map_err(|_| CameraError::StreamStopped)?;
+                .map_err(|_| CameraError::stream_stopped())?;
         }
     }
+    /// Performs the `next_timeout` operation.
     pub async fn next_timeout(&mut self, timeout: Duration) -> CameraResult<Frame> {
         tokio::time::timeout(timeout, self.next())
             .await
-            .map_err(|_| CameraError::Timeout {
-                stage: crate::OperationStage::FrameWait,
-            })?
+            .map_err(|_| CameraError::timeout(crate::OperationStage::FrameWait))?
     }
 }

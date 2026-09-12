@@ -12,7 +12,7 @@ fn main() {
         println!("cargo:rustc-cfg=camera_v4l2");
     }
 
-    // 检查是否启用了 backend-uvc feature
+    // Detect whether the UVC backend feature is enabled.
     let backend_uvc_enabled = env::var("CARGO_FEATURE_BACKEND_UVC").is_ok()
         && matches!(target_os.as_str(), "linux" | "macos" | "android");
 
@@ -27,7 +27,7 @@ fn main() {
     let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
     let thirdparty_dir = manifest_dir.join("3rdparty");
 
-    // Android 必须链接 log 库
+    // Android requires the system log library.
     if target_os == "android" {
         println!("cargo:rustc-link-lib=log");
     }
@@ -53,22 +53,22 @@ fn main() {
             .compile("camera_v4l2");
     }
 
-    // 仅在启用 backend-uvc feature 时编译 UVC 相关的 C 库
+    // Compile the native UVC libraries only when the backend is enabled.
     if backend_uvc_enabled {
         compile_libusb(&thirdparty_dir, &target_os);
         compile_libuvc(&thirdparty_dir, &target_os);
-        println!("cargo:warning=✓ UVC C 库编译完成");
+        println!("cargo:warning=UVC native libraries compiled");
     } else {
-        println!("cargo:warning=跳过 UVC C 库编译 (未启用 backend-uvc feature)");
+        println!("cargo:warning=Skipping UVC native libraries (backend-uvc is disabled)");
     }
 
-    // 仅在 Android 平台且启用 backend-camera2 feature 时编译 NDK Camera2 桥接层
+    // Compile the NDK Camera2 bridge only for an enabled Android backend.
     let backend_camera2_enabled = env::var("CARGO_FEATURE_BACKEND_CAMERA2").is_ok();
     if backend_camera2_enabled && target_os == "android" {
         compile_ndk_camera2_bridge(&manifest_dir);
-        println!("cargo:warning=✓ NDK Camera2 桥接层编译完成");
+        println!("cargo:warning=Android NDK Camera2 bridge compiled");
     } else if backend_camera2_enabled {
-        println!("cargo:warning=跳过 NDK Camera2 编译 (非 Android 平台)");
+        println!("cargo:warning=Skipping the NDK Camera2 bridge on this target");
     }
 }
 
@@ -79,15 +79,15 @@ fn compile_libusb(thirdparty_dir: &Path, target_os: &str) {
         panic!("backend-uvc requires bundled libusb sources; reinstall the source package");
     }
 
-    println!("cargo:warning=编译 libusb...");
+    println!("cargo:warning=Compiling bundled libusb");
 
-    // 生成平台特定的 config.h
+    // Generate the platform-specific config.h.
     let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
     generate_libusb_config(&out_dir, target_os);
 
     let mut build = cc::Build::new();
 
-    // 核心源文件
+    // Core sources.
     build
         .file(libusb_dir.join("core.c"))
         .file(libusb_dir.join("descriptor.c"))
@@ -96,7 +96,7 @@ fn compile_libusb(thirdparty_dir: &Path, target_os: &str) {
         .file(libusb_dir.join("strerror.c"))
         .file(libusb_dir.join("sync.c"));
 
-    // 平台特定源文件
+    // Platform-specific sources.
     if target_os == "android" || target_os == "linux" {
         let os_dir = libusb_dir.join("os");
         build
@@ -111,19 +111,19 @@ fn compile_libusb(thirdparty_dir: &Path, target_os: &str) {
             .file(os_dir.join("events_posix.c"))
             .file(os_dir.join("threads_posix.c"));
     } else if target_os == "windows" {
-        println!("cargo:warning=⚠ Windows 不支持 libusb 直接访问 UVC 摄像头");
-        println!("cargo:warning=  请使用 Windows Media Foundation 或 DirectShow");
+        println!("cargo:warning=Bundled libusb UVC access is unsupported on Windows");
+        println!("cargo:warning=Use the Media Foundation backend on Windows");
         return;
     }
 
-    // 包含目录 - 优先使用生成的 config.h
+    // Include directories, with the generated config.h taking precedence.
     build
-        .include(&out_dir) // 生成的 config.h 所在目录
+        .include(&out_dir) // Directory containing the generated config.h.
         .include(&libusb_dir)
         .include(thirdparty_dir.join("libusb"))
         .include(libusb_dir.join("os"));
 
-    // 平台特定配置
+    // Platform-specific configuration.
     if target_os == "android" {
         let android_config = thirdparty_dir.join("libusb/android");
         if android_config.exists() {
@@ -131,7 +131,7 @@ fn compile_libusb(thirdparty_dir: &Path, target_os: &str) {
         }
     }
 
-    // 编译定义
+    // Compiler definitions.
     build
         .define("LIBUSB_DESCRIBE", "\"\"")
         .define("ENABLE_LOGGING", "1");
@@ -149,7 +149,7 @@ fn compile_libusb(thirdparty_dir: &Path, target_os: &str) {
         build.define("OS_DARWIN", "1").define("PLATFORM_POSIX", "1");
     }
 
-    // 编译选项
+    // Compiler options.
     build
         .flag_if_supported("-fPIC")
         .flag_if_supported("-std=gnu11")
@@ -166,7 +166,7 @@ fn generate_libusb_config(out_dir: &Path, target_os: &str) {
     use std::io::Write;
 
     let config_content = if target_os == "linux" || target_os == "android" {
-        r#"/* libusb config.h - 适用于 Linux/Android */
+        r#"/* libusb config.h for Linux and Android. */
 #ifndef LIBUSB_CONFIG_H
 #define LIBUSB_CONFIG_H
 
@@ -215,11 +215,11 @@ fn generate_libusb_config(out_dir: &Path, target_os: &str) {
 #define PACKAGE "libusb-1.0"
 #define PACKAGE_BUGREPORT "libusb-devel@lists.sourceforge.net"
 #define PACKAGE_NAME "libusb-1.0"
-#define PACKAGE_STRING "libusb-1.0 1.0.26"
+#define PACKAGE_STRING "libusb-1.0 1.0.29"
 #define PACKAGE_TARNAME "libusb-1.0"
 #define PACKAGE_URL "http://libusb.info"
-#define PACKAGE_VERSION "1.0.26"
-#define VERSION "1.0.26"
+#define PACKAGE_VERSION "1.0.29"
+#define VERSION "1.0.29"
 
 #define POLL_NFDS_TYPE nfds_t
 #define STDC_HEADERS 1
@@ -229,7 +229,7 @@ fn generate_libusb_config(out_dir: &Path, target_os: &str) {
 #endif /* LIBUSB_CONFIG_H */
 "#
     } else if target_os == "macos" {
-        r#"/* libusb config.h - 适用于 macOS */
+        r#"/* libusb config.h for macOS. */
 #ifndef LIBUSB_CONFIG_H
 #define LIBUSB_CONFIG_H
 
@@ -275,11 +275,11 @@ fn generate_libusb_config(out_dir: &Path, target_os: &str) {
 #define PACKAGE "libusb-1.0"
 #define PACKAGE_BUGREPORT "libusb-devel@lists.sourceforge.net"
 #define PACKAGE_NAME "libusb-1.0"
-#define PACKAGE_STRING "libusb-1.0 1.0.26"
+#define PACKAGE_STRING "libusb-1.0 1.0.29"
 #define PACKAGE_TARNAME "libusb-1.0"
 #define PACKAGE_URL "http://libusb.info"
-#define PACKAGE_VERSION "1.0.26"
-#define VERSION "1.0.26"
+#define PACKAGE_VERSION "1.0.29"
+#define VERSION "1.0.29"
 
 #define POLL_NFDS_TYPE nfds_t
 #define STDC_HEADERS 1
@@ -306,7 +306,10 @@ fn generate_libusb_config(out_dir: &Path, target_os: &str) {
     file.write_all(config_content.as_bytes())
         .expect("Failed to write config.h");
 
-    println!("cargo:warning=✓ 生成 config.h: {}", config_path.display());
+    println!(
+        "cargo:warning=Generated libusb config: {}",
+        config_path.display()
+    );
 }
 
 fn compile_libuvc(thirdparty_dir: &Path, target_os: &str) {
@@ -317,11 +320,11 @@ fn compile_libuvc(thirdparty_dir: &Path, target_os: &str) {
         panic!("backend-uvc requires vendored libuvc sources");
     }
 
-    println!("cargo:warning=编译 libuvc...");
+    println!("cargo:warning=Compiling bundled libuvc");
 
     let mut build = cc::Build::new();
 
-    // 所有源文件
+    // All source files.
     build
         .file(src_dir.join("ctrl.c"))
         .file(src_dir.join("ctrl-gen.c"))
@@ -333,14 +336,15 @@ fn compile_libuvc(thirdparty_dir: &Path, target_os: &str) {
         .file(src_dir.join("misc.c"))
         .file("cpp/uvc_abi_probe.c");
 
-    // libuvc 始终可传输原生 MJPEG；是否能转换为 RGB 由独立解码 feature 决定。
+    // libuvc always transports native MJPEG. The independent decode feature
+    // controls whether camera-rs can convert it to RGB.
     if env::var_os("CARGO_FEATURE_DECODE_MJPEG").is_some() {
-        println!("cargo:warning=✓ MJPEG 原生传输及 TurboJPEG 解码已启用");
+        println!("cargo:warning=MJPEG transport and TurboJPEG decoding enabled");
     } else {
-        println!("cargo:warning=✓ MJPEG 原生传输已启用；RGB 解码未编译");
+        println!("cargo:warning=MJPEG transport enabled without RGB decoding");
     }
 
-    // 包含目录
+    // Include directories.
     build
         .include(libuvc_dir.join("include"))
         .include(libuvc_dir.join("include/libuvc"))
@@ -350,19 +354,19 @@ fn compile_libuvc(thirdparty_dir: &Path, target_os: &str) {
         build.define("CAMERA_NATIVE_DEBUG_LOGS", "1");
     }
 
-    // libuvc 版本定义
+    // libuvc version definitions.
     build
         .define("LIBUVC_VERSION_MAJOR", "0")
         .define("LIBUVC_VERSION_MINOR", "0")
-        .define("LIBUVC_VERSION_PATCH", "6")
-        .define("LIBUVC_VERSION_STR", "\"0.0.6\"")
-        .define("LIBUVC_VERSION_INT", "0x000006");
+        .define("LIBUVC_VERSION_PATCH", "7")
+        .define("LIBUVC_VERSION_STR", "\"0.0.7\"")
+        .define("LIBUVC_VERSION_INT", "0x000007");
 
     if target_os == "android" {
         build.define("__ANDROID__", "1");
     }
 
-    // 编译选项
+    // Compiler options.
     build
         .flag_if_supported("-fPIC")
         .flag_if_supported("-std=gnu11")
@@ -373,7 +377,7 @@ fn compile_libuvc(thirdparty_dir: &Path, target_os: &str) {
         panic!("libuvc compilation failed: {}", e);
     });
 
-    println!("cargo:warning=✓ libuvc 编译完成");
+    println!("cargo:warning=Bundled libuvc compiled");
 }
 
 fn compile_ndk_camera2_bridge(manifest_dir: &Path) {
@@ -384,7 +388,7 @@ fn compile_ndk_camera2_bridge(manifest_dir: &Path) {
         panic!("backend-camera2 requires cpp/ndk_camera2_bridge.cpp");
     }
 
-    println!("cargo:warning=编译 NDK Camera2 桥接层...");
+    println!("cargo:warning=Compiling the Android NDK Camera2 bridge");
 
     let mut build = cc::Build::new();
 
@@ -403,7 +407,9 @@ fn compile_ndk_camera2_bridge(manifest_dir: &Path) {
             println!("cargo:rustc-link-lib=camera2ndk");
             println!("cargo:rustc-link-lib=mediandk");
             println!("cargo:rustc-link-lib=android");
-            println!("cargo:warning=✓ NDK Camera2 桥接层编译完成，链接 camera2ndk + mediandk");
+            println!(
+                "cargo:warning=Android NDK Camera2 bridge linked with camera2ndk and mediandk"
+            );
         }
         Err(e) => {
             panic!("NDK Camera2 bridge compilation failed: {}", e);

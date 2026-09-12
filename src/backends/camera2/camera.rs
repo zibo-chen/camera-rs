@@ -62,7 +62,9 @@ impl NativeHandle {
     fn new() -> CameraResult<Self> {
         let ptr = unsafe { ffi::ndk_camera2_create() };
         if ptr.is_null() {
-            return Err(CameraError::Other(
+            return Err(CameraError::backend_failure(
+                crate::BackendId::CAMERA2,
+                crate::OperationStage::Open,
                 "Failed to create NDK Camera2 instance".into(),
             ));
         }
@@ -144,15 +146,16 @@ impl Camera2Camera {
                     && unsafe { CStr::from_ptr(info.id) }.to_string_lossy() == expected
                 {
                     if selected.is_some() {
-                        return Err(CameraError::AmbiguousDevice(expected.into()));
+                        return Err(CameraError::ambiguous_device(expected.into()));
                     }
                     selected = Some(i as u32);
                 }
             }
-            device_index = selected.ok_or_else(|| CameraError::DeviceNotFound(expected.into()))?;
+            device_index =
+                selected.ok_or_else(|| CameraError::device_not_found(expected.into()))?;
         }
         if device_index as i32 >= count {
-            return Err(CameraError::DeviceNotFound(format!(
+            return Err(CameraError::device_not_found(format!(
                 "Device index {} not found, only {} cameras available",
                 device_index, count
             )));
@@ -191,7 +194,7 @@ impl Camera2Camera {
         let mut count: i32 = 0;
         let status = unsafe { ffi::ndk_camera2_get_device_count(native.ptr, &mut count) };
         if !status.is_ok() || count == 0 {
-            return Err(CameraError::DeviceNotFound("No cameras available".into()));
+            return Err(CameraError::device_not_found("No cameras available".into()));
         }
 
         let target_facing = match facing {
@@ -214,7 +217,7 @@ impl Camera2Camera {
             }
         }
 
-        Err(CameraError::DeviceNotFound(format!(
+        Err(CameraError::device_not_found(format!(
             "No camera with facing {:?} found",
             facing
         )))
@@ -315,7 +318,7 @@ unsafe extern "C" fn frame_callback(context: *mut c_void, frame: *const ffi::Ndk
                     || frame.pixel_stride_uv <= 0
                     || frame.pixel_stride_v <= 0
                 {
-                    return Err(CameraError::InvalidFormat(
+                    return Err(CameraError::invalid_frame(
                         "Invalid Camera2 plane metadata".into(),
                     ));
                 }
@@ -391,9 +394,16 @@ unsafe fn native_frame_layout(
     frame: &ffi::NdkFrameData,
 ) -> CameraResult<(crate::FrameLayout, Vec<&[u8]>)> {
     use crate::{FrameLayout, PixelFormat, PlaneLayout};
+    let camera2_yuv_color = crate::ColorInfo {
+        // Keep native delivery consistent with convert_camera2_yuv(), which
+        // uses the Android Camera2 YUV_420_888 BT.601 full-range coefficients.
+        matrix: crate::ColorMatrix::Bt601,
+        range: crate::ColorRange::Full,
+        ..Default::default()
+    };
     if frame.pixel_format == ffi::NdkCameraPixelFormat::Rgba8888 as i32 {
         if frame.rgb_data.is_null() || frame.rgb_len <= 0 || frame.row_stride_rgb <= 0 {
-            return Err(CameraError::InvalidFormat(
+            return Err(CameraError::invalid_frame(
                 "Invalid Camera2 RGBA frame".into(),
             ));
         }
@@ -423,7 +433,7 @@ unsafe fn native_frame_layout(
         || frame.row_stride_v <= 0
         || frame.pixel_stride_v <= 0
     {
-        return Err(CameraError::InvalidFormat(
+        return Err(CameraError::invalid_frame(
             "Invalid Camera2 YUV plane".into(),
         ));
     }
@@ -454,6 +464,7 @@ unsafe fn native_frame_layout(
         let chroma_data = std::slice::from_raw_parts(chroma_ptr, chroma_length);
         let mut layout =
             FrameLayout::packed(frame.width as u32, frame.height as u32, chroma.format, 0, 0);
+        layout.color = camera2_yuv_color;
         layout.planes = vec![
             PlaneLayout {
                 offset: 0,
@@ -477,6 +488,7 @@ unsafe fn native_frame_layout(
         0,
         0,
     );
+    layout.color = camera2_yuv_color;
     layout.planes.clear();
     let mut parts = Vec::new();
     let mut offset = 0;
@@ -646,7 +658,7 @@ impl StreamingCamera for Camera2Camera {
     }
 
     async fn set_buffer_size(&self, _size: usize) -> CameraResult<()> {
-        Err(CameraError::InvalidConfig(
+        Err(CameraError::invalid_config(
             "Frame pool capacity is fixed for the lifetime of the camera".into(),
         ))
     }
@@ -654,7 +666,7 @@ impl StreamingCamera for Camera2Camera {
 
 impl CameraControl for Camera2Camera {
     fn get_control(&self, control: CameraControlType) -> CameraResult<CameraControlValue> {
-        Err(CameraError::NotReadable(format!(
+        Err(CameraError::control_not_readable(format!(
             "Camera2 {control:?}: capture-result readback is unavailable"
         )))
     }
@@ -673,19 +685,19 @@ impl CameraControl for Camera2Camera {
             CameraControlType::AutoExposure => {
                 let mode = value
                     .as_i32()
-                    .ok_or_else(|| CameraError::InvalidConfig("Expected native AE mode".into()))?;
+                    .ok_or_else(|| CameraError::invalid_config("Expected native AE mode".into()))?;
                 unsafe { ffi::ndk_camera2_set_ae_mode(native.ptr, mode) }
             }
             CameraControlType::Focus | CameraControlType::AutoFocus => {
                 let mode = value
                     .as_i32()
-                    .ok_or_else(|| CameraError::InvalidConfig("Expected native AF mode".into()))?;
+                    .ok_or_else(|| CameraError::invalid_config("Expected native AF mode".into()))?;
                 unsafe { ffi::ndk_camera2_set_af_mode(native.ptr, mode) }
             }
             CameraControlType::WhiteBalance | CameraControlType::AutoWhiteBalance => {
-                let mode = value
-                    .as_i32()
-                    .ok_or_else(|| CameraError::InvalidConfig("Expected native AWB mode".into()))?;
+                let mode = value.as_i32().ok_or_else(|| {
+                    CameraError::invalid_config("Expected native AWB mode".into())
+                })?;
                 unsafe { ffi::ndk_camera2_set_awb_mode(native.ptr, mode) }
             }
             CameraControlType::Zoom => {
@@ -697,7 +709,7 @@ impl CameraControl for Camera2Camera {
                 unsafe { ffi::ndk_camera2_set_sensitivity(native.ptr, v) }
             }
             _ => {
-                return Err(CameraError::ControlNotSupported(format!(
+                return Err(CameraError::control_not_supported(format!(
                     "{:?} is not supported via NDK Camera2",
                     control
                 )));
@@ -727,7 +739,7 @@ impl CameraControl for Camera2Camera {
                 ffi::ndk_camera2_get_sensitivity_range(native.ptr, &mut min, &mut max)
             },
             _ => {
-                return Err(CameraError::ControlNotSupported(format!(
+                return Err(CameraError::control_not_supported(format!(
                     "Range query for {:?} not supported via NDK Camera2",
                     control
                 )));
@@ -782,7 +794,7 @@ impl Camera2Camera {
             CameraControlType::AutoFocus => 1,
             CameraControlType::AutoWhiteBalance => 2,
             _ => {
-                return Err(CameraError::ControlNotSupported(format!(
+                return Err(CameraError::control_not_supported(format!(
                     "{control:?} modes"
                 )))
             }
@@ -836,6 +848,37 @@ mod tests {
             assert!(v < 10, "Expected near-black, got {}", v);
         }
     }
+
+    #[test]
+    fn native_yuv_layout_reports_the_colorimetry_used_by_camera2_conversion() {
+        let y = [16_u8; 4];
+        let u = [128_u8; 1];
+        let v = [128_u8; 1];
+        let frame = ffi::NdkFrameData {
+            rgb_data: std::ptr::null(),
+            rgb_len: 0,
+            y_data: y.as_ptr(),
+            y_len: y.len() as i32,
+            uv_data: u.as_ptr(),
+            uv_len: u.len() as i32,
+            v_data: v.as_ptr(),
+            v_len: v.len() as i32,
+            row_stride_v: 1,
+            pixel_stride_v: 1,
+            width: 2,
+            height: 2,
+            row_stride_y: 2,
+            row_stride_uv: 1,
+            pixel_stride_uv: 1,
+            row_stride_rgb: 0,
+            pixel_format: ffi::NdkCameraPixelFormat::Yuv420 as i32,
+            timestamp_ns: 0,
+        };
+
+        let (layout, _) = unsafe { native_frame_layout(&frame) }.unwrap();
+        assert_eq!(layout.color.matrix, crate::ColorMatrix::Bt601);
+        assert_eq!(layout.color.range, crate::ColorRange::Full);
+    }
 }
 
 impl Camera2Camera {
@@ -850,7 +893,7 @@ impl Camera2Camera {
         config.validate()?;
 
         if config.fps_denominator != 1 {
-            return Err(CameraError::UnsupportedFormat(
+            return Err(CameraError::unsupported_format(
                 "Camera2 AE target FPS ranges use integer rates".into(),
             ));
         }
@@ -859,7 +902,7 @@ impl Camera2Camera {
             height: config.height as i32,
             format: 0x23, // AIMAGE_FORMAT_YUV_420_888
             fps: i32::try_from(config.fps / config.fps_denominator)
-                .map_err(|_| CameraError::InvalidConfig("Camera2 FPS overflow".into()))?,
+                .map_err(|_| CameraError::invalid_config("Camera2 FPS overflow".into()))?,
         };
 
         let session = self.shared.hub.start();
@@ -921,7 +964,7 @@ impl Camera2Camera {
         let camera = self.clone();
         tokio::task::spawn_blocking(move || camera.start_stream_sync(config))
             .await
-            .map_err(|e| CameraError::Other(e.to_string()))?
+            .map_err(|e| CameraError::worker_failure(e.to_string()).with_source(e))?
     }
     fn stop_stream_sync(&self) -> CameraResult<()> {
         let _guard = self.lifecycle.lock().unwrap();
@@ -945,6 +988,6 @@ impl Camera2Camera {
         let camera = self.clone();
         tokio::task::spawn_blocking(move || camera.stop_stream_sync())
             .await
-            .map_err(|e| CameraError::Other(e.to_string()))?
+            .map_err(|e| CameraError::worker_failure(e.to_string()).with_source(e))?
     }
 }

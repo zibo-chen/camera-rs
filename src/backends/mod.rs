@@ -1,16 +1,16 @@
-//! 后端抽象层
+//! Backend abstraction layer.
 //!
-//! 提供统一的摄像头后端接口，支持多种平台实现：
+//! Provides a unified camera backend interface for multiple platform implementations:
 //!
-//! | 后端 | 平台 | 描述 |
+//! | Backend | Platform | Description |
 //! |------|------|------|
 //! | V4L2 | Linux | Native kernel camera capture (MMAP) |
-//! | UVC | Linux, macOS, Android | 基于 libuvc 的 USB 摄像头支持 |
-//! | AVFoundation | macOS, iOS | Apple 平台原生相机 API |
-//! | Camera2 | Android | Android Framework 相机 API |
-//! | Media Foundation | Windows | Windows 平台媒体 API |
+//! | UVC | Linux, macOS, Android | USB camera support through libuvc |
+//! | AVFoundation | macOS, iOS | Native Apple camera API |
+//! | Camera2 | Android | Android framework camera API |
+//! | Media Foundation | Windows | Windows media API |
 //!
-//! # 架构设计
+//! # Architecture
 //!
 //! ```text
 //! ┌─────────────────────────────────────────────────────────────┐
@@ -20,7 +20,7 @@
 //!                              │
 //!                              ▼
 //! ┌─────────────────────────────────────────────────────────────┐
-//! │                     backends 模块                           │
+//! │                     backends module                        │
 //! │  ┌─────────┐ ┌─────────────┐ ┌────────┐ ┌────────────────┐ │
 //! │  │   UVC   │ │ AVFoundation│ │Camera2 │ │MediaFoundation │ │
 //! │  │ (Linux, │ │   (macOS,   │ │(Android│ │   (Windows)    │ │
@@ -30,11 +30,11 @@
 //! └─────────────────────────────────────────────────────────────┘
 //! ```
 //!
-//! # 使用方式
+//! # Usage
 //!
-//! ## 直接使用特定后端
+//! ## Using a specific backend directly
 //!
-//! ## 使用自动后端选择（推荐）
+//! ## Using automatic backend selection
 
 #[allow(unused_imports)]
 use crate::CameraManager;
@@ -42,9 +42,9 @@ use crate::{CameraError, CameraResult};
 #[allow(unused_imports)]
 use std::sync::Arc;
 
-// ==================== 后端模块 ====================
+// ==================== Backend modules ====================
 
-// UVC 后端：Linux, macOS, Android (通过 libusb/libuvc)
+// UVC backend: Linux, macOS, and Android through libusb/libuvc.
 #[cfg(all(
     feature = "backend-uvc",
     any(target_os = "linux", target_os = "macos", target_os = "android")
@@ -58,40 +58,40 @@ pub mod uvc;
 ))]
 pub mod v4l2;
 
-// AVFoundation 后端：macOS, iOS
+// AVFoundation backend: macOS and iOS.
 #[cfg(all(
     any(feature = "native", feature = "backend-avfoundation"),
     any(target_os = "macos", target_os = "ios")
 ))]
 pub mod avfoundation;
 
-// Camera2 后端：Android
+// Camera2 backend: Android.
 #[cfg(all(
     any(feature = "native", feature = "backend-camera2"),
     target_os = "android"
 ))]
 pub mod camera2;
 
-// Media Foundation 后端：Windows
+// Media Foundation backend: Windows.
 #[cfg(all(any(feature = "native", feature = "backend-mf"), target_os = "windows"))]
 pub mod mf;
 
-// ==================== 后端类型枚举 ====================
+// ==================== Backend type ====================
 
-/// 摄像头后端类型
+/// Camera backend type.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum BackendType {
-    /// 自动选择最佳后端
+    /// Automatically selects the preferred backend.
     Auto,
-    /// UVC (USB Video Class) - 跨平台 USB 摄像头
+    /// UVC (USB Video Class) backend for cross-platform USB cameras.
     Uvc,
     /// Video4Linux2 - Linux kernel camera drivers
     V4l2,
-    /// AVFoundation - Apple 平台原生 API
+    /// AVFoundation, the native Apple camera API.
     AVFoundation,
-    /// Camera2 - Android 原生 API
+    /// Camera2, the native Android camera API.
     Camera2,
-    /// Media Foundation - Windows 原生 API
+    /// Media Foundation, the native Windows media API.
     MediaFoundation,
 }
 
@@ -122,7 +122,7 @@ impl BackendType {
         }
     }
 
-    /// 获取当前平台默认的后端类型
+    /// Returns the default backend for the current platform.
     pub fn default_for_platform() -> Self {
         if cfg!(all(
             target_os = "android",
@@ -146,7 +146,7 @@ impl BackendType {
         }
     }
 
-    /// 检查后端在当前平台是否可用
+    /// Checks whether this backend is available on the current platform.
     pub fn is_available(&self) -> bool {
         match self {
             BackendType::Auto => Self::default_for_platform().is_available(),
@@ -180,7 +180,7 @@ impl BackendType {
         }
     }
 
-    /// 获取后端的人类可读名称
+    /// Returns the human-readable backend name.
     pub fn display_name(&self) -> &'static str {
         match self {
             BackendType::Auto => "Auto",
@@ -223,9 +223,9 @@ pub(crate) fn backend_type(id: &crate::BackendId) -> Option<BackendType> {
     }
 }
 
-// ==================== 后端工厂函数 ====================
+// ==================== Backend factory functions ====================
 
-/// 获取所有在当前平台可用的后端类型
+/// Returns all backend types available on the current platform.
 pub fn available_backends() -> Vec<BackendType> {
     vec![
         #[cfg(all(
@@ -250,14 +250,15 @@ pub fn available_backends() -> Vec<BackendType> {
     ]
 }
 
-// ==================== 摄像头类型包装 ====================
+// ==================== Camera type wrapper ====================
 
-/// 统一的摄像头类型
+/// Unified camera type.
 ///
-/// 由于 `StreamingCamera` trait 包含 async 方法，无法直接用于 `dyn` trait object。
-/// 此枚举提供了一种类型安全的方式来处理不同后端的摄像头实例。
+/// Because `StreamingCamera` contains async methods, it cannot be used directly
+/// as a `dyn` trait object. This enum provides type-safe dispatch across backend
+/// camera implementations.
 ///
-/// # 使用方式
+/// # Usage
 #[non_exhaustive]
 #[derive(Clone)]
 pub enum BackendCamera {
@@ -265,34 +266,43 @@ pub enum BackendCamera {
     #[cfg(camera_v4l2)]
     V4l2(Arc<v4l2::V4l2Camera>),
 
-    /// UVC 摄像头 (USB Video Class)
+    /// UVC camera (USB Video Class).
     #[cfg(all(
         feature = "backend-uvc",
         any(target_os = "linux", target_os = "macos", target_os = "android")
     ))]
     Uvc(Arc<uvc::UvcCamera>),
 
-    /// AVFoundation 摄像头 (macOS/iOS)
+    /// AVFoundation camera (macOS/iOS).
     #[cfg(all(
         any(feature = "native", feature = "backend-avfoundation"),
         any(target_os = "macos", target_os = "ios")
     ))]
     AVFoundation(Arc<avfoundation::AVFoundationCamera>),
 
-    /// Camera2 摄像头 (Android)
+    /// Camera2 camera (Android).
     #[cfg(all(
         any(feature = "native", feature = "backend-camera2"),
         target_os = "android"
     ))]
     Camera2(Arc<camera2::Camera2Camera>),
 
-    /// Media Foundation 摄像头 (Windows)
+    /// Media Foundation camera (Windows).
     #[cfg(all(any(feature = "native", feature = "backend-mf"), target_os = "windows"))]
     MediaFoundation(Arc<mf::MFCamera>),
 }
 
 fn no_camera_backend_enabled() -> CameraError {
-    CameraError::Other("no camera backend is enabled for this build".into())
+    backend_unavailable(BackendType::default_for_platform())
+}
+
+fn backend_unavailable(backend: BackendType) -> CameraError {
+    let id = backend.into();
+    if backend.supports_target() {
+        CameraError::backend_not_compiled(id)
+    } else {
+        CameraError::unsupported_target(id, std::env::consts::OS)
+    }
 }
 
 impl BackendCamera {
@@ -342,7 +352,7 @@ impl BackendCamera {
             .await
     }
 
-    /// 获取后端类型
+    /// Returns the backend type.
     pub fn backend_type(&self) -> BackendType {
         match self {
             #[cfg(all(
@@ -374,9 +384,24 @@ impl BackendCamera {
         }
     }
 
-    // ==================== StreamingCamera 接口 ====================
+    pub(crate) fn opened_device_capabilities(&self) -> CameraResult<crate::DeviceCapabilities> {
+        match self {
+            #[cfg(all(
+                feature = "backend-uvc",
+                any(target_os = "linux", target_os = "macos", target_os = "android")
+            ))]
+            BackendCamera::Uvc(camera) => camera.opened_device_capabilities(),
+            #[allow(unreachable_patterns)]
+            _ => Err(CameraError::invalid_state(
+                "Opened-device capability queries are only required for descriptor-backed UVC"
+                    .into(),
+            )),
+        }
+    }
 
-    /// 启动视频流
+    // ==================== StreamingCamera interface ====================
+
+    /// Starts video streaming.
     pub async fn start_stream(&self, config: crate::CameraConfig) -> CameraResult<()> {
         #[allow(unused_imports)]
         use crate::StreamingCamera;
@@ -413,7 +438,7 @@ impl BackendCamera {
         }
     }
 
-    /// 停止视频流
+    /// Stops video streaming.
     pub async fn stop_stream(&self) -> CameraResult<()> {
         #[allow(unused_imports)]
         use crate::StreamingCamera;
@@ -447,7 +472,7 @@ impl BackendCamera {
         }
     }
 
-    /// 获取最新帧
+    /// Returns the latest frame.
     pub fn get_latest_frame(&self) -> CameraResult<Option<crate::pixels::Pixels<u8>>> {
         #[allow(unused_imports)]
         use crate::StreamingCamera;
@@ -481,7 +506,7 @@ impl BackendCamera {
         }
     }
 
-    /// 等待并获取下一帧
+    /// Waits for and returns the next frame.
     pub async fn wait_for_frame(
         &self,
         timeout: std::time::Duration,
@@ -521,7 +546,7 @@ impl BackendCamera {
         }
     }
 
-    /// 检查流是否正在运行
+    /// Returns whether the stream is running.
     pub fn is_streaming(&self) -> bool {
         #[allow(unused_imports)]
         use crate::StreamingCamera;
@@ -555,7 +580,7 @@ impl BackendCamera {
         }
     }
 
-    /// 获取当前配置
+    /// Returns the current configuration.
     pub fn get_config(&self) -> Option<crate::CameraConfig> {
         #[allow(unused_imports)]
         use crate::StreamingCamera;
@@ -589,7 +614,7 @@ impl BackendCamera {
         }
     }
 
-    /// 获取流统计信息
+    /// Returns stream statistics.
     pub fn get_stats(&self) -> crate::StreamStats {
         #[allow(unused_imports)]
         use crate::StreamingCamera;
@@ -623,7 +648,7 @@ impl BackendCamera {
         }
     }
 
-    /// 设置缓冲区大小
+    /// Sets the buffer size.
     pub async fn set_buffer_size(&self, size: usize) -> CameraResult<()> {
         #[allow(unused_imports)]
         use crate::StreamingCamera;
@@ -667,10 +692,10 @@ impl BackendCamera {
             #[allow(unreachable_patterns)]
             _ => {
                 let _ = options;
-                Err(CameraError::UnsupportedTarget {
-                    backend: crate::BackendId::CAMERA2,
-                    target: std::env::consts::OS,
-                })
+                Err(CameraError::unsupported_target(
+                    crate::BackendId::CAMERA2,
+                    std::env::consts::OS,
+                ))
             }
         }
     }
@@ -688,15 +713,15 @@ impl BackendCamera {
             #[allow(unreachable_patterns)]
             _ => {
                 let _ = options;
-                Err(CameraError::UnsupportedTarget {
-                    backend: crate::BackendId::AV_FOUNDATION,
-                    target: std::env::consts::OS,
-                })
+                Err(CameraError::unsupported_target(
+                    crate::BackendId::AV_FOUNDATION,
+                    std::env::consts::OS,
+                ))
             }
         }
     }
 
-    /// 清理资源
+    /// Releases backend resources.
     pub fn cleanup(&self) {
         match self {
             #[cfg(all(
@@ -717,15 +742,15 @@ impl BackendCamera {
             #[cfg(camera_v4l2)]
             BackendCamera::V4l2(cam) => cam.cleanup(),
 
-            // 其他后端可能没有 cleanup 方法，忽略即可
+            // Other backends may not require an explicit cleanup method.
             #[allow(unreachable_patterns)]
             _ => {}
         }
     }
 
-    // ==================== CameraControl 接口 ====================
+    // ==================== CameraControl interface ====================
 
-    /// 获取指定控制参数的当前值
+    /// Returns the current value of the specified control.
     pub fn get_control(
         &self,
         control: crate::CameraControlType,
@@ -765,7 +790,7 @@ impl BackendCamera {
         }
     }
 
-    /// 设置指定控制参数的值
+    /// Sets the specified control value.
     pub fn set_control(
         &self,
         control: crate::CameraControlType,
@@ -806,7 +831,7 @@ impl BackendCamera {
         }
     }
 
-    /// 获取指定控制参数的取值范围
+    /// Returns the valid range for the specified control.
     pub fn get_control_range(
         &self,
         control: crate::CameraControlType,
@@ -846,7 +871,7 @@ impl BackendCamera {
         }
     }
 
-    /// 检查设备是否支持指定的控制参数
+    /// Checks whether the device supports the specified control.
     pub fn supports_control(&self, control: crate::CameraControlType) -> bool {
         #[allow(unused_imports)]
         use crate::CameraControl;
@@ -883,7 +908,7 @@ impl BackendCamera {
         }
     }
 
-    /// 获取设备支持的所有控制参数
+    /// Returns all controls supported by the device.
     pub fn get_supported_controls(&self) -> Vec<crate::CameraControlType> {
         #[allow(unused_imports)]
         use crate::CameraControl;
@@ -917,7 +942,7 @@ impl BackendCamera {
         }
     }
 
-    /// 将控制参数重置为默认值
+    /// Resets the specified control to its default value.
     pub fn reset_control(&self, control: crate::CameraControlType) -> CameraResult<()> {
         #[allow(unused_imports)]
         use crate::CameraControl;
@@ -954,7 +979,7 @@ impl BackendCamera {
         }
     }
 
-    /// 将所有控制参数重置为默认值
+    /// Resets all controls to their default values.
     pub fn reset_all_controls(&self) -> CameraResult<()> {
         #[allow(unused_imports)]
         use crate::CameraControl;
@@ -989,21 +1014,21 @@ impl BackendCamera {
     }
 }
 
-/// 使用指定后端创建摄像头实例
+/// Creates a camera instance with the specified backend.
 ///
 /// # Arguments
 ///
-/// * `device_index` - 设备索引
-/// * `backend` - 后端类型，使用 `BackendType::Auto` 自动选择
+/// * `device_index` - Device index.
+/// * `backend` - Backend type; use `BackendType::Auto` for automatic selection.
 ///
 /// # Returns
 ///
-/// 返回 `BackendCamera` 枚举，包装了具体的后端实现
+/// Returns a `BackendCamera` wrapping the concrete backend implementation.
 ///
-/// # 回退策略
+/// # Fallback strategy
 ///
-/// 如果指定的后端在当前平台不可用，会自动回退到平台默认后端，
-/// 而不是返回错误。这样可以提供更好的跨平台兼容性。
+/// If the requested backend is unavailable on the current platform, this falls
+/// back to the platform default instead of returning an error.
 pub fn create_camera(_device_index: u32, backend: BackendType) -> CameraResult<BackendCamera> {
     create_camera_with_hub(_device_index, backend, crate::FrameHub::default())
 }
@@ -1020,7 +1045,7 @@ pub(crate) fn create_selected_camera(
     _hub: crate::FrameHub,
     _expected: Option<&str>,
 ) -> CameraResult<BackendCamera> {
-    // 如果是 Auto 或指定的后端不可用，使用平台默认后端
+    // Use the platform default for Auto or an unavailable backend.
     let effective_backend = if backend == BackendType::Auto {
         let fallback = BackendType::default_for_platform();
         if backend != BackendType::Auto && !backend.is_available() {
@@ -1037,7 +1062,7 @@ pub(crate) fn create_selected_camera(
 
     match effective_backend {
         BackendType::Auto => {
-            // 不应该到达这里
+            // All available variants are handled above.
             unreachable!("Auto backend should be resolved to specific backend")
         }
 
@@ -1056,9 +1081,7 @@ pub(crate) fn create_selected_camera(
             feature = "backend-uvc",
             any(target_os = "linux", target_os = "macos", target_os = "android")
         )))]
-        BackendType::Uvc => Err(CameraError::Other(
-            "UVC backend is not enabled. Enable feature 'backend-uvc'".into(),
-        )),
+        BackendType::Uvc => Err(backend_unavailable(BackendType::Uvc)),
 
         #[cfg(all(
             any(feature = "native", feature = "backend-avfoundation"),
@@ -1074,9 +1097,7 @@ pub(crate) fn create_selected_camera(
             any(feature = "native", feature = "backend-avfoundation"),
             any(target_os = "macos", target_os = "ios")
         )))]
-        BackendType::AVFoundation => Err(CameraError::Other(
-            "AVFoundation backend is not available on this platform".into(),
-        )),
+        BackendType::AVFoundation => Err(backend_unavailable(BackendType::AVFoundation)),
 
         #[cfg(all(
             any(feature = "native", feature = "backend-camera2"),
@@ -1091,9 +1112,7 @@ pub(crate) fn create_selected_camera(
             any(feature = "native", feature = "backend-camera2"),
             target_os = "android"
         )))]
-        BackendType::Camera2 => Err(CameraError::Other(
-            "Camera2 backend is not available on this platform".into(),
-        )),
+        BackendType::Camera2 => Err(backend_unavailable(BackendType::Camera2)),
 
         #[cfg(all(any(feature = "native", feature = "backend-mf"), target_os = "windows"))]
         BackendType::MediaFoundation => {
@@ -1102,9 +1121,7 @@ pub(crate) fn create_selected_camera(
         }
 
         #[cfg(not(all(any(feature = "native", feature = "backend-mf"), target_os = "windows")))]
-        BackendType::MediaFoundation => Err(CameraError::Other(
-            "Media Foundation backend is not available on this platform".into(),
-        )),
+        BackendType::MediaFoundation => Err(backend_unavailable(BackendType::MediaFoundation)),
 
         #[cfg(camera_v4l2)]
         BackendType::V4l2 => {
@@ -1116,23 +1133,22 @@ pub(crate) fn create_selected_camera(
             Ok(BackendCamera::V4l2(Arc::new(camera)))
         }
         #[cfg(not(camera_v4l2))]
-        BackendType::V4l2 => Err(CameraError::Other(
-            "V4L2 backend requires Linux and feature 'backend-v4l2'".into(),
-        )),
+        BackendType::V4l2 => Err(backend_unavailable(BackendType::V4l2)),
     }
 }
 
-/// 从文件描述符创建 UVC 摄像头 (Android 专用)
+/// Creates a UVC camera from a file descriptor on Android.
 ///
-/// 在 Android 上，应用无法直接访问 USB 设备。需要通过 Java 层获取 fd 后传入此函数。
+/// Android applications cannot access USB device nodes directly. Obtain an FD
+/// through the Java layer and pass it to this function.
 ///
 /// # Arguments
 ///
-/// * `fd` - 从 UsbDeviceConnection.getFileDescriptor() 获取的文件描述符
+/// * `fd` - File descriptor returned by `UsbDeviceConnection.getFileDescriptor()`.
 ///
 /// # Returns
 ///
-/// 返回 `BackendCamera::Uvc` 变体
+/// Returns the `BackendCamera::Uvc` variant.
 #[cfg(all(
     all(
         feature = "backend-uvc",
@@ -1148,22 +1164,22 @@ pub fn create_camera_from_fd(fd: i32) -> CameraResult<BackendCamera> {
     Ok(BackendCamera::Uvc(arc))
 }
 
-/// 使用指定后端列出所有可用设备
+/// Lists all available devices through the specified backend.
 ///
 /// # Arguments
 ///
-/// * `backend` - 后端类型，使用 `BackendType::Auto` 使用默认后端
+/// * `backend` - Backend type; use `BackendType::Auto` for the platform default.
 ///
 /// # Returns
 ///
-/// 返回设备列表
+/// Returns the device list.
 ///
-/// # 回退策略
+/// # Fallback strategy
 ///
-/// 如果指定的后端在当前平台不可用，会自动回退到平台默认后端，
-/// 而不是返回错误。这样可以提供更好的跨平台兼容性。
+/// If the requested backend is unavailable on the current platform, this falls
+/// back to the platform default instead of returning an error.
 pub fn list_devices(backend: BackendType) -> CameraResult<Vec<crate::CameraDeviceInfo>> {
-    // 如果是 Auto 或指定的后端不可用，使用平台默认后端
+    // Use the platform default for Auto or an unavailable backend.
     let effective_backend = if backend == BackendType::Auto {
         let fallback = BackendType::default_for_platform();
         if backend != BackendType::Auto && !backend.is_available() {
@@ -1193,9 +1209,7 @@ pub fn list_devices(backend: BackendType) -> CameraResult<Vec<crate::CameraDevic
             feature = "backend-uvc",
             any(target_os = "linux", target_os = "macos", target_os = "android")
         )))]
-        BackendType::Uvc => Err(CameraError::Other(
-            "UVC backend is not enabled. Enable feature 'backend-uvc'".into(),
-        )),
+        BackendType::Uvc => Err(backend_unavailable(BackendType::Uvc)),
 
         #[cfg(all(
             any(feature = "native", feature = "backend-avfoundation"),
@@ -1209,9 +1223,7 @@ pub fn list_devices(backend: BackendType) -> CameraResult<Vec<crate::CameraDevic
             any(feature = "native", feature = "backend-avfoundation"),
             any(target_os = "macos", target_os = "ios")
         )))]
-        BackendType::AVFoundation => Err(CameraError::Other(
-            "AVFoundation backend is not available on this platform".into(),
-        )),
+        BackendType::AVFoundation => Err(backend_unavailable(BackendType::AVFoundation)),
 
         #[cfg(all(
             any(feature = "native", feature = "backend-camera2"),
@@ -1223,31 +1235,25 @@ pub fn list_devices(backend: BackendType) -> CameraResult<Vec<crate::CameraDevic
             any(feature = "native", feature = "backend-camera2"),
             target_os = "android"
         )))]
-        BackendType::Camera2 => Err(CameraError::Other(
-            "Camera2 backend is not available on this platform".into(),
-        )),
+        BackendType::Camera2 => Err(backend_unavailable(BackendType::Camera2)),
 
         #[cfg(all(any(feature = "native", feature = "backend-mf"), target_os = "windows"))]
         BackendType::MediaFoundation => <mf::MFCamera as CameraManager>::list_devices(),
 
         #[cfg(not(all(any(feature = "native", feature = "backend-mf"), target_os = "windows")))]
-        BackendType::MediaFoundation => Err(CameraError::Other(
-            "Media Foundation backend is not available on this platform".into(),
-        )),
+        BackendType::MediaFoundation => Err(backend_unavailable(BackendType::MediaFoundation)),
 
         #[cfg(camera_v4l2)]
         BackendType::V4l2 => v4l2::V4l2Camera::list_devices(),
         #[cfg(not(camera_v4l2))]
-        BackendType::V4l2 => Err(CameraError::Other(
-            "V4L2 backend requires Linux and feature 'backend-v4l2'".into(),
-        )),
+        BackendType::V4l2 => Err(backend_unavailable(BackendType::V4l2)),
     }
 }
 
-/// 使用指定后端获取设备支持的视频配置。
+/// Returns the video configurations supported by a device through a backend.
 ///
-/// `BackendType::Auto` 会解析为当前平台默认后端；不可用的后端会与
-/// [`list_devices`] 保持一致，回退到平台默认后端。
+/// `BackendType::Auto` resolves to the current platform default. An unavailable
+/// backend follows [`list_devices`] and falls back to that default.
 pub fn get_supported_configs(
     backend: BackendType,
     _device_index: u32,
@@ -1281,9 +1287,7 @@ pub fn get_supported_configs(
             feature = "backend-uvc",
             any(target_os = "linux", target_os = "macos", target_os = "android")
         )))]
-        BackendType::Uvc => Err(CameraError::Other(
-            "UVC backend is not enabled. Enable feature 'backend-uvc'".into(),
-        )),
+        BackendType::Uvc => Err(backend_unavailable(BackendType::Uvc)),
 
         #[cfg(all(
             any(feature = "native", feature = "backend-avfoundation"),
@@ -1299,9 +1303,7 @@ pub fn get_supported_configs(
             any(feature = "native", feature = "backend-avfoundation"),
             any(target_os = "macos", target_os = "ios")
         )))]
-        BackendType::AVFoundation => Err(CameraError::Other(
-            "AVFoundation backend is not available on this platform".into(),
-        )),
+        BackendType::AVFoundation => Err(backend_unavailable(BackendType::AVFoundation)),
 
         #[cfg(all(
             any(feature = "native", feature = "backend-camera2"),
@@ -1315,9 +1317,7 @@ pub fn get_supported_configs(
             any(feature = "native", feature = "backend-camera2"),
             target_os = "android"
         )))]
-        BackendType::Camera2 => Err(CameraError::Other(
-            "Camera2 backend is not available on this platform".into(),
-        )),
+        BackendType::Camera2 => Err(backend_unavailable(BackendType::Camera2)),
 
         #[cfg(all(any(feature = "native", feature = "backend-mf"), target_os = "windows"))]
         BackendType::MediaFoundation => {
@@ -1325,16 +1325,12 @@ pub fn get_supported_configs(
         }
 
         #[cfg(not(all(any(feature = "native", feature = "backend-mf"), target_os = "windows")))]
-        BackendType::MediaFoundation => Err(CameraError::Other(
-            "Media Foundation backend is not available on this platform".into(),
-        )),
+        BackendType::MediaFoundation => Err(backend_unavailable(BackendType::MediaFoundation)),
 
         #[cfg(camera_v4l2)]
         BackendType::V4l2 => v4l2::V4l2Camera::get_supported_configs(_device_index),
         #[cfg(not(camera_v4l2))]
-        BackendType::V4l2 => Err(CameraError::Other(
-            "V4L2 backend requires Linux and feature 'backend-v4l2'".into(),
-        )),
+        BackendType::V4l2 => Err(backend_unavailable(BackendType::V4l2)),
     }
 }
 
@@ -1365,7 +1361,7 @@ pub(crate) fn requested_configs(
     Ok(Vec::new())
 }
 
-// ==================== 测试 ====================
+// ==================== Tests ====================
 
 #[cfg(test)]
 mod tests {
@@ -1382,7 +1378,7 @@ mod tests {
 
     #[test]
     fn test_available_backends() {
-        // 至少应该有一个后端可用（UVC 默认启用）
+        // At least one backend should be available when UVC is enabled by default.
         #[cfg(all(
             feature = "backend-uvc",
             any(target_os = "linux", target_os = "macos", target_os = "android")
@@ -1443,19 +1439,21 @@ mod tests {
     fn no_backend_build_returns_clear_factory_errors() {
         let create_err = match create_camera(0, BackendType::Auto) {
             Ok(_) => panic!("camera creation should fail when no backend is enabled"),
-            Err(error) => error.to_string(),
+            Err(error) => error,
         };
         let list_err = list_devices(BackendType::Auto)
-            .expect_err("device listing should fail when no backend is enabled")
-            .to_string();
+            .expect_err("device listing should fail when no backend is enabled");
         let config_err = get_supported_configs(BackendType::Auto, 0)
-            .expect_err("config listing should fail when no backend is enabled")
-            .to_string();
+            .expect_err("config listing should fail when no backend is enabled");
 
-        for message in [create_err, list_err, config_err] {
+        for error in [create_err, list_err, config_err] {
             assert!(
-                message.contains("not available") || message.contains("not enabled"),
-                "unexpected no-backend error: {message}"
+                matches!(
+                    error.kind(),
+                    crate::CameraErrorKind::BackendNotCompiled
+                        | crate::CameraErrorKind::UnsupportedTarget
+                ),
+                "unexpected no-backend error: {error}"
             );
         }
     }

@@ -1,6 +1,6 @@
-//! 非 Windows 平台的 MFCamera 占位实现
+//! MFCamera stub for non-Windows platforms.
 //!
-//! 在非 Windows 平台上，所有方法都返回 NotImplemented 错误。
+//! All methods return a not-implemented error outside Windows.
 
 use crate::error::CameraError;
 use crate::pixels::Pixels as Array3;
@@ -13,17 +13,16 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-/// Media Foundation 摄像头占位实现
+/// Media Foundation camera stub.
 ///
-/// 在非 Windows 平台上使用此结构体。
-/// 所有方法都会返回适当的错误。
+/// Used on non-Windows platforms, where every operation returns an appropriate error.
 pub struct MFCamera {
     device_index: u32,
     is_streaming: Arc<AtomicBool>,
 }
 
 impl MFCamera {
-    /// 创建新实例
+    /// Creates a stub instance.
     pub fn new(device_index: u32) -> CameraResult<Self> {
         Ok(Self {
             device_index,
@@ -31,7 +30,7 @@ impl MFCamera {
         })
     }
 
-    /// 获取设备信息
+    /// Returns device information.
     pub fn device_info(&self) -> CameraDeviceInfo {
         CameraDeviceInfo {
             index: self.device_index,
@@ -45,8 +44,9 @@ impl MFCamera {
     }
 
     fn not_implemented<T>() -> CameraResult<T> {
-        Err(CameraError::Other(
-            "Media Foundation backend is only available on Windows".to_string(),
+        Err(CameraError::unsupported_target(
+            crate::BackendId::MEDIA_FOUNDATION,
+            std::env::consts::OS,
         ))
     }
 }

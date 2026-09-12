@@ -4,6 +4,7 @@ use std::time::Duration;
 
 #[cfg_attr(feature = "serde", derive(serde::Serialize))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+/// Positive rational frame rate that preserves values such as 30_000/1_001.
 pub struct FrameRate {
     numerator: u32,
     denominator: u32,
@@ -26,9 +27,10 @@ impl<'de> serde::Deserialize<'de> for FrameRate {
     }
 }
 impl FrameRate {
+    /// Creates and normalizes a positive rational frame rate.
     pub fn new(numerator: u32, denominator: u32) -> CameraResult<Self> {
         if numerator == 0 || denominator == 0 {
-            return Err(CameraError::InvalidConfig(
+            return Err(CameraError::invalid_config(
                 "Frame rate must be positive".into(),
             ));
         }
@@ -44,15 +46,19 @@ impl FrameRate {
             denominator: denominator / a,
         })
     }
+    /// Returns the normalized frames-per-second numerator.
     pub const fn numerator(self) -> u32 {
         self.numerator
     }
+    /// Returns the normalized frames-per-second denominator.
     pub const fn denominator(self) -> u32 {
         self.denominator
     }
+    /// Returns the approximate frames per second as a floating-point value.
     pub fn as_f64(self) -> f64 {
         self.numerator as f64 / self.denominator as f64
     }
+    /// Returns the nominal duration between consecutive frames.
     pub fn interval(self) -> Duration {
         Duration::from_secs_f64(1.0 / self.as_f64()).max(Duration::from_nanos(1))
     }
@@ -90,8 +96,11 @@ pub enum SelectionPolicy {
 }
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// Possible values for `OverflowPolicy`.
 pub enum OverflowPolicy {
+    /// The `DropOldest` variant.
     DropOldest,
+    /// The `DropNewest` variant.
     DropNewest,
 }
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
@@ -105,8 +114,11 @@ pub enum DeliveryPolicy {
 }
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// Values for `MemoryBudget`.
 pub struct MemoryBudget {
+    /// The buffers value.
     pub buffers: usize,
+    /// Maximum byte budget.
     pub bytes: usize,
 }
 impl Default for MemoryBudget {
@@ -118,9 +130,10 @@ impl Default for MemoryBudget {
     }
 }
 impl MemoryBudget {
+    /// Performs the `validate` operation.
     pub fn validate(self) -> CameraResult<()> {
         if !(2..=256).contains(&self.buffers) || self.bytes == 0 {
-            return Err(CameraError::InvalidConfig(
+            return Err(CameraError::invalid_config(
                 "Memory budget requires 2..=256 buffers and nonzero bytes".into(),
             ));
         }
@@ -142,9 +155,13 @@ pub struct StreamRequest {
 }
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[derive(Clone, Debug)]
+/// Values for `ReconnectPolicy`.
 pub struct ReconnectPolicy {
+    /// Maximum recovery attempts, or no limit.
     pub max_attempts: Option<u32>,
+    /// Delay between recovery attempts.
     pub delay: Duration,
+    /// Maximum interval without a frame before recovery.
     pub stall_timeout: Duration,
 }
 impl Default for ReconnectPolicy {
@@ -215,24 +232,24 @@ impl StreamRequestBuilder {
             .checked_mul(r.height as usize)
             .and_then(|n| n.checked_mul(3));
         if r.width == 0 || r.height == 0 || rgb.is_none() || r.startup_timeout.is_zero() {
-            return Err(CameraError::InvalidConfig(
+            return Err(CameraError::invalid_config(
                 "Invalid resolution/startup deadline".into(),
             ));
         }
         if r.output == OutputFormat::Rgb8 && rgb.unwrap() > r.memory.bytes / r.memory.buffers {
-            return Err(CameraError::InvalidConfig(
+            return Err(CameraError::invalid_config(
                 "RGB buffers exceed memory budget".into(),
             ));
         }
         if r.driver_buffers.is_some_and(|n| !(2..=32).contains(&n)) {
-            return Err(CameraError::InvalidConfig(
+            return Err(CameraError::invalid_config(
                 "Driver buffer count must be 2..=32".into(),
             ));
         }
         if r.reconnect.as_ref().is_some_and(|p| {
             p.delay.is_zero() || p.stall_timeout.is_zero() || p.max_attempts == Some(0)
         }) {
-            return Err(CameraError::InvalidConfig(
+            return Err(CameraError::invalid_config(
                 "Invalid reconnect policy".into(),
             ));
         }
@@ -240,87 +257,146 @@ impl StreamRequestBuilder {
     }
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// Possible values for `PixelFormat`.
 pub enum PixelFormat {
+    /// The `Rgb8` variant.
     Rgb8,
+    /// The `Bgr8` variant.
     Bgr8,
+    /// The `Bgra8` variant.
     Bgra8,
+    /// The `Rgba8` variant.
     Rgba8,
+    /// The `Argb8` variant.
     Argb8,
+    /// The `Yuyv` variant.
     Yuyv,
+    /// The `Uyvy` variant.
     Uyvy,
+    /// The `Nv12` variant.
     Nv12,
+    /// The `Nv21` variant.
     Nv21,
+    /// The `Yuv420p` variant.
     Yuv420p,
+    /// The `Gray8` variant.
     Gray8,
+    /// The `Mjpeg` variant.
     Mjpeg,
+    /// The `H264` variant.
     H264,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+/// Possible values for `ColorMatrix`.
 pub enum ColorMatrix {
     #[default]
+    /// The `Unknown` variant.
     Unknown,
+    /// The `Bt601` variant.
     Bt601,
+    /// The `Bt709` variant.
     Bt709,
+    /// The `Bt2020` variant.
     Bt2020,
+    /// The `Smpte240M` variant.
     Smpte240M,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+/// Possible values for `ColorRange`.
 pub enum ColorRange {
     #[default]
+    /// The `Unknown` variant.
     Unknown,
+    /// The `Full` variant.
     Full,
+    /// The `Limited` variant.
     Limited,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+/// Values for `ColorInfo`.
 pub struct ColorInfo {
+    /// The matrix value.
     pub matrix: ColorMatrix,
+    /// The range value.
     pub range: ColorRange,
+    /// The primaries value.
     pub primaries: ColorPrimaries,
+    /// The transfer value.
     pub transfer: TransferFunction,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+/// Possible values for `ColorPrimaries`.
 pub enum ColorPrimaries {
     #[default]
+    /// The `Unknown` variant.
     Unknown,
+    /// The `Bt709` variant.
     Bt709,
+    /// The `Bt601_525` variant.
     Bt601_525,
+    /// The `Bt601_625` variant.
     Bt601_625,
+    /// The `Bt2020` variant.
     Bt2020,
+    /// The `DisplayP3` variant.
     DisplayP3,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+/// Possible values for `TransferFunction`.
 pub enum TransferFunction {
     #[default]
+    /// The `Unknown` variant.
     Unknown,
+    /// The `Linear` variant.
     Linear,
+    /// The `Srgb` variant.
     Srgb,
+    /// The `Bt709` variant.
     Bt709,
+    /// The `Pq` variant.
     Pq,
+    /// The `Hlg` variant.
     Hlg,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+/// Possible values for `ClockDomain`.
 pub enum ClockDomain {
     #[default]
+    /// The `Unknown` variant.
     Unknown,
+    /// The `HostMonotonic` variant.
     HostMonotonic,
+    /// The `MediaPresentation` variant.
     MediaPresentation,
+    /// The `DeviceMonotonic` variant.
     DeviceMonotonic,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// Values for `SourceTimestamp`.
 pub struct SourceTimestamp {
+    /// The nanoseconds value.
     pub nanoseconds: i64,
+    /// The clock value.
     pub clock: ClockDomain,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+/// Values for `Orientation`.
 pub struct Orientation {
+    /// The rotation degrees value.
     pub rotation_degrees: u16,
+    /// The mirrored value.
     pub mirrored: bool,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// Values for `PlaneLayout`.
 pub struct PlaneLayout {
+    /// Byte offset from the beginning of the frame.
     pub offset: usize,
+    /// Length in bytes.
     pub length: usize,
+    /// Distance in bytes between adjacent rows.
     pub row_stride: usize,
+    /// Distance in bytes between adjacent pixels.
     pub pixel_stride: usize,
 }
 
@@ -388,12 +464,19 @@ pub(crate) fn interleaved_chroma_layout(
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+/// Values for `FrameLayout`.
 pub struct FrameLayout {
+    /// Frame width in pixels.
     pub width: u32,
+    /// Frame height in pixels.
     pub height: u32,
+    /// Pixel or capture format.
     pub format: PixelFormat,
+    /// Plane layouts in storage order.
     pub planes: Vec<PlaneLayout>,
+    /// Color-space metadata.
     pub color: ColorInfo,
+    /// Display orientation metadata.
     pub orientation: Orientation,
     /// Whether row zero is the bottom image row (e.g. a Windows RGB DIB).
     pub bottom_up: bool,
@@ -449,9 +532,10 @@ impl FrameLayout {
             bottom_up: false,
         }
     }
+    /// Performs the `validate` operation.
     pub fn validate(&self, length: usize) -> CameraResult<()> {
         let invalid =
-            || CameraError::InvalidFormat("Invalid frame dimensions, planes, or strides".into());
+            || CameraError::invalid_frame("Invalid frame dimensions, planes, or strides".into());
         if self.width == 0
             || self.height == 0
             || ![0, 90, 180, 270].contains(&self.orientation.rotation_degrees)

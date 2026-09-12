@@ -193,7 +193,7 @@ impl<'a> Stream<'a> {
             index: frame.index,
         };
         if !(1..=2).contains(&frame.planes) {
-            return Err(CameraError::InvalidFormat(
+            return Err(CameraError::invalid_frame(
                 "Invalid V4L2 plane count".into(),
             ));
         }

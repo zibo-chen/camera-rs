@@ -1,48 +1,48 @@
-//! 核心数据类型定义
+//! Core data type definitions.
 
 use crate::error::CameraError;
 
-/// 摄像头操作结果类型
+/// Result type for camera operations.
 pub type CameraResult<T> = Result<T, CameraError>;
 
-/// 视频格式枚举
+/// Video pixel and encoded formats.
 #[allow(clippy::upper_case_acronyms)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VideoFormat {
-    /// MJPEG 压缩格式
+    /// MJPEG compressed format.
     MJPEG,
-    /// YUYV 未压缩格式
+    /// Uncompressed YUYV format.
     YUYV,
-    /// UYVY 未压缩格式  
+    /// Uncompressed UYVY format.
     UYVY,
-    /// NV12 格式 (YUV 4:2:0)
+    /// NV12 format (YUV 4:2:0).
     NV12,
-    /// RGB24 格式
+    /// RGB24 format.
     RGB,
-    /// H264 编码
+    /// H.264 encoded format.
     H264,
-    /// 灰度图
+    /// Grayscale format.
     Gray,
 }
 
 impl VideoFormat {
-    /// 是否为压缩格式
+    /// Returns whether this is a compressed format.
     pub fn is_compressed(&self) -> bool {
         matches!(self, VideoFormat::MJPEG | VideoFormat::H264)
     }
 
-    /// 获取每像素字节数（未压缩格式）
+    /// Returns bytes per pixel for fixed-size uncompressed formats.
     pub fn bytes_per_pixel(&self) -> Option<usize> {
         match self {
             VideoFormat::YUYV | VideoFormat::UYVY => Some(2),
-            VideoFormat::NV12 => None, // NV12 是 1.5 字节/像素
+            VideoFormat::NV12 => None, // NV12 uses 1.5 bytes per pixel.
             VideoFormat::RGB => Some(3),
             VideoFormat::Gray => Some(1),
-            _ => None, // 压缩格式不固定
+            _ => None, // Compressed formats have no fixed size per pixel.
         }
     }
 
-    /// 计算给定分辨率的帧数据大小
+    /// Calculates the frame data size for the given resolution.
     pub fn frame_data_size(&self, width: u32, height: u32) -> Option<usize> {
         let pixels = checked_pixel_count(width, height)?;
         match self {
@@ -65,23 +65,23 @@ impl VideoFormat {
     }
 }
 
-/// 摄像头配置
+/// Camera stream configuration.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CameraConfig {
-    /// 视频格式
+    /// Video format.
     pub format: VideoFormat,
-    /// 宽度（像素）
+    /// Width in pixels.
     pub width: u32,
-    /// 高度（像素）
+    /// Height in pixels.
     pub height: u32,
-    /// 帧率（fps）
+    /// Frame rate in frames per second.
     pub fps: u32,
     /// Frame rate denominator; the rate is fps / fps_denominator.
     pub fps_denominator: u32,
 }
 
 impl CameraConfig {
-    /// 创建新配置
+    /// Creates a new configuration.
     pub fn new(format: VideoFormat, width: u32, height: u32, fps: u32) -> Self {
         Self {
             format,
@@ -92,27 +92,27 @@ impl CameraConfig {
         }
     }
 
-    /// 默认 MJPEG 配置 (640x480@30fps)
+    /// Default MJPEG configuration (640x480 at 30 FPS).
     pub fn default_mjpeg() -> Self {
         Self::new(VideoFormat::MJPEG, 640, 480, 30)
     }
 
-    /// HD MJPEG 配置 (1280x720@30fps)
+    /// HD MJPEG configuration (1280x720 at 30 FPS).
     pub fn hd_mjpeg() -> Self {
         Self::new(VideoFormat::MJPEG, 1280, 720, 30)
     }
 
-    /// Full HD MJPEG 配置 (1920x1080@30fps)
+    /// Full HD MJPEG configuration (1920x1080 at 30 FPS).
     pub fn full_hd_mjpeg() -> Self {
         Self::new(VideoFormat::MJPEG, 1920, 1080, 30)
     }
 
-    /// 默认 YUYV 配置 (640x480@30fps)
+    /// Default YUYV configuration (640x480 at 30 FPS).
     pub fn default_yuyv() -> Self {
         Self::new(VideoFormat::YUYV, 640, 480, 30)
     }
 
-    /// 计算未压缩格式的帧大小
+    /// Calculates the frame size for an uncompressed format.
     pub fn frame_size(&self) -> Option<usize> {
         self.format.frame_data_size(self.width, self.height)
     }
@@ -126,20 +126,20 @@ impl CameraConfig {
         crate::FrameRate::new(self.fps, self.fps_denominator)
     }
 
-    /// 验证配置是否合理
+    /// Validates the configuration.
     pub fn validate(&self) -> CameraResult<()> {
         if self.width == 0 || self.height == 0 {
-            return Err(CameraError::InvalidConfig(
+            return Err(CameraError::invalid_config(
                 "Resolution cannot be 0".to_string(),
             ));
         }
         if self.fps == 0 || self.fps_denominator == 0 {
-            return Err(CameraError::InvalidConfig(
+            return Err(CameraError::invalid_config(
                 "Frame rate numerator and denominator must be positive".to_string(),
             ));
         }
         if !self.format.is_compressed() && self.frame_size().is_none() {
-            return Err(CameraError::InvalidConfig(format!(
+            return Err(CameraError::invalid_config(format!(
                 "Resolution {}x{} cannot represent {:?} frame data",
                 self.width, self.height, self.format
             )));
@@ -158,27 +158,27 @@ fn checked_pixel_count(width: u32, height: u32) -> Option<usize> {
     width.checked_mul(height)
 }
 
-/// 摄像头设备信息
+/// Camera device information.
 #[derive(Debug, Clone)]
 pub struct CameraDeviceInfo {
-    /// 设备索引
+    /// Device index.
     pub index: u32,
-    /// 设备名称
+    /// Device name.
     pub name: String,
-    /// 设备描述
+    /// Device description.
     pub description: String,
-    /// 厂商ID (USB VID)，可能不适用于所有后端
+    /// Vendor ID (USB VID), when available for the backend.
     pub vendor_id: Option<u16>,
-    /// 产品ID (USB PID)，可能不适用于所有后端
+    /// Product ID (USB PID), when available for the backend.
     pub product_id: Option<u16>,
-    /// 序列号
+    /// Serial number.
     pub serial_number: Option<String>,
-    /// 设备路径（平台特定）
+    /// Platform-specific device path.
     pub device_path: Option<String>,
 }
 
 impl CameraDeviceInfo {
-    /// 创建简单的设备信息
+    /// Creates basic device information.
     pub fn new(index: u32, name: String, description: String) -> Self {
         Self {
             index,
@@ -191,7 +191,7 @@ impl CameraDeviceInfo {
         }
     }
 
-    /// 获取设备的唯一标识符
+    /// Returns the device's unique identifier.
     pub fn unique_id(&self) -> String {
         if let Some(path) = self.device_path.as_ref().filter(|p| !p.is_empty()) {
             return path.clone();
@@ -207,59 +207,59 @@ impl CameraDeviceInfo {
         }
     }
 
-    /// 获取友好的显示名称
+    /// Returns a user-friendly display name.
     pub fn display_name(&self) -> &str {
         &self.name
     }
 }
 
 // ============================================================================
-// 摄像头控制参数
+// Camera controls.
 // ============================================================================
 
-/// 摄像头控制参数类型
+/// Camera control type.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum CameraControlType {
-    /// 亮度
+    /// Brightness.
     Brightness,
-    /// 对比度
+    /// Contrast.
     Contrast,
-    /// 色调
+    /// Hue.
     Hue,
-    /// 饱和度
+    /// Saturation.
     Saturation,
-    /// 锐度
+    /// Sharpness.
     Sharpness,
-    /// 伽马值
+    /// Gamma.
     Gamma,
-    /// 白平衡
+    /// White balance.
     WhiteBalance,
-    /// 背光补偿
+    /// Backlight compensation.
     BacklightCompensation,
-    /// 增益
+    /// Gain.
     Gain,
-    /// 水平云台
+    /// Horizontal pan.
     Pan,
-    /// 垂直云台
+    /// Vertical tilt.
     Tilt,
-    /// 变焦
+    /// Zoom.
     Zoom,
-    /// 曝光
+    /// Exposure.
     Exposure,
-    /// 光圈
+    /// Iris.
     Iris,
-    /// 对焦
+    /// Focus.
     Focus,
-    /// 自动曝光
+    /// Automatic exposure.
     AutoExposure,
-    /// 自动对焦
+    /// Automatic focus.
     AutoFocus,
-    /// 自动白平衡
+    /// Automatic white balance.
     AutoWhiteBalance,
 }
 
 impl CameraControlType {
-    /// 获取控制参数的显示名称
+    /// Returns the control's display name.
     pub fn display_name(&self) -> &'static str {
         match self {
             Self::Brightness => "Brightness",
@@ -283,7 +283,7 @@ impl CameraControlType {
         }
     }
 
-    /// 是否为自动模式控制
+    /// Returns whether this control selects an automatic mode.
     pub fn is_auto_control(&self) -> bool {
         matches!(
             self,
@@ -292,19 +292,19 @@ impl CameraControlType {
     }
 }
 
-/// 摄像头控制参数值
+/// Camera control value.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum CameraControlValue {
-    /// 整数值（带自动标志）
+    /// Integer value with an automatic-mode flag.
     Integer { value: i32, is_auto: bool },
-    /// 布尔值
+    /// Boolean value.
     Boolean(bool),
-    /// 浮点值
+    /// Floating-point value.
     Float(f32),
 }
 
 impl CameraControlValue {
-    /// 创建手动模式的整数值
+    /// Creates a manual integer value.
     pub fn manual(value: i32) -> Self {
         Self::Integer {
             value,
@@ -312,7 +312,7 @@ impl CameraControlValue {
         }
     }
 
-    /// 创建自动模式的整数值
+    /// Creates an automatic integer value.
     pub fn auto(value: i32) -> Self {
         Self::Integer {
             value,
@@ -320,7 +320,7 @@ impl CameraControlValue {
         }
     }
 
-    /// 尝试转换为 i32
+    /// Attempts to convert the value to `i32`.
     pub fn as_i32(&self) -> Option<i32> {
         match self {
             Self::Integer { value, .. } => Some(*value),
@@ -329,7 +329,7 @@ impl CameraControlValue {
         }
     }
 
-    /// 尝试转换为 bool
+    /// Attempts to convert the value to `bool`.
     pub fn as_bool(&self) -> Option<bool> {
         match self {
             Self::Boolean(b) => Some(*b),
@@ -338,7 +338,7 @@ impl CameraControlValue {
         }
     }
 
-    /// 是否为自动模式
+    /// Returns whether automatic mode is enabled.
     pub fn is_auto(&self) -> bool {
         match self {
             Self::Integer { is_auto, .. } => *is_auto,
@@ -368,23 +368,23 @@ impl From<f32> for CameraControlValue {
     }
 }
 
-/// 摄像头控制参数范围
+/// Valid range for a camera control.
 #[derive(Debug, Clone, Copy)]
 pub struct CameraControlRange {
-    /// 最小值
+    /// Minimum value.
     pub min: i32,
-    /// 最大值
+    /// Maximum value.
     pub max: i32,
-    /// 步进值
+    /// Step size.
     pub step: i32,
-    /// 默认值
+    /// Default value.
     pub default: i32,
-    /// 是否支持自动模式
+    /// Whether automatic mode is supported.
     pub supports_auto: bool,
 }
 
 impl CameraControlRange {
-    /// 创建新的控制范围
+    /// Creates a control range.
     pub fn new(min: i32, max: i32, step: i32, default: i32, supports_auto: bool) -> Self {
         Self {
             min,
@@ -395,13 +395,13 @@ impl CameraControlRange {
         }
     }
 
-    /// 检查值是否在范围内
+    /// Checks whether a value is within the range.
     pub fn is_in_range(&self, value: i32) -> bool {
         let (min, max) = self.ordered_bounds();
         value >= min && value <= max
     }
 
-    /// 将值钳制到范围内
+    /// Clamps a value to the range.
     pub fn clamp(&self, value: i32) -> i32 {
         let (min, max) = self.ordered_bounds();
         value.clamp(min, max)
@@ -454,7 +454,7 @@ mod tests {
         assert_eq!(config.frame_size(), Some(640 * 480 * 2));
 
         let mjpeg_config = CameraConfig::default_mjpeg();
-        assert_eq!(mjpeg_config.frame_size(), None); // 压缩格式
+        assert_eq!(mjpeg_config.frame_size(), None); // Compressed format.
     }
 
     #[test]
@@ -497,13 +497,13 @@ mod tests {
         let yuyv = CameraConfig::new(VideoFormat::YUYV, 3, 2, 30);
         assert!(matches!(
             yuyv.validate(),
-            Err(CameraError::InvalidConfig(_))
+            Err(ref error) if error.kind() == crate::CameraErrorKind::InvalidArgument
         ));
 
         let nv12 = CameraConfig::new(VideoFormat::NV12, 2, 3, 30);
         assert!(matches!(
             nv12.validate(),
-            Err(CameraError::InvalidConfig(_))
+            Err(ref error) if error.kind() == crate::CameraErrorKind::InvalidArgument
         ));
 
         let mjpeg = CameraConfig::new(VideoFormat::MJPEG, 3, 3, 30);

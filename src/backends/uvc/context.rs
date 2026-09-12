@@ -1,4 +1,4 @@
-//! UVC 上下文和设备管理
+//! UVC context and device management.
 
 use super::ffi;
 use crate::error::{CameraError, Result, UvcErrorCode};
@@ -9,7 +9,7 @@ use std::os::fd::{AsRawFd, OwnedFd};
 use std::ptr;
 use std::sync::Arc;
 
-/// UVC 上下文
+/// UVC context.
 pub struct UvcContext {
     inner: Arc<ContextInner>,
 }
@@ -20,10 +20,10 @@ unsafe impl Send for ContextInner {}
 unsafe impl Sync for ContextInner {}
 
 impl UvcContext {
-    /// 创建新的 UVC 上下文
+    /// Creates a new UVC context.
     pub fn new() -> Result<Self> {
-        // 在 Android 上，需要先设置 LIBUSB_OPTION_NO_DEVICE_DISCOVERY
-        // 这样 libusb 才能在没有 root 权限的情况下工作
+        // Android must disable libusb discovery so an authorized external file
+        // descriptor can be used without root access.
         #[cfg(unix)]
         {
             log::debug!("Setting libusb NO_DEVICE_DISCOVERY option for Android");
@@ -41,20 +41,20 @@ impl UvcContext {
         let mut ctx: *mut ffi::UvcContext = ptr::null_mut();
         let result = unsafe { ffi::uvc_init(&mut ctx, ptr::null_mut()) };
 
-        UvcErrorCode::check(result)?;
+        UvcErrorCode::check(result, crate::OperationStage::Startup, "initialize UVC")?;
 
         Ok(UvcContext {
             inner: Arc::new(ContextInner { ctx }),
         })
     }
 
-    /// 查找指定 VID/PID 的设备
+    /// Finds a device by VID and PID.
     pub fn find_device(&mut self, vid: i32, pid: i32) -> Result<UvcDevice> {
         let mut dev: *mut ffi::UvcDevice = ptr::null_mut();
         let result =
             unsafe { ffi::uvc_find_device(self.inner.ctx, &mut dev, vid, pid, ptr::null()) };
 
-        UvcErrorCode::check(result)?;
+        UvcErrorCode::check(result, crate::OperationStage::Enumeration, "find device")?;
 
         Ok(UvcDevice {
             dev,
@@ -63,12 +63,12 @@ impl UvcContext {
         })
     }
 
-    /// 获取所有设备列表
+    /// Returns all discovered devices.
     pub fn get_device_list(&mut self) -> Result<Vec<UvcDevice>> {
         let mut list: *mut *mut ffi::UvcDevice = ptr::null_mut();
         let result = unsafe { ffi::uvc_get_device_list(self.inner.ctx, &mut list) };
 
-        UvcErrorCode::check(result)?;
+        UvcErrorCode::check(result, crate::OperationStage::Enumeration, "list devices")?;
 
         let mut devices = Vec::new();
         if !list.is_null() {
@@ -76,8 +76,8 @@ impl UvcContext {
             unsafe {
                 while !(*list.add(i)).is_null() {
                     let dev = *list.add(i);
-                    // 注意：uvc_get_device_list 已经为每个设备增加了引用计数（ref=1）
-                    // 我们不再手动调用 uvc_ref_device，只需要接管所有权
+                    // uvc_get_device_list has already incremented every device's
+                    // reference count, so take ownership without another ref.
                     devices.push(UvcDevice {
                         dev,
                         owned: true,
@@ -85,8 +85,8 @@ impl UvcContext {
                     });
                     i += 1;
                 }
-                // 传入 0 表示不减少引用，因为我们已经接管了设备的所有权
-                // 这些设备会在 UvcDevice::drop 时通过 uvc_unref_device 释放
+                // Pass zero to retain the references now owned by UvcDevice;
+                // each device releases its reference from Drop.
                 ffi::uvc_free_device_list(list, 0);
             }
         }
@@ -104,7 +104,7 @@ impl UvcContext {
         let fd = owned_fd.as_raw_fd();
         let result = unsafe { ffi::uvc_wrap(fd, self.inner.ctx, &mut devh) };
 
-        UvcErrorCode::check(result)?;
+        UvcErrorCode::check(result, crate::OperationStage::Open, "wrap USB descriptor")?;
 
         Ok(UvcDeviceHandle {
             devh,
@@ -132,7 +132,7 @@ impl Drop for ContextInner {
 unsafe impl Send for UvcContext {}
 unsafe impl Sync for UvcContext {}
 
-/// UVC 设备
+/// UVC device.
 pub struct UvcDevice {
     dev: *mut ffi::UvcDevice,
     owned: bool,
@@ -140,22 +140,26 @@ pub struct UvcDevice {
 }
 
 impl UvcDevice {
-    /// 获取设备描述符
+    /// Returns the device descriptor.
     pub fn get_descriptor(&self) -> Result<UvcDeviceDescriptor> {
         let mut desc: *mut ffi::UvcDeviceDescriptor = ptr::null_mut();
         let result = unsafe { ffi::uvc_get_device_descriptor(self.dev, &mut desc) };
 
-        UvcErrorCode::check(result)?;
+        UvcErrorCode::check(
+            result,
+            crate::OperationStage::Enumeration,
+            "read device descriptor",
+        )?;
 
         Ok(UvcDeviceDescriptor { desc })
     }
 
-    /// 打开设备
+    /// Opens the device.
     pub fn open(&self) -> Result<UvcDeviceHandle> {
         let mut devh: *mut ffi::UvcDeviceHandle = ptr::null_mut();
         let result = unsafe { ffi::uvc_open(self.dev, &mut devh) };
 
-        UvcErrorCode::check(result)?;
+        UvcErrorCode::check(result, crate::OperationStage::Open, "open device")?;
 
         Ok(UvcDeviceHandle {
             devh,
@@ -165,7 +169,7 @@ impl UvcDevice {
         })
     }
 
-    /// 转换为设备信息
+    /// Converts the device into public device information.
     pub fn to_device_info(&self, index: u32) -> Result<CameraDeviceInfo> {
         let desc = self.get_descriptor()?;
         let name = desc.product().unwrap_or_else(|| {
@@ -204,7 +208,7 @@ impl Drop for UvcDevice {
 unsafe impl Send for UvcDevice {}
 unsafe impl Sync for UvcDevice {}
 
-/// UVC 设备描述符
+/// UVC device descriptor.
 pub struct UvcDeviceDescriptor {
     desc: *mut ffi::UvcDeviceDescriptor,
 }
@@ -264,7 +268,7 @@ impl Drop for UvcDeviceDescriptor {
     }
 }
 
-/// UVC 设备句柄
+/// UVC device handle.
 pub struct UvcDeviceHandle {
     devh: *mut ffi::UvcDeviceHandle,
     _context: Arc<ContextInner>,
@@ -274,7 +278,7 @@ pub struct UvcDeviceHandle {
 }
 
 impl UvcDeviceHandle {
-    /// 配置流参数
+    /// Negotiates stream parameters.
     pub fn get_stream_ctrl(
         &mut self,
         format: ffi::UvcFrameFormat,
@@ -293,13 +297,14 @@ impl UvcDeviceHandle {
             unsafe {
                 let _ = Box::from_raw(ctrl_ptr);
             }
-            return Err(CameraError::UvcError {
-                code: result,
-                message: format!(
+            return Err(CameraError::uvc_backend(
+                result,
+                format!(
                     "Select {format:?} {width}x{height}: {}",
                     UvcErrorCode::from_code(result).message()
                 ),
-            });
+            )
+            .with_stage(crate::OperationStage::Capabilities));
         }
 
         Ok(StreamCtrl { ctrl: ctrl_ptr })
@@ -308,14 +313,14 @@ impl UvcDeviceHandle {
     pub(crate) fn probe_stream_ctrl(&mut self, ctrl: &mut StreamCtrl) -> Result<()> {
         let code = unsafe { ffi::uvc_probe_stream_ctrl(self.devh, ctrl.ctrl) };
         if code != ffi::UVC_SUCCESS {
-            return Err(CameraError::UvcError {
-                code,
-                message: "Probe fractional frame interval".into(),
-            });
+            return Err(
+                CameraError::uvc_backend(code, "Probe fractional frame interval".into())
+                    .with_stage(crate::OperationStage::Startup),
+            );
         }
         Ok(())
     }
-    /// 启动流
+    /// Starts streaming.
     pub unsafe fn start_streaming(
         &mut self,
         ctrl: &mut StreamCtrl,
@@ -327,9 +332,9 @@ impl UvcDeviceHandle {
             return Ok(());
         }
         let c = &*ctrl.ctrl;
-        Err(CameraError::UvcError {
-            code: result,
-            message: format!(
+        Err(CameraError::uvc_backend(
+            result,
+            format!(
                 "Start format {} frame {} interval {} payload {}: {}",
                 c.b_format_index,
                 c.b_frame_index,
@@ -337,10 +342,11 @@ impl UvcDeviceHandle {
                 c.dw_max_payload_transfer_size,
                 UvcErrorCode::from_code(result).message()
             ),
-        })
+        )
+        .with_stage(crate::OperationStage::Startup))
     }
 
-    /// 停止流
+    /// Stops streaming.
     pub fn stop_streaming(&mut self) {
         unsafe { ffi::uvc_stop_streaming(self.devh) };
     }
@@ -363,7 +369,7 @@ impl Drop for UvcDeviceHandle {
 unsafe impl Send for UvcDeviceHandle {}
 unsafe impl Sync for UvcDeviceHandle {}
 
-/// 流控制参数
+/// Stream control parameters.
 pub struct StreamCtrl {
     ctrl: *mut ffi::UvcStreamCtrl,
 }

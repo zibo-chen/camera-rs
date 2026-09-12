@@ -1,8 +1,7 @@
 #![cfg(feature = "runtime-tokio")]
 
 use camera::{
-    CameraError, CameraSystem, CaptureFormat, CaptureRequest, DeviceSelector, FrameRate,
-    SubscriptionOptions,
+    CameraSystem, CaptureFormat, CaptureRequest, DeviceSelector, FrameRate, SubscriptionOptions,
 };
 #[test]
 fn rational_rates_preserve_precision_and_reject_zero() {
@@ -53,7 +52,9 @@ async fn synthetic_session_has_independent_receivers_and_stop_wakes_waiters() {
     assert_ne!(first.key, second.key);
     assert_eq!(first.layout().width, 16);
     session.close().await.unwrap();
-    assert!(matches!(a.next().await, Err(CameraError::StreamStopped)));
+    assert!(
+        matches!(a.next().await, Err(ref error) if error.kind() == camera::CameraErrorKind::StreamStopped)
+    );
 }
 #[tokio::test]
 async fn dropping_session_stops_retained_receivers() {
@@ -72,7 +73,9 @@ async fn dropping_session_stops_retained_receivers() {
     let result = tokio::time::timeout(std::time::Duration::from_secs(1), r.next())
         .await
         .unwrap();
-    assert!(matches!(result, Err(CameraError::StreamStopped)));
+    assert!(
+        matches!(result, Err(ref error) if error.kind() == camera::CameraErrorKind::StreamStopped)
+    );
 }
 #[tokio::test]
 async fn requested_native_output_is_described_honestly() {
@@ -151,14 +154,14 @@ async fn old_receivers_and_session_views_do_not_attach_to_new_capture() {
         .unwrap();
     assert!(matches!(
         reader.next().await,
-        Err(CameraError::StreamStopped)
+        Err(ref error) if error.kind() == camera::CameraErrorKind::StreamStopped
     ));
     assert!(matches!(
         old.subscribe(SubscriptionOptions::latest())
             .unwrap()
             .next()
             .await,
-        Err(CameraError::StreamStopped)
+        Err(ref error) if error.kind() == camera::CameraErrorKind::StreamStopped
     ));
     assert!(old.latest().is_none());
     assert_eq!(
@@ -184,7 +187,7 @@ async fn exact_fractional_rate_is_preserved_and_wrong_format_is_rejected() {
         .unwrap();
     assert!(matches!(
         camera.start(invalid).await,
-        Err(CameraError::UnsupportedFormat(_))
+        Err(ref error) if error.kind() == camera::CameraErrorKind::UnsupportedFormat
     ));
     let fps = FrameRate::new(30000, 1001).unwrap();
     let s = camera
@@ -212,7 +215,7 @@ async fn required_aspect_ratio_is_enforced_for_synthetic_capture() {
         .unwrap();
     assert!(matches!(
         camera.start(request).await,
-        Err(CameraError::UnsupportedFormat(_))
+        Err(ref error) if error.kind() == camera::CameraErrorKind::UnsupportedFormat
     ));
 }
 
@@ -227,6 +230,6 @@ async fn stopping_device_watcher_is_terminal_and_idempotent() {
     watcher.stop().await.unwrap();
     assert!(matches!(
         watcher.changed().await,
-        Err(CameraError::StreamStopped)
+        Err(ref error) if error.kind() == camera::CameraErrorKind::StreamStopped
     ));
 }
