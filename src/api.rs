@@ -347,9 +347,13 @@ impl CameraSystem {
     /// Enumerates devices according to the configured backend policy.
     pub async fn devices(&self) -> CameraResult<Vec<DeviceInfo>> {
         let system = self.clone();
-        tokio::task::spawn_blocking(move || system.devices_blocking())
-            .await
-            .map_err(join_error)?
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            tokio::task::spawn_blocking(move || system.devices_blocking()),
+        )
+        .await
+        .map_err(|_| CameraError::timeout(crate::OperationStage::Enumeration))?
+        .map_err(join_error)?
     }
 
     /// Queries formats, resolutions, frame rates, and controls for a device.
@@ -407,7 +411,7 @@ impl CameraSystem {
 
     /// Opens a selected device using the default startup deadline.
     pub async fn open(&self, selector: DeviceSelector) -> CameraResult<Device> {
-        self.open_inner(selector).await
+        self.open_timeout(selector, Duration::from_secs(10)).await
     }
 
     /// Performs the `open_timeout` operation.
@@ -863,6 +867,15 @@ impl Source {
 
     async fn external_capabilities(&self) -> CameraResult<Option<DeviceCapabilities>> {
         match self {
+            Self::Native(source)
+                if source
+                    .id
+                    .as_ref()
+                    .is_some_and(|id| id.backend() == &BackendId::MEDIA_FOUNDATION) =>
+            {
+                let camera = source.current()?;
+                camera.opened_device_capabilities().map(Some)
+            }
             Self::Custom(c) => {
                 let c = c.clone();
                 tokio::task::spawn_blocking(move || c.device.lock().capabilities())
@@ -953,7 +966,10 @@ impl Camera {
                     .await
                     .map_err(join_error)?
             }
-            Source::Native(source) if source.id.is_none() => {
+            Source::Native(source)
+                if source.id.is_none()
+                    || self.device.id.backend() == &BackendId::MEDIA_FOUNDATION =>
+            {
                 let camera = source.current()?;
                 tokio::task::spawn_blocking(move || camera.opened_device_capabilities())
                     .await
@@ -975,8 +991,11 @@ impl Camera {
     }
 
     pub async fn start(&mut self, request: CaptureRequest) -> CameraResult<Session> {
+        let started = std::time::Instant::now();
         let deadline = StartupDeadline::new(request.startup_timeout);
-        self.start_until(request, deadline).await
+        let mut session = self.start_until(request, deadline).await?;
+        session.negotiated.first_frame_latency = started.elapsed();
+        Ok(session)
     }
 
     async fn start_until(

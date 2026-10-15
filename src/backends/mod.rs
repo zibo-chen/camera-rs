@@ -386,6 +386,10 @@ impl BackendCamera {
 
     pub(crate) fn opened_device_capabilities(&self) -> CameraResult<crate::DeviceCapabilities> {
         match self {
+            #[cfg(all(any(feature = "native", feature = "backend-mf"), target_os = "windows"))]
+            BackendCamera::MediaFoundation(camera) => Ok(
+                crate::DeviceCapabilities::from_configurations(camera.get_compatible_formats()?),
+            ),
             #[cfg(all(
                 feature = "backend-uvc",
                 any(target_os = "linux", target_os = "macos", target_os = "android")

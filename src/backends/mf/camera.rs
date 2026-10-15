@@ -833,9 +833,17 @@ impl MFCamera {
                 }
             })
             .map_err(|error| CameraError::io(crate::OperationStage::Worker, error))?;
-        let ready = ready_rx
-            .recv()
-            .map_err(|_| CameraError::stream_error("MF worker initialization failed".into()))?;
+        let ready =
+            ready_rx
+                .recv_timeout(Duration::from_secs(10))
+                .map_err(|error| match error {
+                    mpsc::RecvTimeoutError::Timeout => {
+                        CameraError::timeout(crate::OperationStage::Open)
+                    }
+                    mpsc::RecvTimeoutError::Disconnected => {
+                        CameraError::stream_error("MF worker initialization failed".into())
+                    }
+                })?;
         match ready {
             Ok((device_info, formats)) => Ok(Self {
                 device_info,

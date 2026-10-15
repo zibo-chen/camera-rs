@@ -4,6 +4,8 @@ Intent-driven, cross-platform camera capture for Rust. Version 0.5 adds one stru
 
 Rust 1.88 or newer is required.
 
+Device enumeration and default device opening have a ten-second deadline. Media Foundation reuses the opened device's capabilities and bounds worker initialization to ten seconds; a timed-out driver call may still run in its worker. `Camera::start` records total startup latency in `first_frame_latency`. Use `cargo run --example startup_latency` to measure enumeration, opening, readiness, and the first delivered frame on a machine with a camera.
+
 ## Platform status
 
 | Target | Backend | Build coverage | Hardware expectations |
