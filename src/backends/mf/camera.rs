@@ -85,6 +85,7 @@ struct Worker {
     running: bool,
     stopping: Option<Reply>,
     stride: i32,
+    color: crate::ColorInfo,
 }
 
 enum MediaBufferLock {
@@ -367,6 +368,25 @@ impl Worker {
             VideoFormat::RGB => 3,
             _ => 1,
         };
+        self.color = if matches!(
+            format,
+            VideoFormat::YUYV | VideoFormat::UYVY | VideoFormat::NV12
+        ) {
+            let matrix = unsafe { media.GetUINT32(&MF_MT_YUV_MATRIX) }.ok();
+            let range = unsafe { media.GetUINT32(&MF_MT_VIDEO_NOMINAL_RANGE) }.ok();
+            let color = super::color::resolve_color(matrix, range, width, height)?;
+            log::info!(
+                "MF YUV color: {}x{} matrix={:?} range={:?} -> {:?}",
+                width,
+                height,
+                matrix,
+                range,
+                color
+            );
+            color
+        } else {
+            crate::ColorInfo::default()
+        };
         self.stride =
             unsafe { media.GetUINT32(&MF_MT_DEFAULT_STRIDE) }.unwrap_or(width * pixel_bytes) as i32;
         *self.config.lock().unwrap() = Some(
@@ -456,7 +476,16 @@ impl Worker {
                                 clock: crate::ClockDomain::MediaPresentation,
                             }),
                         None,
-                        |rgb| decode_into(&self.compressed_scratch, &config, stride, decoder, rgb),
+                        |rgb| {
+                            decode_into(
+                                &self.compressed_scratch,
+                                &config,
+                                stride,
+                                self.color,
+                                decoder,
+                                rgb,
+                            )
+                        },
                     )
                     .map(|_| ());
             }
@@ -484,6 +513,7 @@ impl Worker {
                     data.len(),
                 );
                 layout.bottom_up = stride < 0;
+                layout.color = self.color;
                 if format == crate::PixelFormat::Nv12 {
                     let y_len = (stride.unsigned_abs() as usize)
                         .checked_mul(config.height as usize)
@@ -524,7 +554,7 @@ impl Worker {
                                 clock: crate::ClockDomain::MediaPresentation,
                             }),
                         None,
-                        |rgb| decode_into(data, &config, stride, decoder, rgb),
+                        |rgb| decode_into(data, &config, stride, self.color, decoder, rgb),
                     )
                     .map(|_| ())
             }
@@ -615,6 +645,7 @@ fn decode_into(
     data: &[u8],
     config: &CameraConfig,
     stride: i32,
+    color: crate::ColorInfo,
     _decoder: &mut Option<JpegDecoder>,
     rgb: &mut [u8],
 ) -> CameraResult<()> {
@@ -659,13 +690,17 @@ fn decode_into(
             .checked_mul(height)
             .filter(|n| *n <= data.len())
             .ok_or_else(|| CameraError::invalid_frame("Truncated MF NV12 frame".into()))?;
-        return crate::utils::color_convert::yuv420sp_to_rgb_into(
-            &data[..y_length],
-            &data[y_length..],
+        return crate::utils::color_convert::yuv420sp_to_rgb_with_coefficients_into(
+            crate::utils::color_convert::Yuv420Sp {
+                y: &data[..y_length],
+                uv: &data[y_length..],
+                y_stride: stride as usize,
+                uv_stride: stride as usize,
+                vu_order: false,
+            },
             width,
             height,
-            stride as usize,
-            stride as usize,
+            crate::utils::color_convert::color_coefficients(color)?,
             rgb,
         );
     }
@@ -687,16 +722,22 @@ fn decode_into(
             "MF stride shorter than row".into(),
         ));
     }
-    let converter = crate::utils::color_convert::ColorConverter::new();
-    if stride > 0 && pitch == row_bytes {
-        match config.format {
-            VideoFormat::YUYV => {
-                return converter.yuyv_to_rgb_into(data, config.width, config.height, rgb)
-            }
-            VideoFormat::UYVY => {
-                return converter.uyvy_to_rgb_into(data, config.width, config.height, rgb)
-            }
-            _ => {}
+    let coefficients = if matches!(config.format, VideoFormat::YUYV | VideoFormat::UYVY) {
+        Some(crate::utils::color_convert::color_coefficients(color)?)
+    } else {
+        None
+    };
+    if stride > 0 {
+        if let Some(coefficients) = coefficients {
+            return crate::utils::color_convert::yuv422_to_rgb_with_coefficients_into(
+                data,
+                width,
+                height,
+                pitch,
+                config.format == VideoFormat::UYVY,
+                coefficients,
+                rgb,
+            );
         }
     }
     for (row, destination) in rgb.chunks_exact_mut(width * 3).enumerate() {
@@ -708,11 +749,16 @@ fn decode_into(
             .get(offset..offset.saturating_add(row_bytes))
             .ok_or_else(|| CameraError::invalid_frame("Truncated MF row".into()))?;
         match config.format {
-            VideoFormat::YUYV => {
-                converter.yuyv_to_rgb_into(source, config.width, 1, destination)?
-            }
-            VideoFormat::UYVY => {
-                converter.uyvy_to_rgb_into(source, config.width, 1, destination)?
+            VideoFormat::YUYV | VideoFormat::UYVY => {
+                crate::utils::color_convert::yuv422_to_rgb_with_coefficients_into(
+                    source,
+                    width,
+                    1,
+                    row_bytes,
+                    config.format == VideoFormat::UYVY,
+                    coefficients.unwrap(),
+                    destination,
+                )?
             }
             VideoFormat::RGB => {
                 for (src, dst) in source
@@ -817,6 +863,7 @@ impl MFCamera {
                         running: false,
                         stopping: None,
                         stride: 0,
+                        color: crate::ColorInfo::default(),
                     };
                     let formats = worker.get_compatible_formats()?;
                     Ok((worker, info, formats))
@@ -1021,13 +1068,62 @@ impl CameraControl for MFCamera {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn legacy_rgb_capture_uses_the_same_resolved_yuv_color_as_native_frames() {
+        for (format, data) in [
+            (
+                VideoFormat::YUYV,
+                vec![16, 128, 235, 128, 16, 128, 235, 128],
+            ),
+            (
+                VideoFormat::UYVY,
+                vec![128, 16, 128, 235, 128, 16, 128, 235],
+            ),
+            (VideoFormat::NV12, vec![16, 235, 16, 235, 128, 128]),
+        ] {
+            let config = CameraConfig::new(format, 2, 2, 30);
+            let stride = if format == VideoFormat::NV12 { 2 } else { 4 };
+            let mut rgb = [0; 12];
+            decode_into(
+                &data,
+                &config,
+                stride,
+                super::super::color::resolve_color(None, None, 640, 480).unwrap(),
+                &mut None,
+                &mut rgb,
+            )
+            .unwrap();
+            assert_eq!(rgb, [0, 0, 0, 255, 255, 255, 0, 0, 0, 255, 255, 255]);
+            let full = super::super::color::resolve_color(Some(2), Some(1), 640, 480).unwrap();
+            decode_into(&data, &config, stride, full, &mut None, &mut rgb).unwrap();
+            assert_eq!(rgb, [16, 16, 16, 235, 235, 235, 16, 16, 16, 235, 235, 235]);
+        }
+    }
+
     #[test]
     fn decodes_padded_bottom_up_bgr_without_copying_raw_buffer() {
         let config = CameraConfig::new(VideoFormat::RGB, 1, 2, 30);
         let mut out = [0; 6];
-        decode_into(&[3, 2, 1, 0, 6, 5, 4], &config, -4, &mut None, &mut out).unwrap();
+        decode_into(
+            &[3, 2, 1, 0, 6, 5, 4],
+            &config,
+            -4,
+            crate::ColorInfo::default(),
+            &mut None,
+            &mut out,
+        )
+        .unwrap();
         assert_eq!(out, [4, 5, 6, 1, 2, 3]);
-        assert!(decode_into(&[0; 2], &config, -4, &mut None, &mut out).is_err());
+        assert!(decode_into(
+            &[0; 2],
+            &config,
+            -4,
+            crate::ColorInfo::default(),
+            &mut None,
+            &mut out
+        )
+        .is_err());
     }
 
     #[test]

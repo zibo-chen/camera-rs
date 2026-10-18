@@ -76,6 +76,11 @@ pub mod camera2;
 #[cfg(all(any(feature = "native", feature = "backend-mf"), target_os = "windows"))]
 pub mod mf;
 
+// Exercise MF's platform-independent color policy on every test host.
+#[cfg(all(test, not(target_os = "windows")))]
+#[path = "mf/color.rs"]
+mod mf_color;
+
 // ==================== Backend type ====================
 
 /// Camera backend type.

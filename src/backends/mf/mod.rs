@@ -33,6 +33,7 @@
 
 #[cfg(all(target_os = "windows", any(feature = "native", feature = "backend-mf")))]
 mod camera;
+mod color;
 #[cfg(all(target_os = "windows", any(feature = "native", feature = "backend-mf")))]
 mod com;
 #[cfg(all(target_os = "windows", any(feature = "native", feature = "backend-mf")))]
