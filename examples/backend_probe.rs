@@ -112,6 +112,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 session.control(control.id).await
             );
         }
+        println!("LIVE_CAPABILITIES {:?}", camera.capabilities().await?);
         let stop = Instant::now();
         session.close().await?;
         session.close().await?;
@@ -119,6 +120,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             receiver.next().await,
             Err(ref error) if error.kind() == camera::CameraErrorKind::StreamStopped
         ));
+        println!("STOPPED_CAPABILITIES {:?}", camera.capabilities().await?);
         let count = fds();
         if let Some(warm) = warm_fds {
             assert!(count <= warm + 4, "descriptor growth after restart");

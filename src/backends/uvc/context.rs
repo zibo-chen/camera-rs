@@ -19,13 +19,19 @@ struct ContextInner {
 unsafe impl Send for ContextInner {}
 unsafe impl Sync for ContextInner {}
 
+fn configure_device_discovery(set_no_discovery: impl FnOnce()) {
+    #[cfg(target_os = "android")]
+    set_no_discovery();
+    #[cfg(not(target_os = "android"))]
+    let _ = set_no_discovery;
+}
+
 impl UvcContext {
     /// Creates a new UVC context.
     pub fn new() -> Result<Self> {
         // Android must disable libusb discovery so an authorized external file
         // descriptor can be used without root access.
-        #[cfg(unix)]
-        {
+        configure_device_discovery(|| {
             log::debug!("Setting libusb NO_DEVICE_DISCOVERY option for Android");
             let result = unsafe {
                 ffi::libusb_set_option(ptr::null_mut(), ffi::LibusbOption::NoDeviceDiscovery)
@@ -36,7 +42,7 @@ impl UvcContext {
                     result
                 );
             }
-        }
+        });
 
         let mut ctx: *mut ffi::UvcContext = ptr::null_mut();
         let result = unsafe { ffi::uvc_init(&mut ctx, ptr::null_mut()) };
@@ -397,3 +403,20 @@ impl Drop for StreamCtrl {
 
 unsafe impl Send for StreamCtrl {}
 unsafe impl Sync for StreamCtrl {}
+
+#[cfg(test)]
+mod discovery_policy_tests {
+    use super::configure_device_discovery;
+    #[cfg(not(target_os = "android"))]
+    #[test]
+    fn desktop_context_does_not_disable_usb_discovery() {
+        configure_device_discovery(|| panic!("desktop construction must preserve USB discovery"));
+    }
+    #[cfg(target_os = "android")]
+    #[test]
+    fn android_context_disables_discovery_for_authorized_fd_access() {
+        let calls = std::cell::Cell::new(0);
+        configure_device_discovery(|| calls.set(calls.get() + 1));
+        assert_eq!(calls.get(), 1);
+    }
+}

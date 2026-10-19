@@ -247,15 +247,23 @@ impl UvcCamera {
     }
 
     pub(crate) fn opened_device_capabilities(&self) -> CameraResult<crate::DeviceCapabilities> {
+        self.opened_device_capabilities_if_available()?
+            .ok_or_else(|| {
+                CameraError::invalid_state(
+                    "UVC device must be open before querying capabilities".into(),
+                )
+            })
+    }
+
+    pub(crate) fn opened_device_capabilities_if_available(
+        &self,
+    ) -> CameraResult<Option<crate::DeviceCapabilities>> {
         let handle = self.device_handle.lock();
-        let handle = handle.as_ref().ok_or_else(|| {
-            CameraError::invalid_state(
-                "UVC device must be open before querying capabilities".into(),
-            )
-        })?;
-        Ok(crate::DeviceCapabilities::from_configurations(
-            Self::supported_configs_from_handle(handle.as_ptr()),
-        ))
+        Ok(handle.as_ref().map(|handle| {
+            crate::DeviceCapabilities::from_configurations(Self::supported_configs_from_handle(
+                handle.as_ptr(),
+            ))
+        }))
     }
 
     /// Compatibility shim; callbacks no longer require an Arc<UvcCamera>.

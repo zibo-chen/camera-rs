@@ -876,6 +876,32 @@ impl Source {
                 let camera = source.current()?;
                 camera.opened_device_capabilities().map(Some)
             }
+            #[cfg(all(
+                feature = "backend-uvc",
+                any(target_os = "linux", target_os = "macos", target_os = "android")
+            ))]
+            Self::Native(source)
+                if source
+                    .id
+                    .as_ref()
+                    .is_some_and(|id| id.backend() == &BackendId::UVC) =>
+            {
+                // A stopped UVC stream retains its USB handle. Opening another
+                // handle for enumeration would contend with our own interface.
+                match source.current()? {
+                    backends::BackendCamera::Uvc(camera) => {
+                        tokio::task::spawn_blocking(move || {
+                            camera.opened_device_capabilities_if_available()
+                        })
+                        .await
+                        .map_err(join_error)?
+                    }
+                    #[allow(unreachable_patterns)]
+                    _ => Err(CameraError::invalid_state(
+                        "UVC source has a different backend".into(),
+                    )),
+                }
+            }
             Self::Custom(c) => {
                 let c = c.clone();
                 tokio::task::spawn_blocking(move || c.device.lock().capabilities())
@@ -976,6 +1002,9 @@ impl Camera {
                     .map_err(join_error)?
             }
             Source::Native(_) => {
+                if let Some(capabilities) = self.source.external_capabilities().await? {
+                    return Ok(capabilities);
+                }
                 let backend =
                     backends::backend_type(self.device.id.backend()).ok_or_else(|| {
                         CameraError::backend_not_compiled(self.device.id.backend().clone())
