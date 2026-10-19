@@ -1,4 +1,5 @@
 use crate::{CameraError, CameraResult};
+#[cfg(feature = "decode-mjpeg")]
 use turbojpeg::Decompressor;
 
 fn complete_frame(data: &[u8]) -> CameraResult<&[u8]> {
@@ -28,6 +29,7 @@ pub(crate) fn validate(data: &[u8]) -> CameraResult<()> {
 /// Reuse a decoder on the healthy path, but discard it after libjpeg rejects a
 /// frame. Recreating only after an error avoids carrying decoder state across a
 /// broken USB transfer without adding allocations to normal capture.
+#[cfg(feature = "decode-mjpeg")]
 pub(crate) fn decode_with<T>(
     decoder: &mut Option<Decompressor>,
     data: &[u8],
@@ -46,7 +48,7 @@ pub(crate) fn decode_with<T>(
     result
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "decode-mjpeg"))]
 mod tests {
     use super::*;
 
@@ -71,5 +73,18 @@ mod tests {
         let decoded_length = decode_with(&mut decoder, &frame, |_, complete| Ok(complete.len()))
             .expect("padding after EOI is valid transport data");
         assert_eq!(decoded_length, 6);
+    }
+}
+
+#[cfg(test)]
+mod validation_tests {
+    use super::*;
+    #[test]
+    fn native_validation_is_available_without_a_jpeg_decoder() {
+        for data in [&[][..], &[0xff, 0xd8, 1, 2][..], &[1, 2, 0xff, 0xd9][..]] {
+            assert!(validate(data).is_err());
+        }
+        assert!(validate(&[0xff, 0xd8, 1, 2, 0xff, 0xd9]).is_ok());
+        assert!(validate(&[0xff, 0xd8, 1, 2, 0xff, 0xd9, 0, 0]).is_ok());
     }
 }

@@ -65,6 +65,7 @@ struct Frame {
     damaged: u32,
     sequence: u32,
     monotonic: u32,
+    timestamp_valid: u32,
 }
 
 extern "C" {
@@ -88,6 +89,7 @@ extern "C" {
     fn camera_v4l2_get_control(fd: i32, id: u32, value: *mut i32) -> i32;
     fn camera_v4l2_set_control(fd: i32, id: u32, value: i32) -> i32;
     fn camera_v4l2_auto_exposure(fd: i32, enabled: i32) -> i32;
+    fn camera_v4l2_exposure_modes(fd: i32, modes: *mut u32) -> i32;
 }
 
 fn check(rc: i32) -> std::io::Result<()> {
@@ -147,6 +149,11 @@ pub(super) fn get_control(fd: RawFd, id: u32) -> std::io::Result<i32> {
 pub(super) fn set_control(fd: RawFd, id: u32, value: i32) -> std::io::Result<()> {
     check(unsafe { camera_v4l2_set_control(fd, id, value) })
 }
+pub(super) fn exposure_modes(fd: RawFd) -> std::io::Result<u32> {
+    let mut modes = 0;
+    check(unsafe { camera_v4l2_exposure_modes(fd, &mut modes) })?;
+    Ok(modes)
+}
 pub(super) fn auto_exposure(fd: RawFd, enabled: bool) -> std::io::Result<()> {
     check(unsafe { camera_v4l2_auto_exposure(fd, i32::from(enabled)) })
 }
@@ -174,7 +181,13 @@ impl<'a> Stream<'a> {
         &mut self,
         wake_fd: RawFd,
         strides: [u32; 2],
-        consume: impl FnOnce(&[Plane<'_>], i64, crate::ClockDomain, u64, bool) -> CameraResult<()>,
+        consume: impl FnOnce(
+            &[Plane<'_>],
+            Option<i64>,
+            crate::ClockDomain,
+            u64,
+            bool,
+        ) -> CameraResult<()>,
     ) -> CameraResult<()> {
         let ptr = self.ptr.unwrap().as_ptr();
         let mut frame = Frame::default();
@@ -212,7 +225,7 @@ impl<'a> Stream<'a> {
         }
         let result = consume(
             &planes[..frame.planes as usize],
-            frame.timestamp_ns,
+            (frame.timestamp_valid != 0).then_some(frame.timestamp_ns),
             if frame.monotonic != 0 {
                 crate::ClockDomain::HostMonotonic
             } else {

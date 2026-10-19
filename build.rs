@@ -55,8 +55,9 @@ fn main() {
 
     // Compile the native UVC libraries only when the backend is enabled.
     if backend_uvc_enabled {
-        compile_libusb(&thirdparty_dir, &target_os);
+        // Static archives must precede the libraries that satisfy their symbols.
         compile_libuvc(&thirdparty_dir, &target_os);
+        compile_libusb(&thirdparty_dir, &target_os);
         println!("cargo:warning=UVC native libraries compiled");
     } else {
         println!("cargo:warning=Skipping UVC native libraries (backend-uvc is disabled)");

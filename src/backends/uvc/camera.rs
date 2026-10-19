@@ -363,7 +363,6 @@ impl UvcCamera {
                 return Ok(false);
             }
             let data = std::slice::from_raw_parts(frame.data as *const u8, frame.data_bytes);
-            #[cfg(feature = "decode-mjpeg")]
             if frame.frame_format == ffi::UvcFrameFormat::Mjpeg {
                 if let Err(error) = crate::mjpeg::validate(data) {
                     context.state.hub.record_input_error(context.session);
@@ -1563,6 +1562,42 @@ impl Drop for UvcCamera {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn native_callback_rejects_truncated_mjpeg_without_requiring_a_decoder() {
+        let camera = UvcCamera::new(0).unwrap();
+        camera
+            .capture
+            .hub
+            .configure(&crate::StreamRequest::builder().build().unwrap())
+            .unwrap();
+        let session = camera.capture.hub.start();
+        let mut context = Box::new(CallbackContext {
+            state: camera.capture.clone(),
+            session,
+            #[cfg(feature = "decode-mjpeg")]
+            mjpeg: None,
+        });
+        let pointer = context.as_mut() as *mut CallbackContext as *mut c_void;
+        let mut bytes = [0xffu8, 0xd8, 1, 2];
+        let mut frame: ffi::UvcFrame = unsafe { std::mem::zeroed() };
+        frame.data = bytes.as_mut_ptr() as *mut c_void;
+        frame.data_bytes = bytes.len();
+        frame.width = 16;
+        frame.height = 16;
+        frame.frame_format = ffi::UvcFrameFormat::Mjpeg;
+        UvcCamera::frame_callback(&mut frame, pointer);
+        assert!(camera.capture.hub.latest().is_none());
+        assert_eq!(camera.capture.hub.metrics().conversion_errors, 1);
+        bytes[2..].copy_from_slice(&[0xff, 0xd9]);
+        frame.sequence = 8;
+        UvcCamera::frame_callback(&mut frame, pointer);
+        assert_eq!(
+            camera.capture.hub.latest().unwrap().source_sequence,
+            Some(8)
+        );
+        assert_eq!(camera.capture.hub.metrics().published, 1);
+    }
 
     #[test]
     fn test_camera_creation() {

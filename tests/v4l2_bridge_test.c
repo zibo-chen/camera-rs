@@ -15,6 +15,8 @@ static unsigned long fail_request;
 static unsigned mapped, unmapped, allocations_freed, queued, stream_off;
 static int mplane, fail_map, poll_mode, invalid_index, invalid_bytes, invalid_offset, corrupt;
 static unsigned char pixels[8][16];
+static int64_t timestamp_seconds=1;
+static long timestamp_microseconds=2;
 static int fake_ioctl(int fd, unsigned long request, void *arg) {
     (void)fd;
     if (request == fail_request) { errno = EIO; return -1; }
@@ -39,7 +41,8 @@ static int fake_ioctl(int fd, unsigned long request, void *arg) {
     else if (request == VIDIOC_DQBUF) {
         struct v4l2_buffer *b = arg;
         b->index = invalid_index ? 500 : 1;
-        b->timestamp.tv_sec = 1; b->timestamp.tv_usec = 2;
+        b->timestamp.tv_sec = timestamp_seconds; b->timestamp.tv_usec = timestamp_microseconds;
+        b->sequence = 77;
         b->flags = corrupt ? V4L2_BUF_FLAG_ERROR : 0;
         if (mplane) {
             for (unsigned i = 0; i < b->length; ++i) {
@@ -81,6 +84,7 @@ static void capture_and_release(int multi) {
     assert(camera_v4l2_next(s, 11, &f) == 0);
     assert(f.index == 1 && f.planes == (multi ? 2U : 1U));
     assert(f.timestamp_ns == 1000002000);
+    assert(f.timestamp_valid == 1);
     assert(f.lengths[0] == (multi ? 6U : 8U));
     assert(f.data[0] == pixels[multi ? 2 : 1] + (multi ? 2 : 0));
     assert(camera_v4l2_next(s, 11, &f) == -EBUSY);
@@ -95,7 +99,24 @@ static void capture_and_release(int multi) {
     assert(camera_v4l2_stop(s) == 0);
     assert(unmapped == mapped && allocations_freed == 1 && stream_off == 1);
 }
+static void invalid_timestamps_keep_sequence_and_do_not_overflow(void) {
+    const int64_t seconds[] = {-1, 1, INT64_MAX / 1000000000 + 1, 1};
+    const long microseconds[] = {2, -1, 0, 1000000};
+    for (unsigned i=0; i<4; ++i) {
+        reset(0); camera_v4l2_stream *s=NULL; camera_v4l2_frame f;
+        assert(camera_v4l2_start(10,4,&s)==0);
+        timestamp_seconds=seconds[i]; timestamp_microseconds=microseconds[i];
+        assert(camera_v4l2_next(s,11,&f)==0);
+        assert(f.sequence==77);
+        assert(f.timestamp_ns==0);
+        assert(f.timestamp_valid==0);
+        assert(camera_v4l2_release(s,f.index)==0);
+        assert(camera_v4l2_stop(s)==0);
+    }
+    timestamp_seconds=1; timestamp_microseconds=2;
+}
 int main(void) {
+    invalid_timestamps_keep_sequence_and_do_not_overflow();
     capture_and_release(0); capture_and_release(1);
     for (int multi = 0; multi <= 1; ++multi) {
         const unsigned long errors[] = {VIDIOC_QUERYBUF, VIDIOC_QBUF, VIDIOC_STREAMON};

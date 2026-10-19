@@ -20,6 +20,9 @@ esac
  "${camera_link[@]}" -pthread -fsanitize=address,undefined -o "$camera_tmp/uvc-negotiation"
 "$camera_tmp/uvc-negotiation"
 if [[ $(uname -s) == Linux ]]; then
- "${CC:-cc}" -std=c11 -D_GNU_SOURCE -Wall -Wextra -Werror tests/v4l2_bridge_test.c -o "$camera_tmp/v4l2"
- "$camera_tmp/v4l2"
+ for camera_test in v4l2_bridge v4l2_control_modes; do
+  "${CC:-cc}" -std=c11 -D_GNU_SOURCE -Wall -Wextra -Werror \
+   -fsanitize=address,undefined "tests/${camera_test}_test.c" -o "$camera_tmp/$camera_test"
+  "$camera_tmp/$camera_test"
+ done
 fi

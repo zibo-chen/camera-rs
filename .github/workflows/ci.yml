@@ -51,6 +51,8 @@ jobs:
       - name: UVC contracts
         if: runner.os != 'Windows'
         run: cargo test --features backend-uvc,ndarray,convert-rgb,decode-mjpeg,custom-backend --lib
+      - name: Capture contracts without an MJPEG decoder
+        run: cargo test --no-default-features --features backend-uvc,backend-v4l2,serde --lib
       - name: Public documentation
         env:
           RUSTDOCFLAGS: -D warnings -D rustdoc::broken-intra-doc-links

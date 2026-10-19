@@ -33,7 +33,6 @@ mod extension;
 mod format;
 #[cfg(feature = "runtime-tokio")]
 mod frame;
-#[cfg(feature = "decode-mjpeg")]
 mod mjpeg;
 #[cfg(all(
     unix,

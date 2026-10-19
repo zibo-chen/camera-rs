@@ -101,6 +101,18 @@ impl V4l2Camera {
     pub async fn stop_stream_arc(self: &Arc<Self>) -> CameraResult<()> {
         self.stop_stream().await
     }
+    pub(crate) fn exposure_modes(&self) -> CameraResult<Vec<crate::ControlMode>> {
+        let _guard = self.inner.state.lock();
+        let bits = native::exposure_modes(self.inner.file.as_raw_fd())
+            .map_err(|e| control_error(CameraControlType::AutoExposure, e))?;
+        Ok([
+            (1, crate::ControlMode::Manual),
+            (2, crate::ControlMode::Automatic),
+        ]
+        .into_iter()
+        .filter_map(|(bit, mode)| (bits & bit != 0).then_some(mode))
+        .collect())
+    }
     pub(crate) fn control_writable(&self, control: CameraControlType) -> CameraResult<bool> {
         let _guard = self.inner.state.lock();
         Ok(self.query(control)?.read_only == 0)
@@ -294,7 +306,8 @@ impl Inner {
                 let _stop = StopHub(hub.clone());
                 let setup = (|| {
                     let mut format = requested_format(file.as_raw_fd(), &config)?;
-                    native::configure(file.as_raw_fd(), &mut format, true)?;
+                    native::configure(file.as_raw_fd(), &mut format, true)
+                        .map_err(|e| startup_error("V4L2 format/frame interval", e))?;
                     let actual = config_from_format(&format)?;
                     let mut decoder = Converter::new()?;
                     if matches!(
@@ -303,7 +316,8 @@ impl Inner {
                     ) {
                         decoder.set_colorimetry(format.ycbcr, format.full_range != 0)?;
                     }
-                    let stream = native::Stream::start(&file, buffers)?;
+                    let stream = native::Stream::start(&file, buffers)
+                        .map_err(|e| startup_error("V4L2 MMAP/STREAMON", e))?;
                     Ok::<_, CameraError>((format, actual, decoder, stream))
                 })();
                 let (format, actual, mut decoder, mut stream) = match setup {
@@ -333,10 +347,8 @@ impl Inner {
                                 hub.log_frame_error("V4L2", &error);
                                 return Ok(());
                             }
-                            let timestamp = Some(crate::SourceTimestamp {
-                                nanoseconds: timestamp,
-                                clock,
-                            });
+                            let timestamp = timestamp
+                                .map(|nanoseconds| crate::SourceTimestamp { nanoseconds, clock });
                             if !native_output && actual.format == VideoFormat::MJPEG {
                                 let Some(plane) = planes.first() else {
                                     return Err(CameraError::buffer_exhausted());
@@ -347,19 +359,24 @@ impl Inner {
                                 return Ok(());
                             }
                             let converted = if native_output {
-                                native_layout(&actual, &format, planes).and_then(|layout| {
-                                    let parts = [
-                                        planes[0].data,
-                                        planes.get(1).map_or(&[][..], |plane| plane.data),
-                                    ];
-                                    hub.publish_native(
-                                        session,
-                                        layout,
-                                        timestamp,
-                                        Some(source_sequence),
-                                        &parts[..planes.len()],
-                                    )
-                                })
+                                native_layout(&actual, &format, planes)
+                                    .map_err(|error| {
+                                        hub.record_input_error(session);
+                                        error
+                                    })
+                                    .and_then(|layout| {
+                                        let parts = [
+                                            planes[0].data,
+                                            planes.get(1).map_or(&[][..], |plane| plane.data),
+                                        ];
+                                        hub.publish_native(
+                                            session,
+                                            layout,
+                                            timestamp,
+                                            Some(source_sequence),
+                                            &parts[..planes.len()],
+                                        )
+                                    })
                             } else {
                                 hub.publish_rgb_metadata(
                                     session,
@@ -473,6 +490,33 @@ fn requested_format(fd: i32, config: &CameraConfig) -> CameraResult<native::Form
         ..Default::default()
     })
 }
+fn startup_error(operation: &str, error: std::io::Error) -> CameraError {
+    use crate::{BackendId, CameraErrorKind, OperationStage};
+    let kind = match error.raw_os_error() {
+        Some(libc::EBUSY) => CameraErrorKind::DeviceBusy,
+        Some(libc::EACCES | libc::EPERM) => CameraErrorKind::PermissionDenied,
+        Some(libc::ENODEV | libc::ENXIO) => CameraErrorKind::DeviceDisconnected,
+        Some(libc::EINVAL | libc::ENOTSUP) => CameraErrorKind::UnsupportedFormat,
+        Some(libc::ETIMEDOUT) => CameraErrorKind::Timeout,
+        Some(libc::ENOMEM) => CameraErrorKind::BufferExhausted,
+        _ => CameraErrorKind::Io,
+    };
+    if let Some(code) = error.raw_os_error() {
+        CameraError::native(
+            kind,
+            BackendId::V4L2,
+            OperationStage::Startup,
+            operation.into(),
+            i64::from(code),
+            error.to_string(),
+        )
+        .with_source(error)
+    } else {
+        CameraError::io(OperationStage::Startup, error)
+            .with_backend(BackendId::V4L2)
+            .with_operation(operation)
+    }
+}
 fn config_from_format(format: &native::Format) -> CameraResult<CameraConfig> {
     let pixel_format = from_fourcc(format.fourcc).ok_or_else(|| {
         CameraError::unsupported_format(format!("V4L2 negotiated fourcc 0x{:08x}", format.fourcc))
@@ -508,6 +552,12 @@ fn native_layout(
         VideoFormat::Gray => PixelFormat::Gray8,
         _ => return Err(CameraError::unsupported_format("V4L2 native layout".into())),
     };
+    let first = planes
+        .first()
+        .ok_or_else(|| CameraError::invalid_frame("Missing V4L2 plane".into()))?;
+    if format == PixelFormat::Mjpeg {
+        crate::mjpeg::validate(first.data)?;
+    }
     let mut layout = FrameLayout::packed(
         config.width,
         config.height,
@@ -989,7 +1039,7 @@ impl V4l2Camera {
     fn write_auto(&self, control: CameraControlType, enabled: bool) -> CameraResult<()> {
         let fd = self.inner.file.as_raw_fd();
         if control == CameraControlType::AutoExposure {
-            native::auto_exposure(fd, enabled)?;
+            native::auto_exposure(fd, enabled).map_err(|e| control_error(control, e))?;
         } else {
             native::set_control(fd, control_id(control), i32::from(enabled))?;
         }
@@ -1071,7 +1121,20 @@ impl CameraControl for V4l2Camera {
             } else {
                 range.def
             };
-            return Ok(CameraControlRange::new(0, 1, 1, default, false));
+            let (min, max) = if control == CameraControlType::AutoExposure {
+                let bits = native::exposure_modes(self.inner.file.as_raw_fd())
+                    .map_err(|e| control_error(control, e))?;
+                (i32::from(bits & 1 == 0), i32::from(bits & 2 != 0))
+            } else {
+                (range.min, range.max)
+            };
+            return Ok(CameraControlRange::new(
+                min,
+                max,
+                1,
+                default.clamp(min, max),
+                false,
+            ));
         }
         Ok(CameraControlRange::new(
             range.min,
@@ -1095,6 +1158,80 @@ impl CameraControl for V4l2Camera {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn startup_native_errors_preserve_semantics_and_native_context() {
+        use crate::{BackendId, CameraErrorKind, OperationStage, RecoveryHint};
+        for (code, kind, hint) in [
+            (
+                libc::EBUSY,
+                CameraErrorKind::DeviceBusy,
+                RecoveryHint::Retry,
+            ),
+            (
+                libc::EACCES,
+                CameraErrorKind::PermissionDenied,
+                RecoveryHint::RequestPermission,
+            ),
+            (
+                libc::ENODEV,
+                CameraErrorKind::DeviceDisconnected,
+                RecoveryHint::ReenumerateDevice,
+            ),
+            (
+                libc::EINVAL,
+                CameraErrorKind::UnsupportedFormat,
+                RecoveryHint::ChangeConfiguration,
+            ),
+            (
+                libc::ETIMEDOUT,
+                CameraErrorKind::Timeout,
+                RecoveryHint::Retry,
+            ),
+            (
+                libc::ENOMEM,
+                CameraErrorKind::BufferExhausted,
+                RecoveryHint::ReduceResourceUsage,
+            ),
+            (libc::EIO, CameraErrorKind::Io, RecoveryHint::Retry),
+        ] {
+            let error = startup_error("test ioctl", std::io::Error::from_raw_os_error(code));
+            assert_eq!(error.kind(), kind);
+            assert_eq!(error.recovery_hint(), hint);
+            assert_eq!(error.native_code(), Some(i64::from(code)));
+            assert_eq!(error.backend(), Some(&BackendId::V4L2));
+            assert_eq!(error.stage(), Some(OperationStage::Startup));
+            assert_eq!(error.io_error().unwrap().raw_os_error(), Some(code));
+        }
+        let error = startup_error("test ioctl", std::io::Error::other("unknown"));
+        assert_eq!(error.native_code(), None);
+        assert_eq!(error.kind(), CameraErrorKind::Io);
+    }
+
+    #[test]
+    fn native_mjpeg_requires_complete_transport_markers() {
+        let config = CameraConfig::new(VideoFormat::MJPEG, 2, 2, 30);
+        let native = native::Format::default();
+        for data in [
+            &[0xff, 0xd8, 1, 2][..],
+            &[1, 2, 3, 4][..],
+            &[1, 2, 0xff, 0xd9][..],
+        ] {
+            let result = native_layout(&config, &native, &[Plane { data, stride: 0 }]);
+            assert!(matches!(result,Err(ref e) if e.kind()==crate::CameraErrorKind::InvalidFrame));
+        }
+        let data = [0xff, 0xd8, 1, 2, 0xff, 0xd9, 0, 0];
+        let layout = native_layout(
+            &config,
+            &native,
+            &[Plane {
+                data: &data,
+                stride: 0,
+            }],
+        )
+        .unwrap();
+        assert_eq!(layout.planes[0].length, data.len());
+    }
+
     #[tokio::test]
     async fn startup_failure_stops_readers_and_is_safe_to_retry() {
         // A real non-camera fd exercises the native ioctl failure and worker

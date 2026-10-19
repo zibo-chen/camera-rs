@@ -14,7 +14,7 @@ typedef struct {
     const uint8_t *data[2];
     size_t lengths[2];
     int64_t timestamp_ns;
-    uint32_t index, planes, damaged, sequence, monotonic;
+    uint32_t index, planes, damaged, sequence, monotonic, timestamp_valid;
 } camera_v4l2_frame;
 typedef struct camera_v4l2_stream camera_v4l2_stream;
 int camera_v4l2_probe(int fd, camera_v4l2_info *info);
@@ -29,5 +29,6 @@ int camera_v4l2_stop(camera_v4l2_stream *stream);
 int camera_v4l2_query_control(int fd, uint32_t id, camera_v4l2_control *control);
 int camera_v4l2_get_control(int fd, uint32_t id, int32_t *value);
 int camera_v4l2_set_control(int fd, uint32_t id, int32_t value);
+int camera_v4l2_exposure_modes(int fd, uint32_t *modes);
 int camera_v4l2_auto_exposure(int fd, int enabled);
 #endif

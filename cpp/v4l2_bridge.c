@@ -232,10 +232,12 @@ int camera_v4l2_next(camera_v4l2_stream *s, int wake_fd, camera_v4l2_frame *out)
     out->damaged = !!(buf.flags & V4L2_BUF_FLAG_ERROR);
     /* Native clock remains separate from the host wall clock in FrameHub. */
     if (buf.timestamp.tv_sec >= 0 && buf.timestamp.tv_sec <= (INT64_MAX - 999999999) / 1000000000 &&
-        buf.timestamp.tv_usec >= 0 && buf.timestamp.tv_usec < 1000000)
+        buf.timestamp.tv_usec >= 0 && buf.timestamp.tv_usec < 1000000) {
+        out->timestamp_ns = (int64_t)buf.timestamp.tv_sec * 1000000000 + buf.timestamp.tv_usec * 1000;
+        out->timestamp_valid = 1;
+    }
     out->sequence = buf.sequence;
     out->monotonic = (buf.flags & V4L2_BUF_FLAG_TIMESTAMP_MASK) == V4L2_BUF_FLAG_TIMESTAMP_MONOTONIC;
-        out->timestamp_ns = (int64_t)buf.timestamp.tv_sec * 1000000000 + buf.timestamp.tv_usec * 1000;
     for (uint32_t p = 0; p < s->planes; ++p) {
         struct mapping *m = &s->maps[buf.index * s->planes + p];
         size_t used = s->type == V4L2_BUF_TYPE_VIDEO_CAPTURE ? buf.bytesused : planes[p].bytesused;
@@ -265,11 +267,40 @@ int camera_v4l2_set_control(int fd, uint32_t id, int32_t value) {
     struct v4l2_control c = {0}; c.id = id; c.value = value;
     return xioctl(fd, VIDIOC_S_CTRL, &c);
 }
-int camera_v4l2_auto_exposure(int fd, int enabled) {
-    int mode = V4L2_EXPOSURE_MANUAL;
-    if (enabled) {
-        struct v4l2_querymenu menu = {0}; menu.id = V4L2_CID_EXPOSURE_AUTO; menu.index = V4L2_EXPOSURE_APERTURE_PRIORITY;
-        mode = xioctl(fd, VIDIOC_QUERYMENU, &menu) == 0 ? V4L2_EXPOSURE_APERTURE_PRIORITY : V4L2_EXPOSURE_AUTO;
+/* Probe only modes representable by the public manual/automatic-time API. */
+static int exposure_menu(int fd, int *manual, int *automatic) {
+    struct v4l2_queryctrl q = {0}; q.id = V4L2_CID_EXPOSURE_AUTO;
+    int rc = xioctl(fd, VIDIOC_QUERYCTRL, &q);
+    if (rc) return rc;
+    if (q.flags & V4L2_CTRL_FLAG_DISABLED || q.type != V4L2_CTRL_TYPE_MENU) return -ENOTSUP;
+    *manual = -1; *automatic = -1;
+    const uint32_t candidates[] = {V4L2_EXPOSURE_MANUAL, V4L2_EXPOSURE_AUTO, V4L2_EXPOSURE_APERTURE_PRIORITY};
+    for (size_t i = 0; i < sizeof(candidates) / sizeof(candidates[0]); ++i) {
+        uint32_t index = candidates[i];
+        if ((int64_t)index < q.minimum || (int64_t)index > q.maximum) continue;
+        struct v4l2_querymenu menu = {0}; menu.id = q.id; menu.index = index;
+        rc = xioctl(fd, VIDIOC_QUERYMENU, &menu);
+        if (rc == -EINVAL) continue;
+        if (rc) return rc;
+        if (index == V4L2_EXPOSURE_MANUAL) *manual = (int)index;
+        else *automatic = (int)index;
     }
+    return (*manual >= 0 || *automatic >= 0) ? 0 : -ENOTSUP;
+}
+int camera_v4l2_exposure_modes(int fd, uint32_t *modes) {
+    if (!modes) return -EINVAL;
+    *modes = 0;
+    int manual, automatic;
+    int rc = exposure_menu(fd, &manual, &automatic);
+    if (rc) return rc;
+    *modes = (manual >= 0 ? 1U : 0U) | (automatic >= 0 ? 2U : 0U);
+    return 0;
+}
+int camera_v4l2_auto_exposure(int fd, int enabled) {
+    int manual, automatic;
+    int rc = exposure_menu(fd, &manual, &automatic);
+    if (rc) return rc;
+    int mode = enabled ? automatic : manual;
+    if (mode < 0) return -ENOTSUP;
     return camera_v4l2_set_control(fd, V4L2_CID_EXPOSURE_AUTO, mode);
 }

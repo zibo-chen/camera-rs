@@ -386,6 +386,9 @@ fn descriptor(camera: &BackendCamera, id: ControlId) -> CameraResult<ControlDesc
         #[cfg(camera_v4l2)]
         BackendCamera::V4l2(c) => {
             writable = Some(c.control_writable(raw)?);
+            if id == ControlId::ExposureMode {
+                modes = c.exposure_modes()?;
+            }
         }
         _ => {}
     }
@@ -452,6 +455,12 @@ impl CaptureSession {
             let raw_value = match value {
                 ControlValue::Mode(mode) if unit == ControlUnit::Mode => {
                     if !desc.modes.contains(&mode) {
+                        #[cfg(camera_v4l2)]
+                        if backend == BackendType::V4l2 {
+                            return Err(CameraError::control_not_supported(format!(
+                                "{id:?}: {mode:?}"
+                            )));
+                        }
                         return Err(CameraError::invalid_config("Invalid control mode".into()));
                     }
                     #[cfg(all(
