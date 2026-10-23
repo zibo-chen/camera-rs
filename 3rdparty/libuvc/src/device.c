@@ -1144,7 +1144,18 @@ uvc_error_t uvc_release_if(uvc_device_handle_t *devh, int idx)
   {
     devh->claimed &= ~(1u << idx);
     /* Reattach any kernel drivers that were disabled when we claimed this interface */
-    if (!(devh->detached & (1u << idx))) return UVC_SUCCESS;
+    int restore_driver = (devh->detached & (1u << idx)) != 0;
+#ifdef __ANDROID__
+    /* Android may kill a UVC app without running uvc_close. On the next open
+     * uvcvideo is already unbound, so detached does not record it. Restore the
+     * VideoControl driver on final close as well, otherwise Camera2 permanently
+     * loses this physical camera until it is unplugged or manually rebound. */
+    if (!restore_driver && devh->closing && devh->info &&
+        idx == devh->info->ctrl_if.bInterfaceNumber &&
+        libusb_kernel_driver_active(devh->usb_devh, idx) == 0)
+      restore_driver = 1;
+#endif
+    if (!restore_driver) return UVC_SUCCESS;
     ret = libusb_attach_kernel_driver(devh->usb_devh, idx);
     LIBUVC_LOG("uvc_release_if: reattach interface %d returned %d, active=%d\n", idx, ret,
                libusb_kernel_driver_active(devh->usb_devh, idx));

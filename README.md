@@ -74,6 +74,13 @@ async fn main() -> camera::CameraResult<()> {
 
 `Capture` owns both the session and its default receiver, so a convenient call cannot accidentally drop capture lifetime. For preview, recognition and recording at the same time, open a `Device`, start one `Session`, then create independent `SubscriptionOptions` for every consumer.
 
+`Session::close().await` stops capture while retaining the open device for another
+session. When switching between Camera2 and UVC, also call `Device::close().await`
+before opening the other backend. This releases native handles and USB interface
+claims even when readers retain the closed session. A closed device must be opened
+again through `CameraSystem`; closing an active device requires closing its session
+first.
+
 ## Feature model
 
 Features decide what is compiled; `BackendPolicy` decides runtime behavior.

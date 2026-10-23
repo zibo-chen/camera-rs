@@ -208,6 +208,115 @@ struct TestDevice {
     running: Arc<AtomicBool>,
 }
 
+#[derive(Debug)]
+struct ExclusiveProvider(Arc<AtomicBool>);
+
+impl BackendProvider for ExclusiveProvider {
+    fn id(&self) -> BackendId {
+        TestProvider.id()
+    }
+    fn enumerate(&self) -> CameraResult<Vec<BackendDeviceInfo>> {
+        TestProvider.enumerate()
+    }
+    fn open(&self, _: &str) -> CameraResult<Box<dyn BackendDevice>> {
+        if self.0.swap(true, Ordering::AcqRel) {
+            return Err(CameraError::invalid_state(
+                "physical device still owned".into(),
+            ));
+        }
+        Ok(Box::new(ExclusiveDevice {
+            held: self.0.clone(),
+            device: TestDevice {
+                running: Arc::new(AtomicBool::new(false)),
+            },
+        }))
+    }
+}
+
+struct ExclusiveDevice {
+    held: Arc<AtomicBool>,
+    device: TestDevice,
+}
+impl BackendDevice for ExclusiveDevice {
+    fn capabilities(&self) -> CameraResult<DeviceCapabilities> {
+        self.device.capabilities()
+    }
+    fn start(&mut self, sink: FrameSink, plan: &camera::CapturePlan) -> CameraResult<()> {
+        self.device.start(sink, plan)
+    }
+    fn stop(&mut self) -> CameraResult<()> {
+        self.device.stop()
+    }
+}
+impl Drop for ExclusiveDevice {
+    fn drop(&mut self) {
+        self.held.store(false, Ordering::Release);
+    }
+}
+
+#[tokio::test]
+async fn close_device_releases_hardware_before_retained_session_and_receiver_drop() {
+    let held = Arc::new(AtomicBool::new(false));
+    let system = CameraSystem::builder()
+        .register_backend(ExclusiveProvider(held.clone()))
+        .backend_policy(BackendPolicy::Require(TestProvider.id()))
+        .build()
+        .unwrap();
+    let mut device = system.open(DeviceSelector::Default).await.unwrap();
+    let session = device
+        .start(CaptureRequest::builder().build().unwrap())
+        .await
+        .unwrap();
+    let mut receiver = session.subscribe(SubscriptionOptions::latest()).unwrap();
+    let frame = receiver.next().await.unwrap();
+    assert!(
+        device.close().await.is_err(),
+        "an active session must be closed first"
+    );
+    session.close().await.unwrap();
+    assert!(
+        held.load(Ordering::Acquire),
+        "stopping capture retains the open USB handle"
+    );
+    assert!(system.open(DeviceSelector::Default).await.is_err());
+    device.close().await.unwrap();
+    device.close().await.unwrap();
+    assert!(
+        !held.load(Ordering::Acquire),
+        "close must release even while the old session is retained"
+    );
+    let mut replacement = system.open(DeviceSelector::Default).await.unwrap();
+    let next = replacement
+        .start(CaptureRequest::builder().build().unwrap())
+        .await
+        .unwrap();
+    assert!(next.latest().is_some());
+    assert!(!session.is_streaming());
+    assert!(receiver.next().await.is_err());
+    assert!(!frame.bytes().is_empty());
+    assert!(device
+        .start(CaptureRequest::builder().build().unwrap())
+        .await
+        .is_err());
+    assert!(device.capabilities().await.is_err());
+    next.close().await.unwrap();
+    replacement.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn closed_synthetic_device_cannot_start_another_session() {
+    let mut device = CameraSystem::synthetic()
+        .open(DeviceSelector::Default)
+        .await
+        .unwrap();
+    device.close().await.unwrap();
+    assert!(device
+        .start(CaptureRequest::builder().build().unwrap())
+        .await
+        .is_err());
+    assert!(device.capabilities().await.is_err());
+}
+
 impl BackendDevice for TestDevice {
     fn capabilities(&self) -> CameraResult<DeviceCapabilities> {
         Ok(DeviceCapabilities::single_native(

@@ -27,6 +27,7 @@ int libusb_release_interface(libusb_device_handle *h, int i) {
 int libusb_attach_kernel_driver(libusb_device_handle *h, int i) { (void)h; (void)i; atomic_fetch_add(&attached, 1); return 0; }
 int libusb_detach_kernel_driver(libusb_device_handle *h, int i) { (void)h; (void)i; return detach_result; }
 int libusb_claim_interface(libusb_device_handle *h, int i) { (void)h; (void)i; return claim_result; }
+int libusb_kernel_driver_active(libusb_device_handle *h, int i) { (void)h; (void)i; return 0; }
 void libusb_close(libusb_device_handle *h) { (void)h; assert(atomic_load(&callback_done)); atomic_fetch_add(&closed, 1); }
 void libusb_unref_device(libusb_device *d) { (void)d; }
 void libusb_free_config_descriptor(struct libusb_config_descriptor *d) { free(d); }
@@ -53,5 +54,12 @@ int main(void) {
   assert(uvc_claim_if(&stack, 0) == UVC_ERROR_BUSY && attached == 2 && stack.detached == 0);
   assert(uvc_claim_if(&stack, 32) == UVC_ERROR_INVALID_PARAM);
   assert(uvc_release_if(&stack, -1) == UVC_ERROR_INVALID_PARAM);
+#ifdef __ANDROID__
+  // A killed Android UVC process can leave uvcvideo unbound. The next process
+  // did not detach it itself, but must still return the camera to Camera2.
+  uvc_device_info_t info = {0};
+  stack.info = &info; stack.closing = 1; stack.claimed = 1;
+  assert(uvc_release_if(&stack, 0) == UVC_SUCCESS && attached == 3);
+#endif
   return 0;
 }

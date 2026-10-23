@@ -1070,6 +1070,40 @@ fail:
   return ret;
 }
 
+/* Android USB host controllers can reject large contiguous ISO URB buffers
+ * with ENOMEM even when the global usbfs budget has room. Keep each Android
+ * request within 16 KiB; retain the existing desktop packet limit. */
+static size_t _uvc_iso_packets_per_transfer(size_t frame_bytes, size_t packet_bytes) {
+  size_t packets = (frame_bytes + packet_bytes - 1) / packet_bytes;
+  size_t limit = 32;
+#ifdef __ANDROID__
+  limit = 16384 / packet_bytes;
+  if (limit == 0) limit = 1;
+  if (limit > 32) limit = 32;
+#endif
+  return packets < limit ? packets : limit;
+}
+
+static uvc_error_t _uvc_submit_transfers(uvc_stream_handle_t *strmh) {
+  int transfer_id;
+  uvc_error_t ret = UVC_SUCCESS;
+  for (transfer_id = 0; transfer_id < LIBUVC_NUM_TRANSFER_BUFS; transfer_id++) {
+    ret = libusb_submit_transfer(strmh->transfers[transfer_id]);
+    if (ret != UVC_SUCCESS) break;
+  }
+  if (ret != UVC_SUCCESS) {
+    int submitted = transfer_id;
+    for (; transfer_id < LIBUVC_NUM_TRANSFER_BUFS; transfer_id++) {
+      free(strmh->transfers[transfer_id]->buffer);
+      libusb_free_transfer(strmh->transfers[transfer_id]);
+      strmh->transfers[transfer_id] = NULL;
+    }
+    /* A partial queue can still stream. An empty queue cannot deliver a frame. */
+    if (submitted > 0) ret = UVC_SUCCESS;
+  }
+  return ret;
+}
+
 /** Begin streaming video from the stream into the callback function.
  * @ingroup streaming
  *
@@ -1184,12 +1218,8 @@ uvc_error_t uvc_stream_start(
       if (endpoint_bytes_per_packet >= config_bytes_per_packet) {
         /* Transfers will be at most one frame long: Divide the maximum frame size
          * by the size of the endpoint and round up */
-        packets_per_transfer = (ctrl->dwMaxVideoFrameSize +
-                                endpoint_bytes_per_packet - 1) / endpoint_bytes_per_packet;
-
-        /* But keep a reasonable limit: Otherwise we start dropping data */
-        if (packets_per_transfer > 32)
-          packets_per_transfer = 32;
+        packets_per_transfer = _uvc_iso_packets_per_transfer(
+            ctrl->dwMaxVideoFrameSize, endpoint_bytes_per_packet);
         
         total_transfer_size = packets_per_transfer * endpoint_bytes_per_packet;
         break;
@@ -1249,22 +1279,10 @@ uvc_error_t uvc_stream_start(
     pthread_create(&strmh->cb_thread, NULL, _uvc_user_caller, (void*) strmh);
   }
 
-  for (transfer_id = 0; transfer_id < LIBUVC_NUM_TRANSFER_BUFS;
-      transfer_id++) {
-    ret = libusb_submit_transfer(strmh->transfers[transfer_id]);
-    if (ret != UVC_SUCCESS) {
-      UVC_DEBUG("libusb_submit_transfer failed: %d",ret);
-      break;
-    }
-  }
-
-  if ( ret != UVC_SUCCESS && transfer_id >= 0 ) {
-    for ( ; transfer_id < LIBUVC_NUM_TRANSFER_BUFS; transfer_id++) {
-      free ( strmh->transfers[transfer_id]->buffer );
-      libusb_free_transfer ( strmh->transfers[transfer_id]);
-      strmh->transfers[transfer_id] = 0;
-    }
-    ret = UVC_SUCCESS;
+  ret = _uvc_submit_transfers(strmh);
+  if (ret != UVC_SUCCESS) {
+    /* Wake and join the callback thread even though no transfer was queued. */
+    uvc_stream_stop(strmh);
   }
 
   UVC_EXIT(ret);

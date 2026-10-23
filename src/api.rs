@@ -476,6 +476,7 @@ impl CameraSystem {
             hub,
             busy: Arc::new(AtomicBool::new(false)),
             backend_options: self.backend_options.clone(),
+            closed: false,
         })
     }
     /// Open a borrowed, already-authorized USB descriptor. The backend duplicates
@@ -513,6 +514,7 @@ impl CameraSystem {
             hub,
             busy: Arc::new(AtomicBool::new(false)),
             backend_options: self.backend_options.clone(),
+            closed: false,
         })
     }
 
@@ -663,6 +665,9 @@ fn resolve_backend(b: BackendType) -> CameraResult<BackendType> {
 fn join_error(e: tokio::task::JoinError) -> CameraError {
     CameraError::worker_failure(format!("Camera worker: {e}")).with_source(e)
 }
+fn closed_device() -> CameraError {
+    CameraError::invalid_state("Device has been closed; open it again through CameraSystem".into())
+}
 #[derive(Clone)]
 enum Source {
     Native(Arc<NativeSource>),
@@ -671,7 +676,7 @@ enum Source {
 }
 
 struct CustomSource {
-    device: parking_lot::Mutex<Box<dyn crate::extension::BackendDevice>>,
+    device: parking_lot::Mutex<Option<Box<dyn crate::extension::BackendDevice>>>,
     hub: FrameHub,
     actual: parking_lot::Mutex<Option<CameraConfig>>,
 }
@@ -758,7 +763,7 @@ impl Source {
 
     fn custom(device: Box<dyn crate::extension::BackendDevice>) -> Self {
         Self::Custom(Arc::new(CustomSource {
-            device: parking_lot::Mutex::new(device),
+            device: parking_lot::Mutex::new(Some(device)),
             hub: FrameHub::default(),
             actual: parking_lot::Mutex::new(None),
         }))
@@ -789,7 +794,11 @@ impl Source {
                         estimated_pool_bytes: 0,
                         adjustments: Vec::new(),
                     };
-                    c.device.lock().start(sink, &plan)?;
+                    c.device
+                        .lock()
+                        .as_mut()
+                        .ok_or_else(closed_device)?
+                        .start(sink, &plan)?;
                     *c.actual.lock() = Some(config);
                     Ok(())
                 })
@@ -840,7 +849,11 @@ impl Source {
                 let c = c.clone();
                 tokio::task::spawn_blocking(move || {
                     c.hub.stop();
-                    let result = c.device.lock().stop();
+                    let result = c
+                        .device
+                        .lock()
+                        .as_mut()
+                        .map_or(Ok(()), |device| device.stop());
                     *c.actual.lock() = None;
                     result
                 })
@@ -852,6 +865,26 @@ impl Source {
                 Ok(())
             }
         }
+    }
+    async fn release(&self) -> CameraResult<()> {
+        self.stop().await?;
+        let source = self.clone();
+        tokio::task::spawn_blocking(move || {
+            // Sessions retain their source for terminal metrics and receivers.
+            // Release hardware explicitly instead of waiting for their last Arc.
+            match source {
+                Self::Native(source) => {
+                    source.camera.lock().take();
+                }
+                Self::Custom(source) => {
+                    source.device.lock().take();
+                }
+                Self::Synthetic(_) => {}
+            }
+        })
+        .await
+        .map_err(join_error)?;
+        Ok(())
     }
     fn actual(&self, fallback: &CameraConfig) -> CameraResult<CameraConfig> {
         match self {
@@ -904,10 +937,16 @@ impl Source {
             }
             Self::Custom(c) => {
                 let c = c.clone();
-                tokio::task::spawn_blocking(move || c.device.lock().capabilities())
-                    .await
-                    .map_err(join_error)?
-                    .map(Some)
+                tokio::task::spawn_blocking(move || {
+                    c.device
+                        .lock()
+                        .as_ref()
+                        .ok_or_else(closed_device)?
+                        .capabilities()
+                })
+                .await
+                .map_err(join_error)?
+                .map(Some)
             }
             _ => Ok(None),
         }
@@ -959,6 +998,7 @@ pub struct Camera {
     hub: FrameHub,
     busy: Arc<AtomicBool>,
     backend_options: Arc<Vec<BackendOptions>>,
+    closed: bool,
 }
 /// Convenient result type for `Device`.
 pub type Device = Camera;
@@ -975,10 +1015,27 @@ impl Camera {
         &self.device
     }
 
+    /// Release the open device, including USB interface claims, without waiting
+    /// for closed sessions or their receivers to be dropped. Close any active
+    /// session first. This operation is idempotent; reopen through CameraSystem
+    /// before starting capture again.
+    pub async fn close(&mut self) -> CameraResult<()> {
+        if self.busy.load(Ordering::Acquire) {
+            return Err(CameraError::invalid_state(
+                "Close the active session before closing its device".into(),
+            ));
+        }
+        self.closed = true;
+        self.source.release().await
+    }
+
     /// Query capabilities from this already-open device. This is required for
     /// Android UVC handles, where USB discovery is owned by the Java permission
     /// layer and the native backend receives only an authorized descriptor.
     pub async fn capabilities(&self) -> CameraResult<DeviceCapabilities> {
+        if self.closed {
+            return Err(closed_device());
+        }
         match &self.source {
             Source::Synthetic(_) => Ok(DeviceCapabilities::single_native(
                 CaptureFormat::Rgb8,
@@ -988,9 +1045,16 @@ impl Camera {
             )),
             Source::Custom(source) => {
                 let source = source.clone();
-                tokio::task::spawn_blocking(move || source.device.lock().capabilities())
-                    .await
-                    .map_err(join_error)?
+                tokio::task::spawn_blocking(move || {
+                    source
+                        .device
+                        .lock()
+                        .as_ref()
+                        .ok_or_else(closed_device)?
+                        .capabilities()
+                })
+                .await
+                .map_err(join_error)?
             }
             Source::Native(source)
                 if source.id.is_none()
@@ -1020,6 +1084,9 @@ impl Camera {
     }
 
     pub async fn start(&mut self, request: CaptureRequest) -> CameraResult<Session> {
+        if self.closed {
+            return Err(closed_device());
+        }
         let started = std::time::Instant::now();
         let deadline = StartupDeadline::new(request.startup_timeout);
         let mut session = self.start_until(request, deadline).await?;
